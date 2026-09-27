@@ -997,7 +997,7 @@ fn recording_proxy(
 }
 
 #[test]
-fn a_replayed_handshake_holds_the_receiver_only_until_the_offer_deadline() {
+fn a_silent_replayed_handshake_does_not_hold_the_receiver() {
     use std::io::Write;
     let src = TempDir::new().unwrap();
     let file = src.path().join("f.bin");
@@ -1028,7 +1028,7 @@ fn a_replayed_handshake_holds_the_receiver_only_until_the_offer_deadline() {
     rx.join().unwrap();
     let waited = started.elapsed();
     assert!(
-        waited < Duration::from_secs(15),
+        waited < Duration::from_secs(5),
         "real sender waited {waited:?}"
     );
     assert_file_eq(&file, &second.path().join("f.bin"));

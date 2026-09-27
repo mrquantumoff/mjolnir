@@ -23,10 +23,14 @@ completes. It runs each incoming handshake on its own thread (at most 256 at
 once; connections beyond that are closed at once) and requires the preamble and Noise message 1 to arrive within 10
 seconds, so a peer that trickles bytes cannot hold up a real sender.
 Message 1 must be exactly 96 bytes, its size in IK with an empty payload. Message 1 can be
-replayed, and the receiver answers a replay like the original, so the
-sender has not proven it is live until its `Offer` decrypts. The receiver
-therefore drops a session whose `Offer` does not arrive within 10 seconds
-of the handshake and goes back to waiting. Until then it keeps listening. A failed handshake (unknown key,
+replayed, and the receiver answers a replay like the original, so a
+finished handshake does not prove the sender is live; its `Offer` does,
+because only the real sender can seal it. Each handshake thread therefore
+also waits (up to 10 seconds) for that connection's `Offer`, and only a
+connection whose `Offer` decrypted takes the session. A replay never gets
+that far, so it cannot hold the session or lock out a real sender. A
+sender whose control connection is closed during the handshake, as happens
+while another session is active, retries twice, after 1 and 3 seconds. Until then it keeps listening. A failed handshake (unknown key,
 garbage, a port scanner) drops only that connection. It is logged, and the
 receiver keeps waiting, so nobody who merely reaches the port can shut a
 receiver down. While a session is active, further control connections are
