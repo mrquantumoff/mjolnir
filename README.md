@@ -6,6 +6,46 @@ them over several TCP connections at once. The receiver decrypts each chunk
 and writes it at its offset. Both hosts authenticate with static key pairs,
 and an interrupted transfer resumes where it stopped.
 
+## Install
+
+Releases ship prebuilt binaries for Linux and Windows on x86_64 and
+aarch64. The install scripts download the latest one, check it against the
+release's `SHA256SUMS`, and install it. They download with the GitHub CLI
+when it is logged in, and otherwise with a personal access token in
+`GH_TOKEN` or `GITHUB_TOKEN` that can read this repository's contents.
+
+On Linux, [`scripts/install.sh`](scripts/install.sh) installs to
+`~/.local/bin`:
+
+```sh
+gh api repos/mrquantumoff/mjolnir/contents/scripts/install.sh \
+    -H "Accept: application/vnd.github.raw" | bash
+```
+
+With a token and no GitHub CLI:
+
+```sh
+curl -fsSL -H "Authorization: Bearer $GH_TOKEN" \
+    -H "Accept: application/vnd.github.raw" \
+    https://api.github.com/repos/mrquantumoff/mjolnir/contents/scripts/install.sh | bash
+```
+
+On Windows, [`scripts/install.ps1`](scripts/install.ps1) installs to
+`%LOCALAPPDATA%\Programs\mjolnir` and adds that folder to the user `PATH`:
+
+```powershell
+gh api repos/mrquantumoff/mjolnir/contents/scripts/install.ps1 `
+    -H "Accept: application/vnd.github.raw" | Out-String | Invoke-Expression
+```
+
+Both scripts read `MJOLNIR_VERSION` to install a specific tag instead of
+the latest, and `MJOLNIR_INSTALL_DIR` to install somewhere else. From a
+checkout, run either script directly; `install.ps1` also takes `-Version`
+and `-InstallDir`.
+
+To build from source instead, run `cargo build --release`; the binary lands
+in `target/release`.
+
 ## Quick start
 
 On each host, create a key pair. `keygen` writes the private key and prints
@@ -174,3 +214,23 @@ script on your own hosts.
 
 Rerun with `scripts/bench.sh [WORKDIR]`; `SIZE_MIB`, `REPEAT`, and `PORT`
 override the defaults.
+
+## CI and releases
+
+[`.github/workflows/ci.yml`](.github/workflows/ci.yml) builds release
+binaries for `x86_64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu`,
+`x86_64-pc-windows-msvc`, and `aarch64-pc-windows-msvc` on every push to
+`master` and every pull request, and runs the tests on the two x86_64
+targets. The aarch64 targets cross-compile on x86_64 runners, so their tests
+do not run. Each build is kept as a workflow artifact.
+
+Pushing a tag that starts with `v` publishes a release from that tag:
+
+```sh
+git tag v0.1.0
+git push origin v0.1.0
+```
+
+The release holds `mjolnir-<target>.tar.gz` for Linux,
+`mjolnir-<target>.zip` for Windows, and a `SHA256SUMS` file covering them,
+which is the layout the install scripts expect.
