@@ -9,6 +9,7 @@ use std::time::{Instant, SystemTime};
 use serde::Serialize;
 
 use super::api::JobSpec;
+use crate::progress::PhaseTimes;
 use crate::{Cancelled, Progress};
 
 pub type JobId = u64;
@@ -27,6 +28,30 @@ pub struct Report {
     pub file_hashes: Vec<FileHash>,
     pub warnings: Vec<String>,
     pub skipped: Vec<String>,
+    pub phase_times: PhaseMs,
+}
+
+/// Milliseconds per stage, fractional so short phases stay visible.
+#[derive(Clone, Copy, Serialize)]
+pub struct PhaseMs {
+    pub connect_ms: f64,
+    pub transfer_ms: f64,
+    pub verify_ms: f64,
+    pub hash_ms: f64,
+    pub finalize_ms: f64,
+}
+
+impl From<PhaseTimes> for PhaseMs {
+    fn from(t: PhaseTimes) -> PhaseMs {
+        let ms = |d: std::time::Duration| d.as_secs_f64() * 1000.0;
+        PhaseMs {
+            connect_ms: ms(t.connect),
+            transfer_ms: ms(t.transfer),
+            verify_ms: ms(t.verify),
+            hash_ms: ms(t.hash),
+            finalize_ms: ms(t.finalize),
+        }
+    }
 }
 
 #[derive(Clone, Serialize)]

@@ -393,6 +393,13 @@ fn send_a_directory_end_to_end() {
     assert_eq!(received["report"]["verified"], true);
     assert_eq!(received["report"]["hashed"], true);
     assert_eq!(sent["report"]["hashed"], true);
+    for side in [&sent, &received] {
+        let times = &side["report"]["phase_times"];
+        assert!(times["transfer_ms"].as_f64().unwrap() > 0.0, "{times}");
+        for key in ["connect_ms", "verify_ms", "hash_ms", "finalize_ms"] {
+            assert!(times[key].as_f64().is_some(), "{key} missing: {times}");
+        }
+    }
     let hashes = sent["report"]["file_hashes"].as_array().unwrap();
     assert_eq!(hashes.len(), files.len(), "{}", sent["report"]);
     assert!(

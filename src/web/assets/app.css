@@ -859,3 +859,7 @@ details.hashes {
   color: var(--muted);
   overflow-wrap: anywhere;
 }
+
+.report-phases {
+  margin: 2px 0 0;
+}

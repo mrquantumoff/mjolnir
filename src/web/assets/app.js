@@ -776,10 +776,32 @@ function reportList(title, items, tone) {
     h('ul', null, items.map((item) => h('li', { class: 'mono tiny' }, item))));
 }
 
+const PHASE_TIME_KEYS = ['connect', 'transfer', 'verify', 'hash', 'finalize'];
+
+function formatSeconds(ms) {
+  const s = ms / 1000;
+  return (s < 10 ? s.toFixed(2) : s.toFixed(1)) + ' s';
+}
+
+function phaseTimesText(report) {
+  const times = report.phase_times;
+  if (!times) return '';
+  return PHASE_TIME_KEYS
+    .filter((key) => times[key + '_ms'] > 0)
+    .map((key) => {
+      const ms = times[key + '_ms'];
+      const rate = key === 'transfer' ? ' (' + formatRate((report.bytes / ms) * 1000) + ')' : '';
+      return key + ' ' + formatSeconds(ms) + rate;
+    })
+    .join(' \u00b7 ');
+}
+
 function buildReport(report) {
+  const phases = phaseTimesText(report);
   const hashes = report.file_hashes || [];
   return [
     h('p', { class: 'report-summary' }, reportText(report)),
+    phases ? h('p', { class: 'report-phases muted tiny' }, phases) : null,
     reportList('Warnings', report.warnings, 'warn'),
     reportList('Skipped', report.skipped, 'muted'),
     hashes.length === 0 ? null : h('details', { class: 'hashes' },

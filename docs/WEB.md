@@ -67,7 +67,9 @@ a summary: files, bytes, time, average speed, whether every chunk was
 verified and hash checked, and any repaired, hash-repaired, duplicate, or
 resent chunks. Warnings (metadata the receiver could not apply) and skipped
 files (symbolic links and special files the sender left out) are listed when
-there are any, and the per-file hashes sit in a collapsible section.
+there are any, and the per-file hashes sit in a collapsible section. A line
+below the summary gives the time per stage (connect, transfer with its
+MiB/s, verify, hash, finalize), leaving out stages that took no time.
 
 ![Finished transfers with their summaries](web-ui/done.png)
 
@@ -185,13 +187,17 @@ have the shape `{ "error": "message", "field": "name" | null }`, where
     "verified": true, "hashed": true,
     "chunks_resent": 0, "repaired_chunks": 0, "hash_repaired_chunks": 0, "duplicate_chunks": 0,
     "file_hashes": [{ "path": "dataset/model.ckpt", "hash": "295b43bf..." }],
-    "warnings": [], "skipped": []
+    "warnings": [], "skipped": [],
+    "phase_times": { "connect_ms": 21.4, "transfer_ms": 9800.0, "verify_ms": 1100.0, "hash_ms": 1400.0, "finalize_ms": 30.2 }
   }
   ```
 
   Counts that do not apply to a side are 0. The receiver always lists file
   hashes; the sender lists them only when `hash` was on. `skipped` is filled
-  on the sender, `warnings` mostly on the receiver.
+  on the sender, `warnings` mostly on the receiver. `phase_times` is the
+  time spent per stage in milliseconds. On the sender `verify_ms` is always
+  0, and `finalize_ms` includes waiting for the receiver's verify. On a
+  receiver `connect_ms` covers only the last session's handshake.
 - `bound_addr` is the receiver's actual listening address, `null` for sends.
 - `progress.phase` is `connecting`, `handshaking`, `transferring`,
   `verifying`, `hashing`, `finishing`, `done`, or `failed`. `bytes_total` is 0

@@ -125,6 +125,7 @@ impl From<SendReport> for Report {
             file_hashes: file_hashes(r.file_hashes),
             warnings: r.warnings,
             skipped: r.skipped,
+            phase_times: r.phase_times.into(),
         }
     }
 }
@@ -144,6 +145,7 @@ impl From<RecvReport> for Report {
             file_hashes: file_hashes(r.file_hashes),
             warnings: r.warnings,
             skipped: r.skipped,
+            phase_times: r.phase_times.into(),
         }
     }
 }
