@@ -680,3 +680,29 @@ fn one_connection_many_workers_completes_out_of_order() {
     assert_eq!(recv.duplicate_chunks, 0);
     assert_file_eq(&file, &out.path().join("f.bin"));
 }
+
+#[test]
+fn many_chunks_over_two_connections_arrive_once() {
+    let src = TempDir::new().unwrap();
+    let file = big_source(&src, 96);
+    let out = TempDir::new().unwrap();
+    let (rk, _) = keypair();
+    let (sk, spub) = keypair();
+    let mut cfg = recv_config(rk, vec![spub], out.path());
+    cfg.threads = 2;
+    let rx = start(cfg);
+    let mut send = Send::to(sk, rx.public);
+    send.connections = 2;
+    send.threads = 8;
+    send.chunk_size = 4096;
+    let progress = Arc::new(Progress::default());
+    let report = mjolnir::send(send.config(rx.addr, &[&file]), progress.clone()).unwrap();
+    let recv = rx.join().unwrap();
+    let chunks = (96u64 << 20) / 4096;
+    assert_eq!(report.chunks_sent, chunks);
+    assert_eq!(report.chunks_resent, 0);
+    assert_eq!(recv.duplicate_chunks, 0);
+    let p = progress.snapshot();
+    assert_eq!((p.bytes_done, p.chunks_done), (96 << 20, chunks));
+    assert_file_eq(&file, &out.path().join("big.bin"));
+}

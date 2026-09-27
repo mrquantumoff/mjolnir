@@ -378,11 +378,13 @@ fn stream_frames(
             let chunk = chunks[slot];
             let len = u64::from(ctx.manifest.chunk_len(chunk));
             ctx.chunks_sent.fetch_add(1, Relaxed);
-            if !ctx.sent[chunk.file as usize].set(chunk.index) {
+            ctx.bytes_sent.fetch_add(len, Relaxed);
+            // Progress counts each chunk once, so it never passes its total.
+            if ctx.sent[chunk.file as usize].set(chunk.index) {
+                ctx.progress.add_chunk(len);
+            } else {
                 ctx.chunks_resent.fetch_add(1, Relaxed);
             }
-            ctx.bytes_sent.fetch_add(len, Relaxed);
-            ctx.progress.add_chunk(len);
             if ctx.progress.is_cancelled() {
                 return Err(Cancelled::Local.into());
             }

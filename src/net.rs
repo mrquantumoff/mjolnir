@@ -11,19 +11,25 @@ use socket2::{SockRef, TcpKeepalive};
 use crate::progress::{Cancelled, Progress};
 use crate::wire::{ControlTx, Msg};
 
-/// OS-level socket timeout. Blocked reads and writes wake this often to
-/// check whether they should stop; nothing else depends on its value.
+/// OS-level read timeout. Blocked reads wake this often to check whether
+/// they should stop; nothing else depends on its value.
 pub(crate) const POLL: Duration = Duration::from_millis(100);
+/// OS-level write timeout, after which the connection is given up. A write
+/// that times out is never retried: on Windows a send that hits
+/// `SO_SNDTIMEO` may already have queued part of its buffer while reporting
+/// failure, so a retry would put duplicate bytes on the stream.
+pub(crate) const WRITE_TIMEOUT: Duration = Duration::from_secs(60);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// Configures an accepted or connected socket: blocking with `POLL`
-/// timeouts, no Nagle delay, and TCP keepalive so a vanished peer is
-/// noticed even on an idle control connection.
+/// Configures an accepted or connected socket: blocking with a `POLL` read
+/// timeout and a `WRITE_TIMEOUT` write timeout, no Nagle delay, and TCP
+/// keepalive so a vanished peer is noticed even on an idle control
+/// connection.
 pub(crate) fn prepare(stream: &TcpStream) -> io::Result<()> {
     stream.set_nonblocking(false)?;
     stream.set_nodelay(true)?;
     stream.set_read_timeout(Some(POLL))?;
-    stream.set_write_timeout(Some(POLL))?;
+    stream.set_write_timeout(Some(WRITE_TIMEOUT))?;
     let keepalive = TcpKeepalive::new()
         .with_time(Duration::from_secs(15))
         .with_interval(Duration::from_secs(5));
@@ -42,12 +48,14 @@ impl std::fmt::Display for Stopped {
 
 impl std::error::Error for Stopped {}
 
-/// Blocking reads and writes on a `prepare`d socket. Each call retries
-/// across the `POLL` timeouts, so no partial progress is lost, until it
-/// finishes, `stop` returns true, the deadline passes, or no byte moves for
-/// `idle`. The checks run only on timeouts, which keeps the hot path clean,
-/// and they work on Windows, where `shutdown` from another thread does not
-/// wake a blocked `recv`.
+/// Blocking reads and writes on a `prepare`d socket. A read retries across
+/// the `POLL` timeouts, so no partial progress is lost, until it finishes,
+/// `stop` returns true, the deadline passes, or no byte moves for `idle`.
+/// The checks run only on timeouts, which keeps the hot path clean, and
+/// they work on Windows, where `shutdown` from another thread does not wake
+/// a blocked `recv`. A write blocks until the peer takes the bytes or
+/// `WRITE_TIMEOUT` passes, which fails the connection; callers check `stop`
+/// between writes.
 pub(crate) struct Io<'a> {
     stream: TcpStream,
     stop: &'a (dyn Fn() -> bool + Sync),
@@ -88,10 +96,10 @@ impl<'a> Io<'a> {
         self.stream
     }
 
-    fn retry<T>(&mut self, mut op: impl FnMut(&mut TcpStream) -> io::Result<T>) -> io::Result<T> {
+    fn read_retrying(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         let started = Instant::now();
         loop {
-            match op(&mut self.stream) {
+            match self.stream.read(buf) {
                 Err(e) if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {}
                 Err(e) if e.kind() == ErrorKind::Interrupted => continue,
                 other => return other,
@@ -112,13 +120,24 @@ impl<'a> Io<'a> {
 
 impl Read for Io<'_> {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        self.retry(|s| s.read(buf))
+        self.read_retrying(buf)
     }
 }
 
 impl Write for Io<'_> {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        self.retry(|s| s.write(buf))
+        loop {
+            match self.stream.write(buf) {
+                Err(e) if e.kind() == ErrorKind::Interrupted => {}
+                Err(e) if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {
+                    return Err(io::Error::new(
+                        ErrorKind::TimedOut,
+                        "peer stopped reading; giving up the connection",
+                    ));
+                }
+                other => return other,
+            }
+        }
     }
 
     fn flush(&mut self) -> io::Result<()> {
@@ -211,5 +230,52 @@ pub(crate) fn unexpected(msg: Msg, waiting_for: &str) -> anyhow::Error {
         Msg::Error { message } => PeerError(message).into(),
         Msg::Cancel => Cancelled::Peer.into(),
         other => anyhow!("protocol error: expected {waiting_for}, got {other:?}"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::TcpListener;
+    use std::thread;
+
+    /// A reader that pauses for longer than `POLL` makes the writer block.
+    /// Every byte must still arrive exactly once and in order.
+    #[test]
+    fn writes_blocked_by_a_stalled_reader_arrive_exactly_once() {
+        let total = 48usize << 20;
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let reader = thread::spawn(move || {
+            let (mut s, _) = listener.accept().unwrap();
+            let mut buf = vec![0u8; 1 << 20];
+            let (mut pos, mut bad, mut reads) = (0usize, 0usize, 0u32);
+            loop {
+                let n = s.read(&mut buf).unwrap();
+                if n == 0 {
+                    return (pos, bad);
+                }
+                bad += buf[..n]
+                    .iter()
+                    .enumerate()
+                    .filter(|&(i, &b)| b != ((pos + i) % 251) as u8)
+                    .count();
+                pos += n;
+                reads += 1;
+                if reads % 16 == 0 {
+                    thread::sleep(Duration::from_millis(250));
+                }
+            }
+        });
+        let stream = TcpStream::connect(addr).unwrap();
+        prepare(&stream).unwrap();
+        let never = || false;
+        let mut io = Io::new(stream, &never);
+        let data: Vec<u8> = (0..total).map(|i| (i % 251) as u8).collect();
+        for part in data.chunks(256 << 10) {
+            io.write_all(part).unwrap();
+        }
+        drop(io);
+        assert_eq!(reader.join().unwrap(), (total, 0));
     }
 }
