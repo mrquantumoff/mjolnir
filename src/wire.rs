@@ -7,6 +7,7 @@ use anyhow::{Context, Result, bail, ensure};
 use serde::{Deserialize, Serialize};
 
 use crate::crypto::{Cipher, CipherState, FrameKey, SessionKeys, TAG_LEN};
+use crate::filemap::FileMap;
 use crate::manifest::{ChunkId, END_FILE_ID, OfferFile};
 
 pub const MAGIC: &[u8; 4] = b"MJLN";
@@ -57,8 +58,22 @@ pub enum Msg {
         round: u32,
         connections: u32,
     },
+    Delivered,
+    Digests {
+        file: u32,
+        first: u64,
+        /// Concatenated 16-byte chunk digests for chunks `first..`.
+        #[serde(with = "serde_bytes")]
+        digests: Vec<u8>,
+    },
+    Finalize {
+        hash: bool,
+        map: FileMap,
+    },
     Finished {
         verified: bool,
+        hashed: bool,
+        warnings: Vec<String>,
     },
     Error {
         message: String,
@@ -67,6 +82,8 @@ pub enum Msg {
 }
 
 pub const MAX_CONTROL_LEN: usize = 64 << 20;
+/// Most digests one `Digests` message carries.
+pub const DIGESTS_PER_MSG: usize = 1 << 20;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Role {
@@ -365,7 +382,15 @@ mod tests {
         let tag = |m: &Msg| postcard::to_allocvec(m).unwrap()[0];
         assert_eq!(tag(&Msg::Have { bitmaps: vec![] }), 1);
         assert_eq!(tag(&Msg::RoundStart { round: 0 }), 2);
-        assert_eq!(tag(&Msg::Finished { verified: true }), 4);
-        assert_eq!(tag(&Msg::Cancel), 6);
+        assert_eq!(tag(&Msg::Delivered), 4);
+        assert_eq!(
+            tag(&Msg::Finished {
+                verified: true,
+                hashed: false,
+                warnings: vec![]
+            }),
+            7
+        );
+        assert_eq!(tag(&Msg::Cancel), 9);
     }
 }

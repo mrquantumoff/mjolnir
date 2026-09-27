@@ -7,6 +7,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Result, bail};
 use clap::{Parser, Subcommand};
 
+use mjolnir::filemap::{ApplyPolicy, Preserve};
 use mjolnir::{
     Cipher, Phase, PrivateKey, Progress, PublicKey, Receiver, RecvConfig, SendConfig,
     load_authorized_keys, parse_size, web,
@@ -57,6 +58,12 @@ enum Cmd {
         /// Workers that decrypt, write, and verify chunks (0 = one per core).
         #[arg(long, default_value_t = 0)]
         threads: usize,
+        /// Apply file owners from the sender's map (only as root on Unix).
+        #[arg(long)]
+        allow_owner: bool,
+        /// Keep setuid, setgid, and sticky bits from the sender's map.
+        #[arg(long)]
+        allow_special_bits: bool,
     },
     /// Send files or directories to a receiver.
     Send {
@@ -78,6 +85,13 @@ enum Cmd {
         /// Workers that read and encrypt chunks (0 = one per core).
         #[arg(long, default_value_t = 0)]
         threads: usize,
+        /// After delivery, re-read every file and have the receiver compare
+        /// chunk digests; mismatched chunks are sent again.
+        #[arg(long)]
+        hash: bool,
+        /// Metadata to send: `none`, or a list of perms, times, owner.
+        #[arg(long, default_value = "perms")]
+        preserve: Preserve,
         #[arg(required = true)]
         paths: Vec<PathBuf>,
     },
@@ -120,6 +134,8 @@ fn run(cmd: Cmd) -> Result<()> {
             force,
             no_verify,
             threads,
+            allow_owner,
+            allow_special_bits,
         } => {
             if let Some(path) = authorized {
                 allow.extend(load_authorized_keys(&path)?);
@@ -135,6 +151,10 @@ fn run(cmd: Cmd) -> Result<()> {
                 force,
                 verify: !no_verify,
                 threads,
+                apply: ApplyPolicy {
+                    allow_special_bits,
+                    allow_owner,
+                },
             })?;
             eprintln!("public key {}", receiver.public_key());
             eprintln!("listening on {}", receiver.local_addr());
@@ -159,6 +179,7 @@ fn run(cmd: Cmd) -> Result<()> {
                     report.peer
                 ),
             );
+            report_files(report.hashed, &report.file_hashes, &report.warnings);
         }
         Cmd::Send {
             addr,
@@ -168,6 +189,8 @@ fn run(cmd: Cmd) -> Result<()> {
             chunk_size,
             cipher,
             threads,
+            hash,
+            preserve,
             paths,
         } => {
             let cfg = SendConfig {
@@ -179,6 +202,8 @@ fn run(cmd: Cmd) -> Result<()> {
                 cipher,
                 threads,
                 paths,
+                hash,
+                preserve,
             };
             let progress = Arc::new(Progress::default());
             let report = with_progress("sent", &progress, || mjolnir::send(cfg, progress.clone()))?;
@@ -199,6 +224,7 @@ fn run(cmd: Cmd) -> Result<()> {
                     }
                 ),
             );
+            report_files(report.hashed, &report.file_hashes, &report.warnings);
         }
         Cmd::Serve {
             listen,
@@ -241,7 +267,7 @@ fn with_progress<T: Send>(
             let p = progress.snapshot();
             if matches!(
                 p.phase,
-                Phase::Transferring | Phase::Verifying | Phase::Finishing
+                Phase::Transferring | Phase::Verifying | Phase::Hashing | Phase::Finishing
             ) {
                 let rate = (p.bytes_done - last.1.min(p.bytes_done)) as f64
                     / MIB
@@ -257,6 +283,18 @@ fn with_progress<T: Send>(
         }
         worker.join().expect("transfer thread panicked")
     })
+}
+
+/// Prints each file's hash after a `--hash` transfer, then any warnings.
+fn report_files(hashed: bool, file_hashes: &[(String, String)], warnings: &[String]) {
+    if hashed {
+        for (path, hash) in file_hashes {
+            eprintln!("file_hash {hash}  {path}");
+        }
+    }
+    for w in warnings {
+        eprintln!("warning: {w}");
+    }
 }
 
 fn summary(verb: &str, bytes: u64, elapsed: Duration, detail: &str) {

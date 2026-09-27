@@ -4,7 +4,7 @@
 use std::fs::{self, File};
 use std::io::{Read, Write};
 use std::net::{Shutdown, SocketAddr};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering::Relaxed};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
@@ -12,19 +12,22 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use serde::Serialize;
-use walkdir::WalkDir;
 
 use crate::bitset::AtomicBitset;
-use crate::crypto::{Cipher, FrameKey, SessionKeys, TAG_LEN, handshake_initiator};
+use crate::crypto::{
+    Cipher, DIGEST_LEN, FileHasher, FrameKey, SessionKeys, TAG_LEN, chunk_digest,
+    handshake_initiator,
+};
+use crate::filemap::{self, FileMap, Preserve};
 use crate::keys::{PrivateKey, PublicKey};
-use crate::manifest::{ChunkId, ChunkSize, FileEntry, Manifest, RelPath, chunk_span, mtime_of};
+use crate::manifest::{ChunkId, ChunkSize, FileEntry, Manifest, chunk_count, chunk_span, mtime_of};
 use crate::net::{self, Io, tell_peer_about, unexpected};
-use crate::pool::{Buffers, Pool, buffer_count, resolve_threads};
+use crate::pool::{Buffers, InFlight, Pool, buffer_count, resolve_threads};
 use crate::posio::read_exact_at;
 use crate::progress::{ActiveConnection, Cancelled, Phase, Progress};
 use crate::wire::{
-    self, ADMITTED, CHALLENGE_LEN, ConnKind, ControlRx, ControlTx, FrameHeader, HEADER_LEN, Msg,
-    Role, chunk_header, encode_hello, seal_frame,
+    self, ADMITTED, CHALLENGE_LEN, ConnKind, ControlRx, ControlTx, DIGESTS_PER_MSG, FrameHeader,
+    HEADER_LEN, Msg, Role, chunk_header, encode_hello, seal_frame,
 };
 
 #[derive(Clone, Debug, Serialize)]
@@ -42,6 +45,11 @@ pub struct SendConfig {
     pub threads: usize,
     /// Files or directories; a directory is sent recursively under its name.
     pub paths: Vec<PathBuf>,
+    /// Re-read every file after delivery and have the receiver compare
+    /// chunk digests (`send --hash`).
+    pub hash: bool,
+    /// Metadata to put in the file map (`send --preserve`).
+    pub preserve: Preserve,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -55,6 +63,16 @@ pub struct SendReport {
     pub rounds: u32,
     /// Whether the receiver read every chunk back and matched its digest.
     pub verified: bool,
+    /// Whether the receiver compared this side's re-read digests.
+    pub hashed: bool,
+    /// Chunks the hash check sent back for a repair round.
+    pub hash_repaired_chunks: u64,
+    /// `(path, file_hash)` per file, when `hash` is on.
+    pub file_hashes: Vec<(String, String)>,
+    /// Metadata the receiver could not apply, and skipped sources.
+    pub warnings: Vec<String>,
+    /// Symbolic links and special files that were not sent.
+    pub skipped: Vec<String>,
     pub elapsed: Duration,
 }
 
@@ -69,12 +87,6 @@ const DEPTH: usize = 4;
 
 pub fn send(cfg: SendConfig, progress: std::sync::Arc<Progress>) -> Result<SendReport> {
     progress.conclude(run(&cfg, &progress))
-}
-
-/// A local file and where it goes in the manifest.
-struct Source {
-    entry: FileEntry,
-    path: PathBuf,
 }
 
 struct Ctx<'a> {
@@ -92,8 +104,27 @@ struct Ctx<'a> {
     sent: Vec<AtomicBitset>,
     /// A local read failure; fatal for the transfer, unlike network errors.
     fatal: Mutex<Option<anyhow::Error>>,
-    pool: &'a Pool<SealJob>,
+    pool: &'a Pool<SendJob>,
     buffers: &'a Buffers,
+    in_flight: InFlight,
+    hashing: HashRun,
+}
+
+/// Work for the pool.
+enum SendJob {
+    Seal(SealJob),
+    /// Digest chunks of the current `HashRun` window until none are left.
+    Hash,
+}
+
+/// One window of the `--hash` re-read: chunks `first..first + count` of
+/// `file`, digests written to `out` at `(index - first) * DIGEST_LEN`.
+#[derive(Default)]
+struct HashRun {
+    window: Mutex<(u32, u64, u64)>,
+    cursor: AtomicU64,
+    out: Mutex<Vec<u8>>,
+    error: Mutex<Option<anyhow::Error>>,
 }
 
 /// "Read `chunk` and seal it as frame `k` of `conn`", run on the pool.
@@ -147,13 +178,31 @@ fn run(cfg: &SendConfig, progress: &Progress) -> Result<SendReport> {
         "connections must be between 1 and 1024"
     );
     let chunk_size = ChunkSize::new(cfg.chunk_size)?;
-    let sources = collect_sources(&cfg.paths)?;
-    let files = sources
+    let captured = filemap::capture(&cfg.paths, cfg.preserve)?;
+    let files = captured
+        .files
         .iter()
-        .map(|s| File::open(&s.path).with_context(|| format!("opening {}", s.path.display())))
+        .map(|f| File::open(&f.source).with_context(|| format!("opening {}", f.source.display())))
         .collect::<Result<Vec<_>>>()?;
-    let (entries, paths): (Vec<_>, Vec<_>) = sources.into_iter().map(|s| (s.entry, s.path)).unzip();
+    let paths: Vec<PathBuf> = captured.files.iter().map(|f| f.source.clone()).collect();
+    let entries = captured
+        .files
+        .iter()
+        .map(|f| FileEntry {
+            path: f.path.clone(),
+            size: f.size,
+            mtime: f.mtime,
+        })
+        .collect();
     let manifest = Manifest::new(chunk_size, entries)?;
+    let skipped: Vec<String> = captured
+        .skipped
+        .iter()
+        .map(|p| p.display().to_string())
+        .collect();
+    for p in &skipped {
+        eprintln!("mjolnir: skipping {p}: not a regular file or directory");
+    }
 
     let addrs = net::resolve(&cfg.addr)?;
     let cancelled = || progress.is_cancelled();
@@ -187,12 +236,14 @@ fn run(cfg: &SendConfig, progress: &Progress) -> Result<SendReport> {
         fatal: Mutex::new(None),
         pool: &pool,
         buffers: &buffers,
+        in_flight: InFlight::default(),
+        hashing: HashRun::default(),
     };
     let result = thread::scope(|s| {
         for _ in 0..pool.threads() {
-            s.spawn(|| pool.work(|job| seal(&ctx, job)));
+            s.spawn(|| pool.work(|job| run_job(&ctx, job)));
         }
-        let result = transfer(&ctx, cfg.connections, &mut tx, &mut rx);
+        let result = transfer(&ctx, cfg, &captured.map, &mut tx, &mut rx);
         pool.close();
         result
     });
@@ -200,22 +251,44 @@ fn run(cfg: &SendConfig, progress: &Progress) -> Result<SendReport> {
         tell_peer_about(e, progress, Some(&mut tx));
         net::linger(rx.into_inner().into_stream());
     }
-    let (rounds, verified) = result?;
+    let done = result?;
+    let mut warnings = done.warnings;
+    warnings.extend(skipped.iter().map(|p| format!("skipped {p}")));
     Ok(SendReport {
         files: manifest.files.len(),
         bytes_sent: ctx.bytes_sent.load(Relaxed),
         chunks_sent: ctx.chunks_sent.load(Relaxed),
         chunks_resent: ctx.chunks_resent.load(Relaxed),
-        rounds,
-        verified,
+        rounds: done.rounds,
+        verified: done.verified,
+        hashed: done.hashed,
+        hash_repaired_chunks: done.hash_repaired,
+        file_hashes: done.file_hashes,
+        warnings,
+        skipped,
         elapsed: start.elapsed(),
     })
 }
 
-/// Runs rounds until the receiver reports `Finished`. Returns the round
-/// count and whether the receiver verified the files.
-fn transfer(ctx: &Ctx, connections: usize, tx: &mut Tx, rx: &mut Rx) -> Result<(u32, bool)> {
+/// How the session ended, as the receiver's `Finished` and our own
+/// bookkeeping tell it.
+struct Done {
+    rounds: u32,
+    verified: bool,
+    hashed: bool,
+    hash_repaired: u64,
+    file_hashes: Vec<(String, String)>,
+    warnings: Vec<String>,
+}
+
+/// Runs rounds until the receiver reports `Finished`, finalizing (with the
+/// hash check when asked) once the receiver reports `Delivered`.
+fn transfer(ctx: &Ctx, cfg: &SendConfig, map: &FileMap, tx: &mut Tx, rx: &mut Rx) -> Result<Done> {
     let m = ctx.manifest;
+    let connections = cfg.connections;
+    let mut finalized = false;
+    let mut file_hashes = Vec::new();
+    let mut hash_repaired = 0;
     tx.send(&Msg::Offer {
         chunk_size: m.chunk_size.get(),
         cipher: ctx.cipher,
@@ -248,11 +321,39 @@ fn transfer(ctx: &Ctx, connections: usize, tx: &mut Tx, rx: &mut Rx) -> Result<(
             connections: admitted,
         });
         // Read even if the send failed: the peer may have said why it left.
-        let reply = rx.recv().map_err(|e| sent.err().unwrap_or(e))?;
+        let mut reply = rx.recv().map_err(|e| sent.err().unwrap_or(e))?;
+        if matches!(reply, Msg::Delivered) && !finalized {
+            finalized = true;
+            if cfg.hash {
+                file_hashes = send_digests(ctx, tx)?;
+            }
+            ctx.progress.set_phase(Phase::Finishing);
+            tx.send(&Msg::Finalize {
+                hash: cfg.hash,
+                map: map.clone(),
+            })?;
+            reply = rx.recv()?;
+            if let Msg::Have { bitmaps } = &reply {
+                hash_repaired = missing_count(&parse_have(m, bitmaps)?);
+            }
+        }
         match reply {
-            Msg::Finished { verified } => return Ok((round + 1, verified)),
+            Msg::Finished {
+                verified,
+                hashed,
+                warnings,
+            } => {
+                return Ok(Done {
+                    rounds: round + 1,
+                    verified,
+                    hashed,
+                    hash_repaired,
+                    file_hashes,
+                    warnings,
+                });
+            }
             Msg::Have { bitmaps } => have = parse_have(m, &bitmaps)?,
-            other => return Err(unexpected(other, "Have or Finished")),
+            other => return Err(unexpected(other, "Have, Delivered, or Finished")),
         }
         ctx.progress.set_phase(Phase::Transferring);
         // Progress means some chunk this round carried is now held. Chunks
@@ -358,12 +459,12 @@ fn stream_frames(
                     break;
                 };
                 chunks[submitted as usize % DEPTH] = chunk;
-                ctx.pool.submit(SealJob {
+                ctx.pool.submit(SendJob::Seal(SealJob {
                     conn: conn.clone(),
                     k: submitted,
                     chunk,
                     buf,
-                });
+                }));
                 submitted += 1;
             }
             if written == submitted {
@@ -404,6 +505,88 @@ fn stream_frames(
     result
 }
 
+fn run_job(ctx: &Ctx, job: SendJob) {
+    match job {
+        SendJob::Seal(job) => seal(ctx, job),
+        SendJob::Hash => {
+            hash_some(ctx);
+            ctx.in_flight.done();
+        }
+    }
+}
+
+/// Re-reads every file on the pool and streams its chunk digests in
+/// `Digests` messages of at most `DIGESTS_PER_MSG`. Returns each file's
+/// `file_hash`.
+fn send_digests(ctx: &Ctx, tx: &mut Tx) -> Result<Vec<(String, String)>> {
+    let m = ctx.manifest;
+    ctx.progress.set_phase(Phase::Hashing);
+    ctx.progress.reset_counts();
+    let total_chunks = (0..m.files.len() as u32).map(|j| m.chunk_count(j)).sum();
+    ctx.progress
+        .set_totals(total_chunks, m.files.iter().map(|f| f.size).sum());
+    let run = &ctx.hashing;
+    let mut hashes = Vec::with_capacity(m.files.len());
+    for (j, f) in m.files.iter().enumerate() {
+        let count = chunk_count(f.size, m.chunk_size);
+        let mut hasher = FileHasher::new(m.chunk_size.get());
+        for first in (0..count).step_by(DIGESTS_PER_MSG) {
+            let n = (count - first).min(DIGESTS_PER_MSG as u64);
+            *run.window.lock().unwrap() = (j as u32, first, n);
+            *run.out.lock().unwrap() = vec![0u8; n as usize * DIGEST_LEN];
+            run.cursor.store(0, Relaxed);
+            for _ in 0..ctx.pool.threads() {
+                ctx.in_flight.add();
+                ctx.pool.submit(SendJob::Hash);
+            }
+            ctx.in_flight.wait_idle();
+            if ctx.progress.is_cancelled() {
+                return Err(Cancelled::Local.into());
+            }
+            if let Some(e) = run.error.lock().unwrap().take() {
+                return Err(e);
+            }
+            let digests = std::mem::take(&mut *run.out.lock().unwrap());
+            hasher.update(&digests);
+            tx.send(&Msg::Digests {
+                file: j as u32,
+                first,
+                digests,
+            })?;
+        }
+        hashes.push((f.path.display(), hasher.hex()));
+    }
+    check_unchanged(ctx)?;
+    Ok(hashes)
+}
+
+/// One pool worker's share of a `HashRun` window.
+fn hash_some(ctx: &Ctx) {
+    let run = &ctx.hashing;
+    let (file, first, n) = *run.window.lock().unwrap();
+    let entry = &ctx.manifest.files[file as usize];
+    let mut buf = vec![0u8; ctx.manifest.chunk_size.get() as usize];
+    let mut done = Vec::new();
+    while let i = run.cursor.fetch_add(1, Relaxed)
+        && i < n
+        && !ctx.progress.is_cancelled()
+    {
+        let (offset, len) = chunk_span(entry.size, ctx.manifest.chunk_size, first + i);
+        let data = &mut buf[..len as usize];
+        if let Err(e) = read_exact_at(&ctx.files[file as usize], data, offset) {
+            let e = anyhow!(e).context(format!("re-reading {}", entry.path.display()));
+            *run.error.lock().unwrap() = Some(e);
+            return;
+        }
+        done.push((i, chunk_digest(data)));
+        ctx.progress.add_chunk(u64::from(len));
+    }
+    let mut out = run.out.lock().unwrap();
+    for (i, digest) in done {
+        out[i as usize * DIGEST_LEN..][..DIGEST_LEN].copy_from_slice(&digest);
+    }
+}
+
 /// Pool worker: reads a chunk and seals it as its connection's frame `k`.
 fn seal(ctx: &Ctx, job: SealJob) {
     let SealJob {
@@ -419,7 +602,7 @@ fn seal(ctx: &Ctx, job: SealJob) {
     let plain = &mut frame[HEADER_LEN..HEADER_LEN + len as usize];
     let sealed = read_exact_at(&ctx.files[chunk.file as usize], plain, offset)
         .map_err(|e| {
-            let path = ctx.manifest.files[chunk.file as usize].path.as_str();
+            let path = ctx.manifest.files[chunk.file as usize].path.display();
             let e = anyhow!(e).context(format!("reading {path} at offset {offset}"));
             *ctx.fatal.lock().unwrap() = Some(anyhow!("{e:#}"));
             e
@@ -484,60 +667,6 @@ fn missing(have: &[AtomicBitset]) -> Vec<ChunkId> {
     queue
 }
 
-/// Walks the inputs. A file is named by its file name; a directory's files
-/// are named `<dir name>/<path inside it>`.
-fn collect_sources(paths: &[PathBuf]) -> Result<Vec<Source>> {
-    ensure!(!paths.is_empty(), "nothing to send");
-    let mut out = Vec::new();
-    for root in paths {
-        let meta = fs::metadata(root).with_context(|| format!("reading {}", root.display()))?;
-        let canonical = root.canonicalize()?;
-        let base = canonical
-            .file_name()
-            .map(|n| utf8(Path::new(n)))
-            .transpose()?;
-        if meta.is_file() {
-            let name = base.with_context(|| format!("{} has no file name", root.display()))?;
-            out.push(source(&name, root.clone(), &meta)?);
-            continue;
-        }
-        for entry in WalkDir::new(root).sort_by_file_name() {
-            let entry = entry?;
-            if !entry.file_type().is_file() {
-                continue;
-            }
-            let inner = utf8(entry.path().strip_prefix(root)?)?;
-            let name = match &base {
-                Some(base) => format!("{base}/{inner}"),
-                None => inner,
-            };
-            out.push(source(&name, entry.path().to_owned(), &entry.metadata()?)?);
-        }
-    }
-    Ok(out)
-}
-
-fn source(name: &str, path: PathBuf, meta: &fs::Metadata) -> Result<Source> {
-    Ok(Source {
-        entry: FileEntry {
-            path: RelPath::parse(name)
-                .with_context(|| format!("cannot send {}", path.display()))?,
-            size: meta.len(),
-            mtime: mtime_of(meta),
-        },
-        path,
-    })
-}
-
-/// A relative path as `/`-separated UTF-8.
-fn utf8(p: &Path) -> Result<String> {
-    let parts = p
-        .components()
-        .map(|c| {
-            c.as_os_str()
-                .to_str()
-                .with_context(|| format!("{} is not valid UTF-8", p.display()))
-        })
-        .collect::<Result<Vec<_>>>()?;
-    Ok(parts.join("/"))
+fn missing_count(have: &[AtomicBitset]) -> u64 {
+    have.iter().map(|b| b.len() - b.count_ones()).sum()
 }

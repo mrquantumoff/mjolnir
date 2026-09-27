@@ -138,7 +138,10 @@ holds one byte string per file, in offer order, of exactly
 `ceil(chunk_count / 8)` bytes: chunk `k` is bit `k % 8` (least significant
 first) of byte `k / 8`. The sender rejects a `Have` whose shape does not
 match the offer, and refuses up front to offer more chunks than a `Have`
-could carry in one 64 MiB message.
+could carry in one 64 MiB message. In `Digests`, `file` is a `u32`,
+`first` a `u64`, and `digests` one byte string of concatenated 16-byte
+digests. `Finalize.map` is the file map below, and `Finished.warnings` a
+list of strings.
 
 `path` is a list of components, each a byte string: the file's raw name,
 not necessarily UTF-8 (see "File names"). The receiver rejects empty paths,
@@ -146,13 +149,15 @@ empty components, `.` and `..` components, components containing NUL or
 `/`, paths deeper than 256 components or longer than 4096 bytes (the
 components joined with `/`), components ending in `.mjolnir-part`,
 `.mjolnir-state`, `.mjolnir-state.tmp`, or `.mjolnir-sums` in any ASCII
-case, and paths that are equal after lowercasing their macOS names (see
-"File names"). The suffix rule covers directories too, because a directory
+case, and paths that are equal after NFC-normalizing and lowercasing their
+macOS names (see "File names"). The suffix rule covers directories too, because a directory
 `a.mjolnir-part` would collide with the part file of a sibling `a`, and it
 ignores case because on a case-insensitive file system `a.MJOLNIR-PART` is
 that part file. Case-insensitive file systems (Windows, macOS) treat
-`README` and `readme` as one file. The collision rule uses one key on every
-OS, the lowercased macOS name, so the same offer is valid or invalid
+`README` and `readme` as one file, and APFS also treats the NFC and NFD
+spellings of a name (`café` as one code point or as `e` plus a combining
+accent) as one file. The collision rule uses one key on every OS, the
+NFC-normalized, lowercased macOS name, so the same offer is valid or invalid
 everywhere, and any two names that collide on Windows also collide under
 it. `file_id` is the index into `files`.
 

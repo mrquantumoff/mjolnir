@@ -311,6 +311,8 @@ fn start_send(app: &App, req: SendRequest) -> Result<Reply, ApiError> {
         cipher: req.cipher,
         threads,
         paths,
+        hash: false,
+        preserve: Default::default(),
     };
     let id = app.jobs.spawn(spec, move |progress| {
         crate::send(cfg, progress).map(Report::from)
@@ -350,6 +352,7 @@ fn start_receive(app: &App, req: ReceiveRequest) -> Result<Reply, ApiError> {
         force: req.force,
         verify: req.verify,
         threads,
+        apply: Default::default(),
     })
     .map_err(|e| ApiError::field("listen", format!("{e:#}")))?;
     let bound_addr = receiver.local_addr();
@@ -436,6 +439,7 @@ fn phase_name(p: Phase) -> &'static str {
         Phase::Handshaking => "handshaking",
         Phase::Transferring => "transferring",
         Phase::Verifying => "verifying",
+        Phase::Hashing => "hashing",
         Phase::Finishing => "finishing",
         Phase::Done => "done",
         Phase::Failed => "failed",

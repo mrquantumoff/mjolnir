@@ -2,84 +2,13 @@
 
 use std::collections::HashSet;
 use std::fs::Metadata;
-use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
 
-use anyhow::{Result, anyhow, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use serde::{Deserialize, Serialize};
+use serde_bytes::ByteBuf;
 
-/// A relative path with `/` separators that is safe to join under an output
-/// directory on any OS. Only constructible through [`RelPath::parse`].
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub struct RelPath(String);
-
-impl RelPath {
-    pub fn parse(s: &str) -> Result<Self> {
-        if s.is_empty() {
-            bail!("empty path");
-        }
-        if s.starts_with('/') {
-            bail!("absolute path {s:?}");
-        }
-        if s.contains('\\') {
-            bail!("backslash in path {s:?}");
-        }
-        for component in s.split('/') {
-            match component {
-                "" => bail!("empty component in path {s:?}"),
-                "." | ".." => bail!("{component:?} component in path {s:?}"),
-                c if c.contains(':') => bail!("':' (drive prefix or stream) in path {s:?}"),
-                c if c.contains('\0') => bail!("NUL in path {s:?}"),
-                c if c.ends_with('.') || c.ends_with(' ') => {
-                    bail!("component ending in '.' or ' ' in path {s:?}")
-                }
-                c if is_windows_device(c) => bail!("reserved device name in path {s:?}"),
-                _ => {}
-            }
-        }
-        if RESERVED_SUFFIXES.iter().any(|suffix| s.ends_with(suffix)) {
-            bail!("path {s:?} ends in a suffix the receiver uses for its own files");
-        }
-        Ok(RelPath(s.to_owned()))
-    }
-
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
-
-    /// Names that case-insensitive file systems treat as one file share a key.
-    fn collision_key(&self) -> String {
-        self.0.to_lowercase()
-    }
-
-    /// Joins component by component, so no component can reset the base.
-    pub fn under(&self, root: &Path) -> PathBuf {
-        let mut path = root.to_path_buf();
-        path.extend(self.0.split('/'));
-        path
-    }
-}
-
-/// Suffixes of the receiver's side files; see `recv.rs`.
-pub const RESERVED_SUFFIXES: [&str; 4] = [
-    ".mjolnir-part",
-    ".mjolnir-state",
-    ".mjolnir-state.tmp",
-    ".mjolnir-sums",
-];
-
-/// `CON`, `nul.txt`, `COM1` and the like open devices on Windows.
-fn is_windows_device(component: &str) -> bool {
-    let stem = component
-        .split('.')
-        .next()
-        .unwrap_or_default()
-        .to_ascii_uppercase();
-    matches!(stem.as_str(), "CON" | "PRN" | "AUX" | "NUL")
-        || (stem.len() == 4
-            && (stem.starts_with("COM") || stem.starts_with("LPT"))
-            && matches!(stem.as_bytes()[3], b'1'..=b'9'))
-}
+use crate::names::WirePath;
 
 pub const MIN_CHUNK_SIZE: u32 = 4 << 10;
 pub const MAX_CHUNK_SIZE: u32 = 64 << 20;
@@ -124,16 +53,18 @@ pub fn parse_size(text: &str) -> Result<u32> {
 /// One file of the manifest.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FileEntry {
-    pub path: RelPath,
+    pub path: WirePath,
     pub size: u64,
     /// Modification time in nanoseconds since the Unix epoch (0 if unknown).
     pub mtime: u64,
 }
 
-/// A file as it travels in `Offer`, before validation.
+/// A file as it travels in `Offer`, before validation. `path` has the
+/// same encoding as a serialized [`WirePath`]; it is parsed explicitly so a
+/// bad name gets a precise error.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OfferFile {
-    pub path: String,
+    pub path: Vec<ByteBuf>,
     pub size: u64,
     pub mtime: u64,
 }
@@ -148,7 +79,8 @@ pub fn mtime_of(meta: &Metadata) -> u64 {
 /// `file_id` value reserved for the end-of-stream frame.
 pub const END_FILE_ID: u32 = u32::MAX;
 
-/// A validated manifest: unique paths, fewer than `END_FILE_ID` files.
+/// A validated manifest: paths unique after case and Unicode folding,
+/// fewer than `END_FILE_ID` files.
 #[derive(Clone, Debug)]
 pub struct Manifest {
     pub chunk_size: ChunkSize,
@@ -162,10 +94,11 @@ impl Manifest {
         }
         let mut seen = HashSet::new();
         for f in &files {
-            if !seen.insert(f.path.collision_key()) {
+            if !seen.insert(f.path.fold_key()) {
                 bail!(
-                    "duplicate path {:?} (paths that differ only in case collide)",
-                    f.path.as_str()
+                    "duplicate path {} (paths that differ only in case or Unicode \
+                     normalization collide)",
+                    f.path.display()
                 );
             }
         }
@@ -186,9 +119,12 @@ impl Manifest {
         let chunk_size = ChunkSize::new(chunk_size)?;
         let files = files
             .into_iter()
-            .map(|f| {
+            .enumerate()
+            .map(|(j, f)| {
+                let path = WirePath::parse(f.path.into_iter().map(ByteBuf::into_vec))
+                    .with_context(|| format!("file {j} of the offer"))?;
                 Ok(FileEntry {
-                    path: RelPath::parse(&f.path)?,
+                    path,
                     size: f.size,
                     mtime: f.mtime,
                 })
@@ -201,7 +137,12 @@ impl Manifest {
         self.files
             .iter()
             .map(|f| OfferFile {
-                path: f.path.as_str().to_owned(),
+                path: f
+                    .path
+                    .components()
+                    .iter()
+                    .map(|c| ByteBuf::from(c.as_bytes()))
+                    .collect(),
                 size: f.size,
                 mtime: f.mtime,
             })
@@ -248,6 +189,10 @@ mod tests {
 
     fn cs(n: u32) -> ChunkSize {
         ChunkSize::new(n).unwrap()
+    }
+
+    fn wire(p: &str) -> WirePath {
+        WirePath::parse(p.split('/').map(|c| c.as_bytes().to_vec())).unwrap()
     }
 
     #[test]
@@ -304,82 +249,22 @@ mod tests {
     }
 
     #[test]
-    fn relpath_accepts_normal_paths() {
-        for ok in [
-            "a",
-            "a/b/c.txt",
-            "dir/.hidden",
-            "a..b/c",
-            "space name/x",
-            "console",
-            "com10",
-            "nul_file",
-            "x.mjolnir-partial",
-        ] {
-            RelPath::parse(ok).unwrap_or_else(|e| panic!("{ok}: {e}"));
-        }
-    }
-
-    #[test]
-    fn relpath_rejections() {
-        for bad in [
-            "",
-            "/etc/passwd",
-            "../x",
-            "a/../../x",
-            "a/./b",
-            ".",
-            "a\\b",
-            "..\\x",
-            "C:/Windows",
-            "C:x",
-            "a/C:x",
-            "file:stream",
-            "a//b",
-            "a/",
-            "//server/share",
-            "a/\0b",
-            "a.",
-            "a ",
-            "d./f",
-            "...",
-            "nul",
-            "NUL.txt",
-            "dir/com1",
-            "Lpt9.log",
-            "aux/x",
-            "big.iso.mjolnir-part",
-            "x.mjolnir-state",
-            "x.mjolnir-state.tmp",
-            "x.mjolnir-sums",
-        ] {
-            assert!(RelPath::parse(bad).is_err(), "accepted {bad:?}");
-        }
-    }
-
-    #[test]
     fn offer_with_bad_path_or_chunk_size_is_rejected() {
         let f = |p: &str| OfferFile {
-            path: p.to_owned(),
+            path: p.split('/').map(|c| ByteBuf::from(c.as_bytes())).collect(),
             size: 10,
             mtime: 0,
         };
         assert!(Manifest::from_offer(4096, vec![f("ok/file")]).is_ok());
         let err = Manifest::from_offer(4096, vec![f("ok"), f("../evil")]).unwrap_err();
-        assert!(err.to_string().contains("../evil"), "{err}");
+        assert!(format!("{err:#}").contains("file 1"), "{err:#}");
         assert!(Manifest::from_offer(1, vec![f("ok")]).is_err());
-    }
-
-    #[test]
-    fn relpath_joins_per_component() {
-        let p = RelPath::parse("a/b/c").unwrap().under(Path::new("out"));
-        assert_eq!(p, Path::new("out").join("a").join("b").join("c"));
     }
 
     #[test]
     fn manifest_rejects_offers_whose_have_would_not_fit() {
         let huge = FileEntry {
-            path: RelPath::parse("huge").unwrap(),
+            path: wire("huge"),
             size: 1 << 50,
             mtime: 0,
         };
@@ -391,7 +276,7 @@ mod tests {
     #[test]
     fn manifest_rejects_duplicates() {
         let f = |p: &str| FileEntry {
-            path: RelPath::parse(p).unwrap(),
+            path: wire(p),
             size: 1,
             mtime: 0,
         };
@@ -399,6 +284,8 @@ mod tests {
         let err = Manifest::new(cs(4096), vec![f("a"), f("b"), f("a")]).unwrap_err();
         assert!(err.to_string().contains("duplicate"));
         let err = Manifest::new(cs(4096), vec![f("README"), f("readme")]).unwrap_err();
+        assert!(err.to_string().contains("duplicate"));
+        let err = Manifest::new(cs(4096), vec![f("caf\u{e9}"), f("cafe\u{301}")]).unwrap_err();
         assert!(err.to_string().contains("duplicate"));
     }
 }

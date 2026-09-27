@@ -212,6 +212,16 @@ fn fold_key_is_case_insensitive_and_platform_independent() {
 }
 
 #[test]
+fn fold_key_joins_nfc_and_nfd_spellings() {
+    let key = |name: &str| WirePath::parse([name.as_bytes()]).unwrap().fold_key();
+    let nfc = "caf\u{e9}";
+    let nfd = "cafe\u{301}";
+    assert_ne!(nfc.as_bytes(), nfd.as_bytes());
+    assert_eq!(key(nfc), key(nfd));
+    assert_eq!(key("CAF\u{c9}"), key(nfd));
+}
+
+#[test]
 fn display_is_lossy() {
     let p = WirePath::parse([b"d".as_slice(), b"\xffx"]).unwrap();
     assert_eq!(p.display(), "d/\u{FFFD}x");

@@ -22,6 +22,35 @@ const NOISE_MAX: usize = 65535;
 const IK_MSG1_LEN: usize = 96;
 
 pub const TAG_LEN: usize = 16;
+/// Bytes of BLAKE3 kept per chunk.
+pub const DIGEST_LEN: usize = 16;
+
+/// A chunk's digest: BLAKE3 of its plaintext, truncated to 16 bytes.
+pub fn chunk_digest(plaintext: &[u8]) -> [u8; DIGEST_LEN] {
+    blake3::hash(plaintext).as_bytes()[..DIGEST_LEN]
+        .try_into()
+        .unwrap()
+}
+
+/// Builds a file's `file_hash = BLAKE3(chunk_size u32 | chunk digests)`.
+pub struct FileHasher(blake3::Hasher);
+
+impl FileHasher {
+    pub fn new(chunk_size: u32) -> Self {
+        let mut h = blake3::Hasher::new();
+        h.update(&chunk_size.to_be_bytes());
+        FileHasher(h)
+    }
+
+    /// Feeds digests in chunk order.
+    pub fn update(&mut self, digests: &[u8]) {
+        self.0.update(digests);
+    }
+
+    pub fn hex(&self) -> String {
+        self.0.finalize().to_hex().to_string()
+    }
+}
 
 /// The message the sender shows when the receiver closed during the handshake.
 pub const REJECTED: &str = "the receiver rejected the handshake (this sender's key is not authorized, \

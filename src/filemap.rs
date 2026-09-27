@@ -41,7 +41,7 @@ pub enum EntryKind {
 }
 
 /// What the sender puts in the map (`send --preserve`).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Preserve {
     pub perms: bool,
     pub times: bool,
@@ -89,7 +89,7 @@ impl FromStr for Preserve {
 }
 
 /// The receiver's guard against a hostile or careless sender.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ApplyPolicy {
     /// Keep setuid, setgid, and sticky (`recv --allow-special-bits`).
     pub allow_special_bits: bool,

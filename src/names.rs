@@ -204,15 +204,22 @@ impl WirePath {
         parts.join("/")
     }
 
-    /// Key for the case-insensitive duplicate check. It lowercases the
-    /// macOS mapping on every platform, so an offer is valid or invalid
-    /// everywhere alike: names that collide on Windows or macOS always share
-    /// a key.
+    /// Key for the case-insensitive duplicate check. It NFC-normalizes and
+    /// then lowercases the macOS mapping on every platform, so an offer is
+    /// valid or invalid everywhere alike: names that collide on Windows or
+    /// macOS always share a key. APFS treats the NFC and NFD spellings of a
+    /// name as one file, hence the normalization.
     pub fn fold_key(&self) -> String {
+        use unicode_normalization::UnicodeNormalization;
         let parts: Vec<_> = self
             .0
             .iter()
-            .map(|n| String::from_utf8_lossy(&encode_utf8_escaped(&n.0)).to_lowercase())
+            .map(|n| {
+                String::from_utf8_lossy(&encode_utf8_escaped(&n.0))
+                    .nfc()
+                    .collect::<String>()
+                    .to_lowercase()
+            })
             .collect();
         parts.join("/")
     }

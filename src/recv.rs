@@ -17,7 +17,11 @@ use anyhow::{Context, Result, anyhow, bail, ensure};
 use serde::Serialize;
 
 use crate::bitset::{AtomicBitset, PartState};
-use crate::crypto::{Cipher, FrameKey, SessionKeys, TAG_LEN, handshake_responder};
+use crate::crypto::{
+    Cipher, DIGEST_LEN, FileHasher, FrameKey, SessionKeys, TAG_LEN, chunk_digest,
+    handshake_responder,
+};
+use crate::filemap::{self, ApplyPolicy, FileMap};
 use crate::keys::{PrivateKey, PublicKey, require_nonempty};
 use crate::manifest::{ChunkSize, FileEntry, Manifest, chunk_count, chunk_span};
 use crate::net::{self, Io, tell_peer_about, unexpected};
@@ -43,6 +47,8 @@ pub struct RecvConfig {
     pub verify: bool,
     /// Workers that open, write, and verify chunks; 0 means one per core.
     pub threads: usize,
+    /// How far to trust the sender's file map.
+    pub apply: ApplyPolicy,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -58,6 +64,16 @@ pub struct RecvReport {
     pub repaired_chunks: u64,
     /// Whether every chunk was read back and matched its digest.
     pub verified: bool,
+    /// Whether the sender's re-read digests were compared (`send --hash`).
+    pub hashed: bool,
+    /// Chunks the hash check found different and fetched again.
+    pub hash_repaired_chunks: u64,
+    /// `(path, file_hash)` per file.
+    pub file_hashes: Vec<(String, String)>,
+    /// File map entries that could not be applied.
+    pub warnings: Vec<String>,
+    /// Always empty on the receiver; the sender lists what it skipped.
+    pub skipped: Vec<String>,
     pub rounds: u32,
     pub elapsed: Duration,
 }
@@ -89,8 +105,6 @@ const ROUND_CLOSE_WAIT: Duration = Duration::from_secs(30);
 const ACCEPT_POLL: Duration = Duration::from_millis(5);
 /// Verification failures of one chunk tolerated in a session.
 const MAX_VERIFY_FAILURES: u8 = 3;
-/// Bytes of BLAKE3 kept per chunk in the sums file.
-const DIGEST_LEN: usize = 16;
 const MAX_VERIFY_THREADS: usize = 16;
 /// Connections the buffer pool is sized for; more still work, sharing it.
 const EXPECTED_CONNECTIONS: usize = 16;
@@ -204,7 +218,12 @@ impl Receiver {
             duplicate_chunks: o.stats.duplicates.load(Relaxed),
             repaired_chunks: o.stats.repaired.load(Relaxed),
             verified: o.verified,
-            rounds: o.rounds,
+            hashed: o.finish.hashed,
+            hash_repaired_chunks: o.stats.hash_repaired.load(Relaxed),
+            file_hashes: o.finish.file_hashes,
+            warnings: o.finish.warnings,
+            skipped: Vec::new(),
+            rounds: o.finish.rounds,
             elapsed: start.elapsed(),
         })
     }
@@ -253,6 +272,8 @@ impl Receiver {
             manifest,
             targets,
             verify: self.cfg.verify,
+            out_dir: &self.cfg.out_dir,
+            policy: self.cfg.apply,
             sync: RoundSync::default(),
             progress,
             stats: Stats::default(),
@@ -296,12 +317,12 @@ impl Receiver {
         {
             eprintln!("mjolnir: checkpoint failed: {e:#}");
         }
-        let rounds = rounds?;
+        let finish = rounds?;
         Ok(Outcome {
             files: session.targets.len(),
             stats: session.stats,
             verified: session.verify,
-            rounds,
+            finish,
         })
     }
 }
@@ -316,13 +337,30 @@ struct Stats {
     bytes: AtomicU64,
     duplicates: AtomicU64,
     repaired: AtomicU64,
+    hash_repaired: AtomicU64,
 }
 
 struct Outcome {
     files: usize,
     stats: Stats,
     verified: bool,
+    finish: Finish,
+}
+
+/// What the final round decided.
+struct Finish {
     rounds: u32,
+    hashed: bool,
+    file_hashes: Vec<(String, String)>,
+    warnings: Vec<String>,
+}
+
+/// The sender's `Finalize`, kept while a hash repair round runs.
+struct Finalized {
+    hash: bool,
+    map: FileMap,
+    /// The sender's digests for the chunks the hash check sent back.
+    expected: HashMap<(u32, u64), [u8; DIGEST_LEN]>,
 }
 
 /// Reads the preamble and runs the Noise handshake, all within
@@ -375,12 +413,6 @@ enum Landed {
     Duplicate,
 }
 
-fn digest(plaintext: &[u8]) -> [u8; DIGEST_LEN] {
-    blake3::hash(plaintext).as_bytes()[..DIGEST_LEN]
-        .try_into()
-        .unwrap()
-}
-
 impl Target {
     fn span(&self, index: u64) -> (u64, u32) {
         chunk_span(self.entry.size, self.chunk_size, index)
@@ -392,8 +424,13 @@ impl Target {
         if !self.claimed.set(index) {
             return Ok(Landed::Duplicate);
         }
-        let written = write_all_at(&self.part, plaintext, self.span(index).0)
-            .and_then(|()| write_all_at(&self.sums, &digest(plaintext), index * DIGEST_LEN as u64));
+        let written = write_all_at(&self.part, plaintext, self.span(index).0).and_then(|()| {
+            write_all_at(
+                &self.sums,
+                &chunk_digest(plaintext),
+                index * DIGEST_LEN as u64,
+            )
+        });
         if let Err(e) = written {
             self.claimed.clear(index);
             return Err(e);
@@ -410,7 +447,7 @@ impl Target {
         read_exact_at(&self.part, data, offset)?;
         let mut stored = [0u8; DIGEST_LEN];
         read_exact_at(&self.sums, &mut stored, index * DIGEST_LEN as u64)?;
-        Ok(digest(data) == stored)
+        Ok(chunk_digest(data) == stored)
     }
 
     /// Makes a chunk missing again after it failed verification.
@@ -433,7 +470,7 @@ fn with_suffix(path: &Path, suffix: &str) -> PathBuf {
 fn prepare_targets(out: &Path, m: &Manifest, force: bool) -> Result<Vec<Target>> {
     let mut targets = Vec::with_capacity(m.files.len());
     for entry in &m.files {
-        let final_path = entry.path.under(out);
+        let final_path = entry.path.to_local_path(out);
         if !force && fs::symlink_metadata(&final_path).is_ok() {
             bail!(
                 "{} already exists (use --force to overwrite)",
@@ -528,6 +565,8 @@ struct Session<'a> {
     manifest: Manifest,
     targets: Vec<Target>,
     verify: bool,
+    out_dir: &'a Path,
+    policy: ApplyPolicy,
     sync: RoundSync,
     progress: &'a Progress,
     stats: Stats,
@@ -575,42 +614,167 @@ struct VerifyRun {
 }
 
 impl Session<'_> {
-    /// Drives the control channel until `Finished`. Returns the round count.
-    fn rounds(&self, rx: &mut Rx, tx: &mut Tx) -> Result<u32> {
+    /// Drives the control channel until `Finished`.
+    fn rounds(&self, rx: &mut Rx, tx: &mut Tx) -> Result<Finish> {
+        let mut finalized: Option<Finalized> = None;
         loop {
-            match rx.recv()? {
+            let (round, connections) = match rx.recv()? {
                 Msg::RoundStart { round } => {
                     self.sync.start(round)?;
                     self.progress.set_phase(Phase::Transferring);
+                    continue;
                 }
-                Msg::RoundEnd { round, connections } => {
-                    self.sync.end(round, connections, self.progress)?;
-                    self.in_flight.wait_idle();
-                    if let Some(message) = self.fatal.lock().unwrap().take() {
-                        bail!(message);
-                    }
-                    self.checkpoint()?;
-                    if self.targets.iter().all(|t| t.present.is_full()) {
-                        if self.verify {
-                            self.progress.set_phase(Phase::Verifying);
-                            self.verify_all()?;
-                        }
-                        if self.targets.iter().all(|t| t.present.is_full()) {
-                            self.progress.set_phase(Phase::Finishing);
-                            self.finalize()?;
-                            tx.send(&Msg::Finished {
-                                verified: self.verify,
-                            })?;
-                            return Ok(round + 1);
-                        }
-                        self.checkpoint()?;
-                        set_missing_totals(self.progress, &self.targets, self.manifest.chunk_size);
-                    }
-                    tx.send(&have_msg(&self.targets))?;
-                }
+                Msg::RoundEnd { round, connections } => (round, connections),
                 other => return Err(unexpected(other, "RoundStart or RoundEnd")),
+            };
+            self.sync.end(round, connections, self.progress)?;
+            self.in_flight.wait_idle();
+            if let Some(message) = self.fatal.lock().unwrap().take() {
+                bail!(message);
+            }
+            self.checkpoint()?;
+            if self.all_present() && self.verify {
+                self.progress.set_phase(Phase::Verifying);
+                self.verify_all()?;
+            }
+            if self.all_present() {
+                match &finalized {
+                    None => {
+                        tx.send(&Msg::Delivered)?;
+                        finalized = Some(self.await_finalize(rx)?);
+                    }
+                    Some(done) => self.check_repairs(done)?,
+                }
+            }
+            if self.all_present() {
+                let done = finalized.expect("finalized before every chunk is present");
+                self.progress.set_phase(Phase::Finishing);
+                let file_hashes = self.file_hashes()?;
+                self.finalize()?;
+                let warnings = filemap::apply(&done.map, self.out_dir, self.policy);
+                for w in &warnings {
+                    eprintln!("mjolnir: {w}");
+                }
+                tx.send(&Msg::Finished {
+                    verified: self.verify,
+                    hashed: done.hash,
+                    warnings: warnings.clone(),
+                })?;
+                return Ok(Finish {
+                    rounds: round + 1,
+                    hashed: done.hash,
+                    file_hashes,
+                    warnings,
+                });
+            }
+            self.checkpoint()?;
+            set_missing_totals(self.progress, &self.targets, self.manifest.chunk_size);
+            tx.send(&have_msg(&self.targets))?;
+        }
+    }
+
+    fn all_present(&self) -> bool {
+        self.targets.iter().all(|t| t.present.is_full())
+    }
+
+    /// After `Delivered`: reads the sender's `Digests` (if any) and its
+    /// `Finalize`. Chunks whose stored digest differs from the sender's
+    /// become missing and are remembered for the repair round.
+    fn await_finalize(&self, rx: &mut Rx) -> Result<Finalized> {
+        let mut expected = HashMap::new();
+        loop {
+            match rx.recv()? {
+                Msg::Digests {
+                    file,
+                    first,
+                    digests,
+                } => {
+                    self.progress.set_phase(Phase::Hashing);
+                    self.compare_digests(file, first, &digests, &mut expected)?;
+                }
+                Msg::Finalize { hash, map } => {
+                    let offer: Vec<_> =
+                        self.manifest.files.iter().map(|f| f.path.clone()).collect();
+                    map.check(&offer).context("rejected the file map")?;
+                    return Ok(Finalized {
+                        hash,
+                        map,
+                        expected,
+                    });
+                }
+                other => return Err(unexpected(other, "Digests or Finalize")),
             }
         }
+    }
+
+    fn compare_digests(
+        &self,
+        file: u32,
+        first: u64,
+        digests: &[u8],
+        expected: &mut HashMap<(u32, u64), [u8; DIGEST_LEN]>,
+    ) -> Result<()> {
+        let t = self
+            .targets
+            .get(file as usize)
+            .with_context(|| format!("Digests for file {file}, which is not in the offer"))?;
+        ensure!(
+            digests.len().is_multiple_of(DIGEST_LEN),
+            "Digests length is not a multiple of {DIGEST_LEN}"
+        );
+        let n = (digests.len() / DIGEST_LEN) as u64;
+        ensure!(
+            first
+                .checked_add(n)
+                .is_some_and(|end| end <= t.present.len()),
+            "Digests for chunks past the end of {}",
+            t.entry.path.display()
+        );
+        let mut ours = vec![0u8; digests.len()];
+        read_exact_at(&t.sums, &mut ours, first * DIGEST_LEN as u64)?;
+        let (theirs, _) = digests.as_chunks::<DIGEST_LEN>();
+        let (mine, _) = ours.as_chunks::<DIGEST_LEN>();
+        for (i, (theirs, mine)) in theirs.iter().zip(mine).enumerate() {
+            if theirs != mine {
+                let index = first + i as u64;
+                t.reject(index);
+                self.stats.hash_repaired.fetch_add(1, Relaxed);
+                expected.insert((file, index), *theirs);
+            }
+        }
+        Ok(())
+    }
+
+    /// After a hash repair round: every refetched chunk must now match the
+    /// digest the sender reported.
+    fn check_repairs(&self, done: &Finalized) -> Result<()> {
+        for (&(file, index), want) in &done.expected {
+            let t = &self.targets[file as usize];
+            let mut stored = [0u8; DIGEST_LEN];
+            read_exact_at(&t.sums, &mut stored, index * DIGEST_LEN as u64)?;
+            ensure!(
+                stored == *want,
+                "{} changed during transfer",
+                t.entry.path.display()
+            );
+        }
+        Ok(())
+    }
+
+    /// `(path, BLAKE3(chunk_size u32 | chunk digests))` for every file, from
+    /// the sums files.
+    fn file_hashes(&self) -> Result<Vec<(String, String)>> {
+        let chunk_size = self.manifest.chunk_size.get();
+        self.targets
+            .iter()
+            .map(|t| {
+                let mut digests = vec![0u8; t.present.len() as usize * DIGEST_LEN];
+                read_exact_at(&t.sums, &mut digests, 0)?;
+                let mut hasher = FileHasher::new(chunk_size);
+                hasher.update(&digests);
+                Ok((t.entry.path.display(), hasher.hex()))
+            })
+            .collect()
     }
 
     /// Handles one authenticated chunk from any connection.
@@ -728,7 +892,7 @@ impl Session<'_> {
         ensure!(
             *count < MAX_VERIFY_FAILURES,
             "chunk {index} of {} keeps failing verification",
-            t.entry.path.as_str()
+            t.entry.path.display()
         );
         Ok(())
     }
@@ -1064,13 +1228,14 @@ impl RoundSync {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::manifest::{MIN_CHUNK_SIZE, RelPath};
+    use crate::manifest::MIN_CHUNK_SIZE;
+    use crate::names::WirePath;
 
     fn target_in(dir: &Path, size: u64) -> Target {
         let m = Manifest::new(
             ChunkSize::new(MIN_CHUNK_SIZE).unwrap(),
             vec![FileEntry {
-                path: RelPath::parse("f").unwrap(),
+                path: WirePath::parse([b"f".to_vec()]).unwrap(),
                 size,
                 mtime: 1,
             }],

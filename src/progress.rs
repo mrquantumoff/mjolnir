@@ -16,16 +16,20 @@ pub enum Phase {
     Transferring,
     /// The receiver is reading chunks back to check their digests.
     Verifying,
+    /// `send --hash`: the sender re-reads its files for chunk digests and
+    /// the receiver compares them.
+    Hashing,
     Finishing,
     Done,
     Failed,
 }
 
-const PHASES: [Phase; 7] = [
+const PHASES: [Phase; 8] = [
     Phase::Connecting,
     Phase::Handshaking,
     Phase::Transferring,
     Phase::Verifying,
+    Phase::Hashing,
     Phase::Finishing,
     Phase::Done,
     Phase::Failed,

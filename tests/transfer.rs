@@ -9,6 +9,7 @@ use std::time::{Duration, Instant, SystemTime};
 use anyhow::Result;
 use mjolnir::bitset::{AtomicBitset, PartState};
 use mjolnir::crypto::REJECTED;
+use mjolnir::filemap::Preserve;
 use mjolnir::manifest::mtime_of;
 use mjolnir::{
     Cancelled, Cipher, Phase, PrivateKey, Progress, PublicKey, Receiver, RecvConfig, RecvReport,
@@ -57,6 +58,7 @@ fn recv_config(key: PrivateKey, authorized: Vec<PublicKey>, out: &Path) -> RecvC
         force: false,
         verify: true,
         threads: *THREADS,
+        apply: Default::default(),
     }
 }
 
@@ -98,6 +100,8 @@ struct Send {
     chunk_size: u32,
     cipher: Cipher,
     threads: usize,
+    hash: bool,
+    preserve: Preserve,
 }
 
 impl Send {
@@ -109,6 +113,8 @@ impl Send {
             chunk_size: CHUNK,
             cipher: Cipher::Aes256Gcm,
             threads: *THREADS,
+            hash: false,
+            preserve: Preserve::default(),
         }
     }
 
@@ -122,6 +128,8 @@ impl Send {
             cipher: self.cipher,
             threads: self.threads,
             paths: paths.iter().map(|p| p.to_path_buf()).collect(),
+            hash: self.hash,
+            preserve: self.preserve,
         }
     }
 
@@ -774,4 +782,156 @@ fn cancel_is_prompt_while_the_receiver_stops_reading() {
     assert_eq!(err.downcast_ref::<Cancelled>(), Some(&Cancelled::Local));
     assert!(latency < Duration::from_secs(1), "cancel took {latency:?}");
     fake.join().unwrap();
+}
+
+#[test]
+fn empty_directories_arrive() {
+    let src = TempDir::new().unwrap();
+    let tree = src.path().join("tree");
+    fs::create_dir_all(tree.join("a/b/c")).unwrap();
+    fs::create_dir_all(tree.join("empty")).unwrap();
+    write(&tree.join("a/file.bin"), &noise(5000, 16));
+    let out = TempDir::new().unwrap();
+    let (rk, _) = keypair();
+    let (sk, spub) = keypair();
+    let rx = start_receiver(rk, vec![spub], out.path());
+    let report = Send::to(sk, rx.public).run(rx.addr, &[&tree]).unwrap();
+    let recv = rx.join().unwrap();
+    assert!(report.warnings.is_empty() && recv.warnings.is_empty());
+    for dir in ["tree/a/b/c", "tree/empty"] {
+        assert!(out.path().join(dir).is_dir(), "{dir} missing");
+    }
+    assert_file_eq(
+        &tree.join("a/file.bin"),
+        &out.path().join("tree/a/file.bin"),
+    );
+}
+
+#[test]
+fn hash_check_reports_equal_file_hashes() {
+    let src = TempDir::new().unwrap();
+    let data = src.path().join("data");
+    write(&data.join("one.bin"), &noise(7 * CHUNK as usize + 11, 17));
+    write(&data.join("empty.bin"), b"");
+    let out = TempDir::new().unwrap();
+    let (rk, _) = keypair();
+    let (sk, spub) = keypair();
+    let rx = start_receiver(rk, vec![spub], out.path());
+    let mut send = Send::to(sk, rx.public);
+    send.hash = true;
+    let report = send.run(rx.addr, &[&data]).unwrap();
+    let recv = rx.join().unwrap();
+    assert!(report.hashed && recv.hashed);
+    assert_eq!(report.hash_repaired_chunks, 0);
+    assert_eq!(recv.hash_repaired_chunks, 0);
+    assert_eq!(report.file_hashes.len(), 2);
+    assert_eq!(report.file_hashes, recv.file_hashes);
+    assert_ne!(report.file_hashes[0].1, report.file_hashes[1].1);
+}
+
+#[test]
+fn hash_check_repairs_a_source_changed_behind_size_and_mtime() {
+    let src = TempDir::new().unwrap();
+    let file = resume_source(&src, 16, 18);
+    let out = TempDir::new().unwrap();
+    seed_resume(&file, out.path(), |_| true, &[]);
+
+    let mtime = fs::metadata(&file).unwrap().modified().unwrap();
+    let mut changed = fs::read(&file).unwrap();
+    changed[5 * CHUNK as usize + 3] ^= 0xFF;
+    fs::write(&file, &changed).unwrap();
+    fs::File::options()
+        .write(true)
+        .open(&file)
+        .unwrap()
+        .set_modified(mtime)
+        .unwrap();
+
+    let (rk, _) = keypair();
+    let (sk, spub) = keypair();
+    let rx = start_receiver(rk, vec![spub], out.path());
+    let mut send = Send::to(sk, rx.public);
+    send.hash = true;
+    let report = send.run(rx.addr, &[&file]).unwrap();
+    let recv = rx.join().unwrap();
+    assert_eq!(
+        recv.repaired_chunks, 0,
+        "the old bytes still match their digests"
+    );
+    assert_eq!(recv.hash_repaired_chunks, 1);
+    assert_eq!(report.hash_repaired_chunks, 1);
+    assert_eq!(report.chunks_sent, 1, "only the changed chunk travels");
+    assert_eq!(report.file_hashes, recv.file_hashes);
+    assert_eq!(fs::read(out.path().join("big.bin")).unwrap(), changed);
+}
+
+/// `a:b.` as the local file system can hold it: literally on Unix, with the
+/// `:` and the trailing `.` escaped into U+F000 + byte on Windows.
+fn awkward_name() -> &'static str {
+    if cfg!(windows) {
+        "a\u{F03A}b\u{F02E}"
+    } else {
+        "a:b."
+    }
+}
+
+#[test]
+fn awkward_names_round_trip() {
+    let src = TempDir::new().unwrap();
+    let file = src.path().join(awkward_name());
+    write(&file, &noise(3000, 19));
+    let out = TempDir::new().unwrap();
+    let (rk, _) = keypair();
+    let (sk, spub) = keypair();
+    let rx = start_receiver(rk, vec![spub], out.path());
+    let mut send = Send::to(sk, rx.public);
+    send.hash = true;
+    let report = send.run(rx.addr, &[&file]).unwrap();
+    rx.join().unwrap();
+    assert_eq!(
+        report.file_hashes[0].0, "a:b.",
+        "the wire name is the raw name"
+    );
+    assert_file_eq(&file, &out.path().join(awkward_name()));
+}
+
+#[cfg(unix)]
+#[test]
+fn perms_times_and_non_utf8_names_arrive_on_unix() {
+    use std::ffi::OsStr;
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::PermissionsExt;
+    let src = TempDir::new().unwrap();
+    let dir = src.path().join("d");
+    let odd = dir.join(OsStr::from_bytes(b"caf\xe9.bin"));
+    write(&odd, &noise(4000, 20));
+    fs::set_permissions(&odd, fs::Permissions::from_mode(0o640)).unwrap();
+    let when = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000_000);
+    fs::File::options()
+        .write(true)
+        .open(&odd)
+        .unwrap()
+        .set_modified(when)
+        .unwrap();
+    fs::set_permissions(&dir, fs::Permissions::from_mode(0o750)).unwrap();
+
+    let out = TempDir::new().unwrap();
+    let (rk, _) = keypair();
+    let (sk, spub) = keypair();
+    let rx = start_receiver(rk, vec![spub], out.path());
+    let mut send = Send::to(sk, rx.public);
+    send.preserve = "perms,times".parse().unwrap();
+    send.run(rx.addr, &[&dir]).unwrap();
+    let recv = rx.join().unwrap();
+    assert!(recv.warnings.is_empty(), "{:?}", recv.warnings);
+    let got = out.path().join("d").join(OsStr::from_bytes(b"caf\xe9.bin"));
+    assert_file_eq(&odd, &got);
+    let meta = fs::metadata(&got).unwrap();
+    assert_eq!(meta.permissions().mode() & 0o7777, 0o640);
+    assert_eq!(meta.modified().unwrap(), when);
+    let dmode = fs::metadata(out.path().join("d"))
+        .unwrap()
+        .permissions()
+        .mode();
+    assert_eq!(dmode & 0o7777, 0o750);
 }

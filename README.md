@@ -92,6 +92,9 @@ key.
 | `--out DIR` | `.` | where files land |
 | `--force` | off | overwrite existing files |
 | `--no-verify` | off | skip reading every chunk back before finishing |
+| `--threads N` | `0` (one per core) | workers that decrypt, write, and verify chunks |
+| `--allow-owner` | off | apply file owners from the sender (only as root, on Unix) |
+| `--allow-special-bits` | off | keep setuid, setgid, and sticky bits from the sender |
 
 At least one of `--authorized` or `--allow` is required. On start the
 receiver prints its public key and listen address.
@@ -107,6 +110,9 @@ as `incoming/photos/...`.
 | `-n, --connections N` | `8` | parallel data connections |
 | `-c, --chunk-size SIZE` | `1MiB` | chunk size, 4 KiB to 64 MiB; accepts `64K`, `256KiB`, `1M`, `4MiB` |
 | `--cipher NAME` | `aes256gcm` | `aes256gcm` or `chacha20poly1305` |
+| `--threads N` | `0` (one per core) | workers that read and encrypt chunks |
+| `--hash` | off | after delivery, re-read every file and have the receiver compare chunk digests; mismatched chunks are sent again |
+| `--preserve LIST` | `perms` | metadata to copy: `none`, or any of `perms`, `times`, `owner` |
 
 `mjolnir serve [--listen 127.0.0.1:7878] [--key PATH] [--no-open]` starts a
 local web UI; see [docs/WEB.md](docs/WEB.md).
@@ -119,18 +125,25 @@ replies, and its reply carries a fresh random secret that both sides feed
 through HKDF, bound to the handshake transcript, to derive every session
 key. The sender offers a manifest; the receiver answers with a bitmap of the
 chunks it already holds from an earlier attempt. The sender then opens N data
-connections that pull chunk numbers from one shared queue, read each chunk
-with a positional read, seal it with a key unique to that connection, and
-stream it. The receiver opens each chunk, claims it so a duplicate is never
-written twice, writes it with a positional write into
+connections that pull chunk numbers from one shared queue. Connections only
+move bytes: a pool of `--threads` workers reads each chunk with a positional
+read and seals it with a key unique to its connection, and the connection
+writes the sealed frames in order. On the receiver a connection's reader
+hands each frame to the same kind of pool. A worker opens the chunk, claims
+it so a duplicate is never written twice, writes it with a positional write
+into
 `<name>.mjolnir-part`, stores a 16-byte BLAKE3 digest of it in
 `<name>.mjolnir-sums`, and marks it present. Every two seconds it syncs the
 part and sums files and saves the bitmap, so a crash or a cancel loses at
 most a few seconds of work. When every chunk is present it reads each one
 back from disk and checks it against its digest. A chunk that fails,
 including one carried over from an earlier session, goes back to missing,
-and the next round fetches only that chunk. When everything checks out it
-renames the part files into place. The wire format is specified in
+and the next round fetches only that chunk. With `send --hash`, the sender
+then re-reads its files and the receiver compares those digests too, which
+catches a source that changed without its size or mtime changing. Last, the
+receiver renames the part files into place and applies the sender's file
+map: directories, including empty ones, and the metadata chosen with
+`--preserve`. The wire format is specified in
 [docs/PROTOCOL.md](docs/PROTOCOL.md), and [docs/prior-art.md](docs/prior-art.md)
 compares mjolnir with existing tools.
 
@@ -161,15 +174,22 @@ symlinks that already exist under `--out` are followed.
 - One transfer per `recv` process. The receiver keeps listening through
   failed handshakes and failed sessions and exits after one transfer
   completes.
-- Only regular files are sent. Empty directories are not recreated, and
-  symlinks inside a sent directory are skipped. File names must be UTF-8
-  and may not contain `:`.
-- Modification times and permissions are not copied.
+- Only regular files and directories are sent. Symbolic links and special
+  files are skipped with a warning. File names travel as raw bytes, so a
+  name that the receiver's file system cannot store (a `:` or a trailing
+  `.` on Windows, invalid UTF-8 on macOS) is stored with the affected
+  characters escaped as U+F000 plus the byte, the Cygwin and WSL
+  convention, and comes back unchanged when sent back.
+- Permissions are copied by default (on Windows only as the read-only
+  attribute); times and owners only when asked for. Windows ACLs and
+  extended attributes are not copied.
 - Private key files are stored unencrypted, protected only by file
   permissions.
 - Integrity is checked per chunk: the AEAD tag in transit, then a BLAKE3
-  digest when the receiver reads the chunk back. There is no whole-file
-  hash. The read-back can be served from the OS page cache, so it catches
+  digest when the receiver reads the chunk back, and with `--hash` a digest
+  of the sender's re-read. The `file_hash` both sides print with `--hash` is
+  a BLAKE3 of the chunk digests, not `b3sum` of the file. The read-back can
+  be served from the OS page cache, so it catches
   write-path bugs, stale resume data, and memory faults, but it does not
   prove what the disk holds. `--no-verify` skips the read-back; the sender's
   summary says whether the receiver verified.
