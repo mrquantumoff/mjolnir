@@ -51,6 +51,7 @@ key.
 | `--listen ADDR` | `0.0.0.0:7777` | address to listen on |
 | `--out DIR` | `.` | where files land |
 | `--force` | off | overwrite existing files |
+| `--no-verify` | off | skip reading every chunk back before finishing |
 
 At least one of `--authorized` or `--allow` is required. On start the
 receiver prints its public key and listen address.
@@ -80,11 +81,16 @@ key. The sender offers a manifest; the receiver answers with a bitmap of the
 chunks it already holds from an earlier attempt. The sender then opens N data
 connections that pull chunk numbers from one shared queue, read each chunk
 with a positional read, seal it with a key unique to that connection, and
-stream it. The receiver opens each chunk, writes it with a positional write
-into `<name>.mjolnir-part`, and marks it present. Every two seconds it
-syncs the part files and saves the bitmap, so a crash or a cancel loses at
-most a few seconds of work. When every chunk is present it renames the part
-files into place. The wire format is specified in
+stream it. The receiver opens each chunk, claims it so a duplicate is never
+written twice, writes it with a positional write into
+`<name>.mjolnir-part`, stores a 16-byte BLAKE3 digest of it in
+`<name>.mjolnir-sums`, and marks it present. Every two seconds it syncs the
+part and sums files and saves the bitmap, so a crash or a cancel loses at
+most a few seconds of work. When every chunk is present it reads each one
+back from disk and checks it against its digest. A chunk that fails,
+including one carried over from an earlier session, goes back to missing,
+and the next round fetches only that chunk. When everything checks out it
+renames the part files into place. The wire format is specified in
 [docs/PROTOCOL.md](docs/PROTOCOL.md), and [docs/prior-art.md](docs/prior-art.md)
 compares mjolnir with existing tools.
 
@@ -121,9 +127,12 @@ symlinks that already exist under `--out` are followed.
 - Modification times and permissions are not copied.
 - Private key files are stored unencrypted, protected only by file
   permissions.
-- Integrity is per chunk. There is no whole-file hash, because the AEAD tag
-  on every chunk already rules out corruption in transit; the receiver
-  finishes only when every chunk has been authenticated and written.
+- Integrity is checked per chunk: the AEAD tag in transit, then a BLAKE3
+  digest when the receiver reads the chunk back. There is no whole-file
+  hash. The read-back can be served from the OS page cache, so it catches
+  write-path bugs, stale resume data, and memory faults, but it does not
+  prove what the disk holds. `--no-verify` skips the read-back; the sender's
+  summary says whether the receiver verified.
 
 ## Benchmark
 

@@ -34,7 +34,8 @@ const PHASES: [Phase; 7] = [
 /// Counters a transfer updates as it runs. Share it through an `Arc`; every
 /// field is an atomic, so reading it never blocks the transfer. Totals and
 /// `*_done` count the chunks this session still had to move, not chunks a
-/// resumed transfer already held.
+/// resumed transfer already held. During `Phase::Verifying` they count the
+/// receiver's read-back of every chunk instead.
 #[derive(Debug)]
 pub struct Progress {
     pub bytes_done: AtomicU64,

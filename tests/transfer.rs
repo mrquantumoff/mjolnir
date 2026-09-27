@@ -43,16 +43,23 @@ struct RunningReceiver {
     handle: JoinHandle<Result<RecvReport>>,
 }
 
-fn start_receiver(key: PrivateKey, authorized: Vec<PublicKey>, out: &Path) -> RunningReceiver {
-    let receiver = Receiver::bind(RecvConfig {
+fn recv_config(key: PrivateKey, authorized: Vec<PublicKey>, out: &Path) -> RecvConfig {
+    RecvConfig {
         listen: "127.0.0.1:0".parse().unwrap(),
         key,
         authorized,
         out_dir: out.to_owned(),
         force: false,
         verify: true,
-    })
-    .unwrap();
+    }
+}
+
+fn start_receiver(key: PrivateKey, authorized: Vec<PublicKey>, out: &Path) -> RunningReceiver {
+    start(recv_config(key, authorized, out))
+}
+
+fn start(cfg: RecvConfig) -> RunningReceiver {
+    let receiver = Receiver::bind(cfg).unwrap();
     let progress = Arc::new(Progress::default());
     let (addr, public) = (receiver.local_addr(), receiver.public_key());
     let p = progress.clone();
@@ -170,6 +177,10 @@ fn multiple_files_and_directories_both_ciphers() {
         let total = 1 + 4 * CHUNK as u64 + 5 * CHUNK as u64 + 123 + 200_007 + CHUNK as u64 - 1;
         assert_eq!(report.bytes_sent, total);
         assert_eq!(recv.bytes_received, total);
+        assert_eq!(recv.duplicate_chunks, 0);
+        assert_eq!(report.chunks_resent, 0);
+        assert_eq!(recv.repaired_chunks, 0);
+        assert!(recv.verified && report.verified);
         assert_eq!(tree(&out.path().join("data")), tree(&data), "{cipher:?}");
         assert_file_eq(&single, &out.path().join("single.txt"));
         assert_eq!(tree(out.path()).len(), 7, "no leftover part or state files");
@@ -224,39 +235,55 @@ fn wrong_pinned_receiver_key_fails_and_receiver_keeps_waiting() {
     assert_file_eq(&file, &out.path().join("f.bin"));
 }
 
-#[test]
-fn resume_sends_only_missing_chunks_and_rewrites_absent_bytes() {
-    let chunks = 32u64;
-    let src = TempDir::new().unwrap();
-    let file = src.path().join("big.bin");
-    let content = noise((chunks * CHUNK as u64) as usize - 1000, 7);
-    write(&file, &content);
-    let out = TempDir::new().unwrap();
-
+/// Leaves `out` as an interrupted earlier session would for `file`:
+/// chunks where `present(k)` hold the right bytes and digest and are marked
+/// in the state file, and the rest hold garbage. Chunks in `rot` are marked
+/// present with a valid digest, but their bytes are then corrupted, as a
+/// disk fault would do. Returns the chunk count.
+fn seed_resume(file: &Path, out: &Path, present: impl Fn(u64) -> bool, rot: &[u64]) -> u64 {
+    let content = fs::read(file).unwrap();
+    let chunks = (content.len() as u64).div_ceil(u64::from(CHUNK));
     let mut part = content.clone();
     let mut sums = vec![0u8; chunks as usize * 16];
     let have = AtomicBitset::new(chunks);
     for k in 0..chunks {
         let span = (k * CHUNK as u64) as usize
             ..((k + 1) * CHUNK as u64).min(content.len() as u64) as usize;
-        if k % 2 == 0 {
+        if present(k) {
             have.set(k);
-            let digest = blake3::hash(&content[span]);
+            let digest = blake3::hash(&content[span.clone()]);
             sums[k as usize * 16..][..16].copy_from_slice(&digest.as_bytes()[..16]);
-        } else {
-            part[span].fill(0xAA);
+        }
+        if !present(k) || rot.contains(&k) {
+            part[span].iter_mut().for_each(|b| *b ^= 0x5A);
         }
     }
-    fs::write(out.path().join("big.bin.mjolnir-part"), &part).unwrap();
-    fs::write(out.path().join("big.bin.mjolnir-sums"), &sums).unwrap();
+    let name = file.file_name().unwrap().to_str().unwrap();
+    fs::write(out.join(format!("{name}.mjolnir-part")), &part).unwrap();
+    fs::write(out.join(format!("{name}.mjolnir-sums")), &sums).unwrap();
     PartState {
         size: content.len() as u64,
-        mtime: mtime_of(&fs::metadata(&file).unwrap()),
+        mtime: mtime_of(&fs::metadata(file).unwrap()),
         chunk_size: CHUNK,
         bitmap: have.to_bytes(),
     }
-    .save(&out.path().join("big.bin.mjolnir-state"))
+    .save(&out.join(format!("{name}.mjolnir-state")))
     .unwrap();
+    chunks
+}
+
+fn resume_source(src: &TempDir, chunks: u64, seed: u64) -> PathBuf {
+    let file = src.path().join("big.bin");
+    write(&file, &noise((chunks * CHUNK as u64) as usize - 1000, seed));
+    file
+}
+
+#[test]
+fn resume_sends_only_missing_chunks_and_rewrites_absent_bytes() {
+    let src = TempDir::new().unwrap();
+    let file = resume_source(&src, 32, 7);
+    let out = TempDir::new().unwrap();
+    let chunks = seed_resume(&file, out.path(), |k| k % 2 == 0, &[]);
 
     let (rk, _) = keypair();
     let (sk, spub) = keypair();
@@ -270,9 +297,73 @@ fn resume_sends_only_missing_chunks_and_rewrites_absent_bytes() {
         "present chunks are not re-sent"
     );
     assert_eq!(recv.chunks_received, chunks / 2);
+    assert_eq!(recv.repaired_chunks, 0);
+    assert_eq!(recv.duplicate_chunks, 0);
     assert_file_eq(&file, &out.path().join("big.bin"));
-    assert!(!out.path().join("big.bin.mjolnir-state").exists());
-    assert!(!out.path().join("big.bin.mjolnir-part").exists());
+    for side in ["state", "part", "sums"] {
+        assert!(!out.path().join(format!("big.bin.mjolnir-{side}")).exists());
+    }
+}
+
+#[test]
+fn verification_repairs_present_chunks_whose_bytes_rotted() {
+    let src = TempDir::new().unwrap();
+    let file = resume_source(&src, 32, 12);
+    let out = TempDir::new().unwrap();
+    let rot = [0, 6, 30];
+    let chunks = seed_resume(&file, out.path(), |k| k % 2 == 0, &rot);
+
+    let (rk, _) = keypair();
+    let (sk, spub) = keypair();
+    let rx = start_receiver(rk, vec![spub], out.path());
+    let report = Send::to(sk, rx.public).run(rx.addr, &[&file]).unwrap();
+    let recv = rx.join().unwrap();
+
+    assert_eq!(recv.repaired_chunks, rot.len() as u64);
+    assert_eq!(
+        report.chunks_sent,
+        chunks / 2 + rot.len() as u64,
+        "only the missing and the rotted chunks travel"
+    );
+    assert_eq!(report.chunks_resent, 0);
+    assert_eq!(report.rounds, 2);
+    assert!(recv.verified && report.verified);
+    assert_file_eq(&file, &out.path().join("big.bin"));
+}
+
+#[test]
+fn verification_repairs_a_fully_present_resume() {
+    let src = TempDir::new().unwrap();
+    let file = resume_source(&src, 16, 13);
+    let out = TempDir::new().unwrap();
+    seed_resume(&file, out.path(), |_| true, &[3]);
+
+    let (rk, _) = keypair();
+    let (sk, spub) = keypair();
+    let rx = start_receiver(rk, vec![spub], out.path());
+    let report = Send::to(sk, rx.public).run(rx.addr, &[&file]).unwrap();
+    let recv = rx.join().unwrap();
+
+    assert_eq!(recv.repaired_chunks, 1);
+    assert_eq!(report.chunks_sent, 1);
+    assert_file_eq(&file, &out.path().join("big.bin"));
+}
+
+#[test]
+fn no_verify_finishes_unverified() {
+    let src = TempDir::new().unwrap();
+    let file = src.path().join("f.bin");
+    write(&file, &noise(10 * CHUNK as usize + 3, 14));
+    let out = TempDir::new().unwrap();
+    let (rk, _) = keypair();
+    let (sk, spub) = keypair();
+    let mut cfg = recv_config(rk, vec![spub], out.path());
+    cfg.verify = false;
+    let rx = start(cfg);
+    let report = Send::to(sk, rx.public).run(rx.addr, &[&file]).unwrap();
+    let recv = rx.join().unwrap();
+    assert!(!report.verified && !recv.verified);
+    assert_file_eq(&file, &out.path().join("f.bin"));
 }
 
 #[test]
@@ -317,8 +408,10 @@ fn more_connections_than_chunks() {
     let mut send = Send::to(sk, rx.public);
     send.connections = 16;
     let report = send.run(rx.addr, &[&file]).unwrap();
-    rx.join().unwrap();
+    let recv = rx.join().unwrap();
     assert_eq!(report.chunks_sent, 3);
+    assert_eq!(report.chunks_resent, 0);
+    assert_eq!(recv.duplicate_chunks, 0);
     assert_file_eq(&file, &out.path().join("small.bin"));
 }
 
