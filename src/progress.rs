@@ -131,7 +131,9 @@ impl Progress {
             }
             Err(e) => {
                 self.set_phase(Phase::Failed);
-                if self.is_cancelled() && e.downcast_ref::<Cancelled>().is_none() {
+                // A local cancel wins over whatever error it raced with,
+                // including a peer's cancel.
+                if self.is_cancelled() {
                     Err(Cancelled::Local.into())
                 } else {
                     Err(e)
