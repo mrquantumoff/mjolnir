@@ -31,7 +31,10 @@ the receiver's key.
 **Receive files.** Pick a listen address (default `0.0.0.0:7777`, use port 0
 for any free port), an output folder, and the sender keys to admit, one per
 line as `key [label]`. Tick "Overwrite existing files" to replace files that
-already exist in the output folder. The receiver binds immediately, so a
+already exist in the output folder. "Verify after transfer" (on by default)
+reads every chunk back from disk before finishing and fetches again any that
+do not match. "CPU threads" sets how many workers open chunks; leave it
+empty for one per core. The receiver binds immediately, so a
 port that is already in use is reported on the form. Its card shows the bound
 address with a Copy button, to paste into the sender's form. Each receiver
 takes one complete transfer, then finishes; a sender that fails the
@@ -40,16 +43,18 @@ Several receivers can wait on different ports at once.
 
 **Send files.** Enter the receiver's address and public key, add files and
 folders with the file browser, and optionally tune the number of connections
-(1 to 64, default 8), the chunk size, and the cipher. Recent peers are
-remembered in the browser.
+(1 to 64, default 8), the chunk size, the cipher, and the CPU threads that
+seal chunks (empty means one per core). Recent peers are remembered in the
+browser.
 
 ![The file browser: folders navigate, checkboxes select files and folders](web-ui/picker.png)
 
 Each transfer card shows its phase, a progress bar, bytes done and total,
 throughput and ETA (computed in the browser from successive polls), and the
 number of active connections. Running transfers have a Cancel button;
-finished ones have Remove. Failed transfers show the error; finished ones show
-a summary.
+finished ones have Remove. Failed transfers show the error. Finished ones show
+a summary: files, bytes, time, average speed, whether every chunk was
+verified, and any repaired, duplicate, or resent chunks.
 
 ![Finished transfers with their summaries](web-ui/done.png)
 
@@ -134,7 +139,8 @@ have the shape `{ "error": "message", "field": "name" | null }`, where
     "paths": ["/data/run-42"],
     "connections": 8,
     "chunk_size": 1048576,
-    "cipher": "Aes256Gcm"
+    "cipher": "Aes256Gcm",
+    "threads": 0
   },
   "created_at_ms": 1790000000000,
   "state": "running",
@@ -154,13 +160,15 @@ have the shape `{ "error": "message", "field": "name" | null }`, where
 ```
 
 - `kind` is `send` or `receive`. A receive `spec` is
-  `{ "listen", "authorized": [keys], "out_dir", "force" }`.
+  `{ "listen", "authorized": [keys], "out_dir", "force", "verify", "threads" }`.
 - `state` is `running`, `done`, `failed`, or `cancelled`. `error` is set
-  when failed, `report` (`{ "files", "bytes", "elapsed_ms" }`) when done.
+  when failed, `report` when done:
+  `{ "files", "bytes", "elapsed_ms", "verified", "chunks_resent", "repaired_chunks", "duplicate_chunks" }`.
+  Counts that do not apply to a side are 0.
 - `bound_addr` is the receiver's actual listening address, `null` for sends.
 - `progress.phase` is `connecting`, `handshaking`, `transferring`,
-  `finishing`, `done`, or `failed`. `bytes_total` is 0 until the manifest is
-  known.
+  `verifying`, `finishing`, `done`, or `failed`. `bytes_total` is 0 until the
+  manifest is known. While verifying, `bytes_done` counts bytes read back.
 - `elapsed_ms` counts from creation to now, or to the end once finished.
 
 ### `POST /api/send`
@@ -172,22 +180,32 @@ have the shape `{ "error": "message", "field": "name" | null }`, where
   "paths": ["/data/run-42", "/data/notes.txt"],
   "connections": 8,
   "chunk_size": 1048576,
-  "cipher": "Aes256Gcm"
+  "cipher": "Aes256Gcm",
+  "threads": 0
 }
 ```
 
-`connections` (1 to 64), `chunk_size` (4 KiB to 64 MiB), and `cipher`
-(`Aes256Gcm` or `ChaCha20Poly1305`) are optional with the defaults shown.
+`connections` (1 to 64), `chunk_size` (4 KiB to 64 MiB), `cipher`
+(`Aes256Gcm` or `ChaCha20Poly1305`), and `threads` (0 to 256, 0 meaning one
+per core) are optional with the defaults shown.
 `addr` may be a host name; it is resolved when the transfer starts. Every
 path must exist. Returns the new Transfer.
 
 ### `POST /api/receive`
 
 ```json
-{ "listen": "0.0.0.0:7777", "authorized": ["base64", "..."], "out_dir": "/incoming", "force": false }
+{
+  "listen": "0.0.0.0:7777",
+  "authorized": ["base64", "..."],
+  "out_dir": "/incoming",
+  "force": false,
+  "verify": true,
+  "threads": 0
+}
 ```
 
-`listen` is an `ip:port`; port 0 picks a free one. At least one authorized
+`listen` is an `ip:port`; port 0 picks a free one. `force`, `verify`, and
+`threads` are optional with the defaults shown. At least one authorized
 key is required, and `out_dir` must be an existing folder. The listener binds
 before the response is sent, so a busy port is a 400 on `listen`, and the
 returned Transfer carries `bound_addr`.

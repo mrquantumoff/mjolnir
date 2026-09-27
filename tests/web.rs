@@ -230,6 +230,7 @@ fn out_of_range_send_options_are_400() {
         ("connections", json!(0)),
         ("connections", json!(65)),
         ("chunk_size", json!(1024)),
+        ("threads", json!(257)),
     ] {
         let mut body =
             json!({ "addr": "127.0.0.1:9", "peer": ui.public_key, "paths": [dir.path()] });
@@ -335,10 +336,12 @@ fn send_a_directory_end_to_end() {
             "connections": 4,
             "chunk_size": 64 * 1024,
             "cipher": "ChaCha20Poly1305",
+            "threads": 2,
         }),
     );
     assert_eq!(r.status, 200, "{}", r.body);
     assert_eq!(r.body["kind"], "send");
+    assert_eq!(r.body["spec"]["threads"], 2);
     let send_id = r.body["id"].as_u64().unwrap();
 
     let sent = wait_until_ended(&ui, send_id);

@@ -17,6 +17,7 @@ use crate::manifest::{MAX_CHUNK_SIZE, MIN_CHUNK_SIZE};
 use crate::{Cipher, Phase, Receiver, RecvConfig, RecvReport, SendConfig, SendReport};
 
 const MAX_CONNECTIONS: usize = 64;
+const MAX_THREADS: usize = 256;
 
 pub struct App {
     key: PrivateKey,
@@ -84,6 +85,7 @@ pub enum JobSpec {
         connections: usize,
         chunk_size: u32,
         cipher: Cipher,
+        threads: usize,
     },
     Receive {
         listen: SocketAddr,
@@ -93,6 +95,7 @@ pub enum JobSpec {
         out_dir: PathBuf,
         force: bool,
         verify: bool,
+        threads: usize,
     },
 }
 
@@ -201,6 +204,8 @@ struct SendRequest {
     chunk_size: u32,
     #[serde(default)]
     cipher: Cipher,
+    #[serde(default)]
+    threads: usize,
 }
 
 fn default_connections() -> usize {
@@ -219,10 +224,23 @@ struct ReceiveRequest {
     force: bool,
     #[serde(default = "default_verify")]
     verify: bool,
+    #[serde(default)]
+    threads: usize,
 }
 
 fn default_verify() -> bool {
     true
+}
+
+/// 0 means one worker per CPU core.
+fn check_threads(threads: usize) -> Result<usize, ApiError> {
+    if threads > MAX_THREADS {
+        return Err(ApiError::field(
+            "threads",
+            format!("must be between 0 (auto) and {MAX_THREADS}"),
+        ));
+    }
+    Ok(threads)
 }
 
 fn parse_key(field: &'static str, text: &str) -> Result<PublicKey, ApiError> {
@@ -273,6 +291,7 @@ fn start_send(app: &App, req: SendRequest) -> Result<Reply, ApiError> {
             "must be between 4 KiB and 64 MiB",
         ));
     }
+    let threads = check_threads(req.threads)?;
 
     let spec = JobSpec::Send {
         addr: addr.clone(),
@@ -281,6 +300,7 @@ fn start_send(app: &App, req: SendRequest) -> Result<Reply, ApiError> {
         connections: req.connections,
         chunk_size: req.chunk_size,
         cipher: req.cipher,
+        threads,
     };
     let cfg = SendConfig {
         addr,
@@ -289,7 +309,7 @@ fn start_send(app: &App, req: SendRequest) -> Result<Reply, ApiError> {
         connections: req.connections,
         chunk_size: req.chunk_size,
         cipher: req.cipher,
-        threads: 0,
+        threads,
         paths,
     };
     let id = app.jobs.spawn(spec, move |progress| {
@@ -320,6 +340,7 @@ fn start_receive(app: &App, req: ReceiveRequest) -> Result<Reply, ApiError> {
     if req.out_dir.trim().is_empty() || !out_dir.is_dir() {
         return Err(ApiError::field("out_dir", "choose an existing folder"));
     }
+    let threads = check_threads(req.threads)?;
 
     let receiver = Receiver::bind(RecvConfig {
         listen,
@@ -328,7 +349,7 @@ fn start_receive(app: &App, req: ReceiveRequest) -> Result<Reply, ApiError> {
         out_dir: out_dir.clone(),
         force: req.force,
         verify: req.verify,
-        threads: 0,
+        threads,
     })
     .map_err(|e| ApiError::field("listen", format!("{e:#}")))?;
     let bound_addr = receiver.local_addr();
@@ -340,6 +361,7 @@ fn start_receive(app: &App, req: ReceiveRequest) -> Result<Reply, ApiError> {
         out_dir,
         force: req.force,
         verify: req.verify,
+        threads,
     };
     let id = app.jobs.spawn(spec, move |progress| {
         receiver.run(progress).map(Report::from)
