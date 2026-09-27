@@ -5,6 +5,7 @@
 //! [`send`] and [`Receiver::run`] block until the transfer ends; run them on
 //! a thread and watch the shared [`Progress`].
 
+mod benchmode;
 pub mod bitset;
 pub mod crypto;
 pub mod filemap;

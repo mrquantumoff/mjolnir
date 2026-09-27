@@ -1,16 +1,20 @@
 #!/usr/bin/env bash
 # Loopback benchmark: a release `mjolnir recv` and `mjolnir send` as two
-# processes on 127.0.0.1, one random file, several connection counts, worker
-# counts, chunk sizes, and both ciphers. Every run's output is checked with
-# SHA-256. On Windows the CPU column is the machine-wide average of
-# `\Processor(_Total)\% Processor Time` sampled by typeperf during the send.
+# processes on 127.0.0.1 with one random file. Rows sweep connection
+# counts, worker counts, chunk sizes, both ciphers, verification, the hash
+# check, and two no-disk modes (MJOLNIR_BENCH, see src/benchmode.rs):
+#   discard  the receiver drops plaintext instead of writing it
+#   memory   the sender serves chunks from a copy of the file in memory
+# Every disk-writing run's output is checked with SHA-256. Each row also
+# records both processes' CPU time (in cores busy on average) and the
+# receiver's time per phase; on Windows, typeperf adds machine-wide CPU.
 #
 # usage: scripts/bench.sh [WORKDIR]
 #   SIZE_MIB  file size in MiB (default 2048)
 #   REPEAT    runs per configuration; the table shows the median (default 3)
 #   PORT      listen port (default 7799)
-#   ROWS      only run rows whose "connections threads chunk cipher verify"
-#             matches this extended regex, e.g. ROWS='^8 0 1MiB'
+#   ROWS      only run rows whose "connections threads chunk cipher verify
+#             hash mode" matches this extended regex, e.g. ROWS='^8 0 1MiB'
 set -euo pipefail
 # Git Bash on Windows rewrites arguments that start with '/' into Windows
 # paths, and a base64 key can start with '/'.
@@ -40,14 +44,24 @@ rm -f "$work/s.key" "$work/r.key"
 spub="$("$bin" keygen --out "$work/s.key" 2>/dev/null)"
 rpub="$("$bin" keygen --out "$work/r.key" 2>/dev/null)"
 
-# One transfer; prints "<sender MiB/s> <average CPU %>".
+cores() { sed -n 's/^cpu .* s, \([0-9.]*\) cores busy.*/\1/p' "$1"; }
+
+# One transfer; prints "<MiB/s> <sender cores> <receiver cores> <machine CPU %>"
+# and leaves the receiver's phase line in $work/phases.
 run_once() {
-  local n="$1" threads="$2" chunk="$3" cipher="$4" verify="$5"
-  local out="$work/out" recv_flags=()
+  local n="$1" threads="$2" chunk="$3" cipher="$4" verify="$5" hash="$6" mode="$7"
+  local out="$work/out" recv_flags=() send_flags=() recv_env="" send_env=""
   [ "$verify" = off ] && recv_flags+=(--no-verify)
+  [ "$hash" = on ] && send_flags+=(--hash)
+  case "$mode" in
+    discard) recv_env=discard ;;
+    memory) send_env=memory-source ;;
+    memory+discard) recv_env=discard send_env=memory-source ;;
+  esac
   rm -rf "$out" && mkdir -p "$out"
-  "$bin" recv --key "$work/r.key" --allow "$spub" --listen "127.0.0.1:$port" \
-    --out "$out" --threads "$threads" "${recv_flags[@]}" 2> "$work/recv.log" &
+  MJOLNIR_BENCH="$recv_env" "$bin" recv --key "$work/r.key" --allow "$spub" \
+    --listen "127.0.0.1:$port" --out "$out" --threads "$threads" "${recv_flags[@]}" \
+    2> "$work/recv.log" &
   local rpid=$!
   for _ in $(seq 100); do
     grep -q "listening on" "$work/recv.log" 2>/dev/null && break
@@ -56,8 +70,9 @@ run_once() {
   if $have_typeperf; then
     typeperf '\Processor(_Total)\% Processor Time' -si 1 > "$work/cpu.txt" 2>&1 &
   fi
-  if ! "$bin" send "127.0.0.1:$port" --key "$work/s.key" --peer "$rpub" \
-    -n "$n" --threads "$threads" -c "$chunk" --cipher "$cipher" "$src" 2> "$work/send.log"; then
+  if ! MJOLNIR_BENCH="$send_env" "$bin" send "127.0.0.1:$port" --key "$work/s.key" \
+    --peer "$rpub" -n "$n" --threads "$threads" -c "$chunk" --cipher "$cipher" \
+    "${send_flags[@]}" "$src" 2> "$work/send.log"; then
     kill "$rpid" 2> /dev/null || true
     cat "$work/send.log" >&2
     exit 1
@@ -70,38 +85,50 @@ run_once() {
     cpu="$(tr -d '\r' < "$work/cpu.txt" | grep '^"[0-9]' | cut -d, -f2 | tr -d '"' |
       awk 'NF { s += $1; c++ } END { if (c) printf "%.0f", s / c; else print "-" }')"
   fi
-  local got
-  got="$(sha256sum "$out/$(basename "$src")" | cut -d' ' -f1)"
-  if [ "$got" != "$want" ]; then
-    echo "SHA-256 mismatch for -n $n --threads $threads -c $chunk --cipher $cipher" >&2
-    exit 1
-  fi
-  echo "$(sed -n 's/^sent .* s, \([0-9.]*\) MiB\/s.*/\1/p' "$work/send.log") $cpu"
+  case "$mode" in
+    *discard) ;;
+    *)
+      local got
+      got="$(sha256sum "$out/$(basename "$src")" | cut -d' ' -f1)"
+      if [ "$got" != "$want" ]; then
+        echo "SHA-256 mismatch for $*" >&2
+        exit 1
+      fi
+      ;;
+  esac
+  grep '^phases:' "$work/recv.log" > "$work/phases" || true
+  echo "$(sed -n 's/^sent .* s, \([0-9.]*\) MiB\/s.*/\1/p' "$work/send.log") \
+$(cores "$work/send.log") $(cores "$work/recv.log") $cpu"
 }
 
 median() { sort -n | awk '{ v[NR] = $1 } END { print v[int((NR + 1) / 2)] }'; }
 
-echo "| connections | threads | chunk | cipher | verify | MiB/s (median of $repeat) | CPU % |"
-echo "|---|---|---|---|---|---|---|"
+echo "| connections | threads | chunk | cipher | verify | hash | mode | MiB/s | sender cores | receiver cores | machine CPU % |"
+echo "|---|---|---|---|---|---|---|---|---|---|---|"
+: > "$work/phase-table"
 bench() {
   if [ -n "${ROWS:-}" ] && ! echo "$*" | grep -Eq "$ROWS"; then return; fi
   local runs
   runs="$(for _ in $(seq "$repeat"); do run_once "$@"; done)"
-  local rate cpu
-  rate="$(echo "$runs" | cut -d' ' -f1 | median)"
-  cpu="$(echo "$runs" | cut -d' ' -f2 | median)"
+  col() { echo "$runs" | cut -d' ' -f"$1" | median; }
   local threads="$2"
   [ "$threads" = 0 ] && threads=auto
-  echo "| $1 | $threads | $3 | $4 | $5 | $rate | $cpu |"
+  echo "| $1 | $threads | $3 | $4 | $5 | $6 | $7 | $(col 1) | $(col 2) | $(col 3) | $(col 4) |"
+  echo "$* -> $(cat "$work/phases")" >> "$work/phase-table"
 }
-for n in 1 4 8 16; do bench "$n" 0 1MiB aes256gcm on; done
-for chunk in 4K 16K 256K 4MiB; do bench 8 0 "$chunk" aes256gcm on; done
-bench 8 0 1MiB chacha20poly1305 on
-bench 8 0 1MiB aes256gcm off
+for n in 1 4 8 16; do bench "$n" 0 1MiB aes256gcm on off disk; done
+for chunk in 4K 16K 256K 4MiB; do bench 8 0 "$chunk" aes256gcm on off disk; done
+bench 8 0 1MiB chacha20poly1305 on off disk
+bench 8 0 1MiB aes256gcm off off disk
+bench 8 0 1MiB aes256gcm on on disk
+for mode in memory discard memory+discard; do bench 8 0 1MiB aes256gcm off off "$mode"; done
 for cipher in aes256gcm chacha20poly1305; do
   for n in 1 2; do
-    for threads in 1 4 16 32; do bench "$n" "$threads" 1MiB "$cipher" on; done
+    for threads in 1 4 16 32; do bench "$n" "$threads" 1MiB "$cipher" off off memory+discard; done
   done
 done
 rm -rf "$work/out"
-echo "all outputs matched SHA-256 $want" >&2
+echo
+echo "Receiver time per phase (last run of each row):"
+sed 's/^/    /' "$work/phase-table"
+echo "all disk-writing outputs matched SHA-256 $want" >&2

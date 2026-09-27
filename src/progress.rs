@@ -4,7 +4,7 @@
 use std::fmt;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering::Relaxed};
 use std::sync::{Condvar, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde::Serialize;
 
@@ -48,6 +48,11 @@ pub struct Progress {
     pub chunks_total: AtomicU64,
     pub active_connections: AtomicU64,
     phase: AtomicU8,
+    /// Time spent in each phase, indexed by `Phase as usize`, in ns, and
+    /// when the current phase began, in ns since `created`.
+    phase_ns: [AtomicU64; PHASES.len()],
+    phase_began: AtomicU64,
+    created: Instant,
     /// Set to stop the transfer. Sockets close promptly and the call returns
     /// [`Cancelled::Local`]; the receiver keeps its part and state files so
     /// a later run resumes.
@@ -63,6 +68,9 @@ impl Default for Progress {
             chunks_total: AtomicU64::new(0),
             active_connections: AtomicU64::new(0),
             phase: AtomicU8::new(Phase::Connecting as u8),
+            phase_ns: Default::default(),
+            phase_began: AtomicU64::new(0),
+            created: Instant::now(),
             cancel: AtomicBool::new(false),
         }
     }
@@ -86,7 +94,30 @@ impl Progress {
     }
 
     pub(crate) fn set_phase(&self, phase: Phase) {
-        self.phase.store(phase as u8, Relaxed);
+        let now = self.now_ns();
+        let began = self.phase_began.swap(now, Relaxed);
+        let old = self.phase.swap(phase as u8, Relaxed);
+        self.phase_ns[usize::from(old)].fetch_add(now.saturating_sub(began), Relaxed);
+    }
+
+    fn now_ns(&self) -> u64 {
+        u64::try_from(self.created.elapsed().as_nanos()).unwrap_or(u64::MAX)
+    }
+
+    /// Time spent in each phase so far, the current one included, skipping
+    /// phases never entered.
+    pub fn phase_times(&self) -> Vec<(Phase, Duration)> {
+        let current = usize::from(self.phase.load(Relaxed));
+        let running = self.now_ns().saturating_sub(self.phase_began.load(Relaxed));
+        PHASES
+            .iter()
+            .enumerate()
+            .map(|(i, &p)| {
+                let ns = self.phase_ns[i].load(Relaxed) + if i == current { running } else { 0 };
+                (p, Duration::from_nanos(ns))
+            })
+            .filter(|&(_, d)| !d.is_zero())
+            .collect()
     }
 
     pub fn cancel(&self) {

@@ -424,7 +424,12 @@ impl Target {
         if !self.claimed.set(index) {
             return Ok(Landed::Duplicate);
         }
-        let written = write_all_at(&self.part, plaintext, self.span(index).0).and_then(|()| {
+        let data = if crate::benchmode::get().discard {
+            Ok(())
+        } else {
+            write_all_at(&self.part, plaintext, self.span(index).0)
+        };
+        let written = data.and_then(|()| {
             write_all_at(
                 &self.sums,
                 &chunk_digest(plaintext),

@@ -95,6 +95,8 @@ struct Ctx<'a> {
     cipher: Cipher,
     manifest: &'a Manifest,
     files: &'a [File],
+    /// Every file's bytes, when `MJOLNIR_BENCH=memory-source`.
+    memory: &'a [Vec<u8>],
     paths: &'a [PathBuf],
     progress: &'a Progress,
     chunks_sent: AtomicU64,
@@ -185,6 +187,11 @@ fn run(cfg: &SendConfig, progress: &Progress) -> Result<SendReport> {
         .map(|f| File::open(&f.source).with_context(|| format!("opening {}", f.source.display())))
         .collect::<Result<Vec<_>>>()?;
     let paths: Vec<PathBuf> = captured.files.iter().map(|f| f.source.clone()).collect();
+    let memory: Vec<Vec<u8>> = if crate::benchmode::get().memory_source {
+        paths.iter().map(fs::read).collect::<std::io::Result<_>>()?
+    } else {
+        Vec::new()
+    };
     let entries = captured
         .files
         .iter()
@@ -225,6 +232,7 @@ fn run(cfg: &SendConfig, progress: &Progress) -> Result<SendReport> {
         cipher: cfg.cipher,
         manifest: &manifest,
         files: &files,
+        memory: &memory,
         paths: &paths,
         progress,
         chunks_sent: AtomicU64::new(0),
@@ -600,7 +608,14 @@ fn seal(ctx: &Ctx, job: SealJob) {
     let frame_len = HEADER_LEN + len as usize + TAG_LEN;
     let frame = &mut buf[..frame_len];
     let plain = &mut frame[HEADER_LEN..HEADER_LEN + len as usize];
-    let sealed = read_exact_at(&ctx.files[chunk.file as usize], plain, offset)
+    let read = match ctx.memory.get(chunk.file as usize) {
+        Some(bytes) => {
+            plain.copy_from_slice(&bytes[offset as usize..][..len as usize]);
+            Ok(())
+        }
+        None => read_exact_at(&ctx.files[chunk.file as usize], plain, offset),
+    };
+    let sealed = read
         .map_err(|e| {
             let path = ctx.manifest.files[chunk.file as usize].path.display();
             let e = anyhow!(e).context(format!("reading {path} at offset {offset}"));

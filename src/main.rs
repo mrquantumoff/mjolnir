@@ -281,8 +281,56 @@ fn with_progress<T: Send>(
             }
             last = (now, p.bytes_done);
         }
-        worker.join().expect("transfer thread panicked")
+        let result = worker.join().expect("transfer thread panicked");
+        let phases: Vec<String> = progress
+            .phase_times()
+            .into_iter()
+            .filter(|(p, _)| !matches!(p, Phase::Done | Phase::Failed))
+            .map(|(p, d)| {
+                format!(
+                    "{} {:.2} s",
+                    format!("{p:?}").to_lowercase(),
+                    d.as_secs_f64()
+                )
+            })
+            .collect();
+        eprintln!("phases: {}", phases.join(", "));
+        result
     })
+}
+
+/// CPU time this process has used, user plus kernel.
+#[cfg(unix)]
+fn process_cpu() -> Option<Duration> {
+    let mut usage = std::mem::MaybeUninit::<libc::rusage>::zeroed();
+    if unsafe { libc::getrusage(libc::RUSAGE_SELF, usage.as_mut_ptr()) } != 0 {
+        return None;
+    }
+    let usage = unsafe { usage.assume_init() };
+    let tv = |t: libc::timeval| Duration::new(t.tv_sec as u64, t.tv_usec as u32 * 1000);
+    Some(tv(usage.ru_utime) + tv(usage.ru_stime))
+}
+
+#[cfg(windows)]
+fn process_cpu() -> Option<Duration> {
+    use windows_sys::Win32::Foundation::FILETIME;
+    use windows_sys::Win32::System::Threading::{GetCurrentProcess, GetProcessTimes};
+    let zero = FILETIME {
+        dwLowDateTime: 0,
+        dwHighDateTime: 0,
+    };
+    let (mut created, mut exited, mut kernel, mut user) = (zero, zero, zero, zero);
+    let ok = unsafe {
+        GetProcessTimes(
+            GetCurrentProcess(),
+            &mut created,
+            &mut exited,
+            &mut kernel,
+            &mut user,
+        )
+    };
+    let ticks = |t: FILETIME| (u64::from(t.dwHighDateTime) << 32) | u64::from(t.dwLowDateTime);
+    (ok != 0).then(|| Duration::from_nanos((ticks(kernel) + ticks(user)) * 100))
 }
 
 /// Prints each file's hash after a `--hash` transfer, then any warnings.
@@ -299,6 +347,13 @@ fn report_files(hashed: bool, file_hashes: &[(String, String)], warnings: &[Stri
 
 fn summary(verb: &str, bytes: u64, elapsed: Duration, detail: &str) {
     let secs = elapsed.as_secs_f64();
+    if let Some(cpu) = process_cpu() {
+        eprintln!(
+            "cpu {:.2} s, {:.1} cores busy on average",
+            cpu.as_secs_f64(),
+            cpu.as_secs_f64() / secs.max(1e-9)
+        );
+    }
     eprintln!(
         "{verb} {bytes} bytes ({:.1} MiB) in {secs:.2} s, {:.1} MiB/s ({detail})",
         bytes as f64 / MIB,
