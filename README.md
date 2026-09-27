@@ -208,6 +208,10 @@ write to.
 
 ## Benchmark
 
+> These numbers come from an earlier build, before the shared crypto
+> worker pool and the later fixes. A fresh run on the current code will
+> replace them.
+
 Measured with [`scripts/bench.sh`](scripts/bench.sh): a release build,
 `recv` and `send` as two processes on 127.0.0.1, one 2 GiB file of random
 data, three runs per row, median shown. Every run's output matched the
