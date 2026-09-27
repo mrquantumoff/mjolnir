@@ -214,11 +214,7 @@ fn run(cfg: &SendConfig, progress: &Progress) -> Result<SendReport> {
 
     let addrs = net::resolve(&cfg.addr)?;
     let cancelled = || progress.is_cancelled();
-    let mut control = Io::new(net::connect(&addrs, progress)?, &cancelled);
-    wire::write_preamble(&mut control, ConnKind::Control)?;
-    progress.set_phase(Phase::Handshaking);
-    let mut handshake = control.try_clone()?.deadline(HANDSHAKE_DEADLINE);
-    let keys = handshake_initiator(&mut handshake, &cfg.key, &cfg.peer)?;
+    let (control, keys) = open_control(cfg, &addrs, progress, &cancelled)?;
     let (mut tx, mut rx) =
         wire::control_channel(control.try_clone()?, control, &keys, Role::Sender);
     let pool = Pool::new(resolve_threads(cfg.threads));
@@ -278,6 +274,45 @@ fn run(cfg: &SendConfig, progress: &Progress) -> Result<SendReport> {
         phase_times: progress.phase_summary(),
         elapsed: start.elapsed(),
     })
+}
+
+/// Delays before the second and third attempt when the receiver hangs up
+/// during the handshake, which it does while another sender's session is
+/// active.
+const HANDSHAKE_RETRIES: [Duration; 2] = [Duration::from_secs(1), Duration::from_secs(3)];
+
+/// Connects the control connection and runs the handshake, retrying when
+/// the receiver closes it before answering.
+fn open_control<'a>(
+    cfg: &SendConfig,
+    addrs: &[SocketAddr],
+    progress: &Progress,
+    cancelled: &'a (dyn Fn() -> bool + Sync),
+) -> Result<(Io<'a>, SessionKeys)> {
+    let mut delays = HANDSHAKE_RETRIES.iter();
+    loop {
+        progress.set_phase(Phase::Connecting);
+        let mut control = Io::new(net::connect(addrs, progress)?, cancelled);
+        wire::write_preamble(&mut control, ConnKind::Control)?;
+        progress.set_phase(Phase::Handshaking);
+        let mut handshake = control.try_clone()?.deadline(HANDSHAKE_DEADLINE);
+        match handshake_initiator(&mut handshake, &cfg.key, &cfg.peer) {
+            Ok(keys) => return Ok((control, keys)),
+            Err(e) if e.to_string() == crate::crypto::REJECTED => match delays.next() {
+                Some(&delay) => {
+                    let until = Instant::now() + delay;
+                    while Instant::now() < until {
+                        if progress.is_cancelled() {
+                            return Err(Cancelled::Local.into());
+                        }
+                        thread::sleep(Duration::from_millis(50));
+                    }
+                }
+                None => return Err(e),
+            },
+            Err(e) => return Err(e),
+        }
+    }
 }
 
 /// How the session ended, as the receiver's `Finished` and our own

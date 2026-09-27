@@ -107,11 +107,6 @@ impl<'a> Io<'a> {
         self
     }
 
-    /// Sets or clears the deadline in place.
-    pub(crate) fn set_deadline(&mut self, deadline: Option<Instant>) {
-        self.deadline = deadline;
-    }
-
     /// Fails an operation that moves no byte for `limit`.
     pub(crate) fn idle(mut self, limit: Duration) -> Self {
         self.idle = Some(limit);

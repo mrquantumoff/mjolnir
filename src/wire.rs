@@ -154,9 +154,23 @@ impl<R: Read> ControlRx<R> {
         self.reader.into_inner()
     }
 
-    /// The underlying reader, to adjust it between messages.
-    pub fn get_mut(&mut self) -> &mut R {
-        self.reader.get_mut()
+    /// Splits off the reader and the receive state, to continue the same
+    /// stream with [`ControlRx::resume`]. Fails if bytes past the last
+    /// message are already buffered, since they would be lost.
+    pub fn into_parts(self) -> Result<(R, CipherState)> {
+        ensure!(
+            self.reader.buffer().is_empty(),
+            "unexpected bytes after the control message"
+        );
+        Ok((self.reader.into_inner(), self.cipher))
+    }
+
+    /// Continues a stream split with [`ControlRx::into_parts`].
+    pub fn resume(reader: R, cipher: CipherState) -> Self {
+        ControlRx {
+            reader: BufReader::new(reader),
+            cipher,
+        }
     }
 
     pub fn recv(&mut self) -> Result<Msg> {

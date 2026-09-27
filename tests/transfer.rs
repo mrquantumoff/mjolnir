@@ -1074,3 +1074,50 @@ fn idle_connections_neither_block_a_sender_nor_pile_up() {
     rx.progress.cancel();
     assert!(rx.join().unwrap_err().is::<Cancelled>());
 }
+
+#[test]
+fn a_replay_loop_never_takes_the_session_from_a_real_sender() {
+    use std::io::Write;
+    use std::sync::atomic::AtomicBool;
+    let src = TempDir::new().unwrap();
+    let file = src.path().join("f.bin");
+    write(&file, &noise(20_000, 23));
+    let (rk, rpub) = keypair();
+    let (sk, spub) = keypair();
+
+    let first = TempDir::new().unwrap();
+    let rx = start(recv_config(rk.clone(), vec![spub], first.path()));
+    let (proxy, recorded) = recording_proxy(rx.addr, 6 + 2 + 96);
+    Send::to(sk.clone(), rpub).run(proxy, &[&file]).unwrap();
+    rx.join().unwrap();
+    let msg1 = recorded.lock().unwrap().clone();
+
+    let second = TempDir::new().unwrap();
+    let rx = start(recv_config(rk, vec![spub], second.path()));
+    let stop = Arc::new(AtomicBool::new(false));
+    let replayer = {
+        let (stop, addr) = (stop.clone(), rx.addr);
+        thread::spawn(move || {
+            let mut held = Vec::new();
+            while !stop.load(Relaxed) {
+                if let Ok(mut s) = std::net::TcpStream::connect(addr) {
+                    let _ = s.write_all(&msg1);
+                    held.push(s);
+                }
+                thread::sleep(Duration::from_millis(100));
+            }
+        })
+    };
+    thread::sleep(Duration::from_millis(350));
+    let started = Instant::now();
+    Send::to(sk, rpub).run(rx.addr, &[&file]).unwrap();
+    rx.join().unwrap();
+    let waited = started.elapsed();
+    stop.store(true, Relaxed);
+    replayer.join().unwrap();
+    assert!(
+        waited < Duration::from_secs(5),
+        "real sender waited {waited:?}"
+    );
+    assert_file_eq(&file, &second.path().join("f.bin"));
+}

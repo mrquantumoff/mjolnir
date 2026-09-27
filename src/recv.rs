@@ -18,7 +18,7 @@ use serde::Serialize;
 
 use crate::bitset::{AtomicBitset, PartState};
 use crate::crypto::{
-    Cipher, DIGEST_LEN, FileHasher, FrameKey, SessionKeys, TAG_LEN, chunk_digest,
+    Cipher, CipherState, DIGEST_LEN, FileHasher, FrameKey, SessionKeys, TAG_LEN, chunk_digest,
     handshake_responder,
 };
 use crate::filemap::{self, ApplyPolicy, FileMap};
@@ -94,7 +94,8 @@ const CHECKPOINT_EVERY: Duration = Duration::from_secs(2);
 /// Preamble plus Noise message 1 must arrive within this, however slowly
 /// the bytes trickle in.
 const HANDSHAKE_DEADLINE: Duration = Duration::from_secs(10);
-/// After the handshake, the sender's Offer must arrive within this.
+/// After the handshake, the sender's Offer must arrive within this; until
+/// it does, the connection holds only a handshake thread, not the session.
 const OFFER_DEADLINE: Duration = Duration::from_secs(10);
 /// Handshakes in progress at once; more connections are dropped at accept.
 const MAX_PENDING_HANDSHAKES: usize = 256;
@@ -116,10 +117,15 @@ const MAX_VERIFY_THREADS: usize = 16;
 const EXPECTED_CONNECTIONS: usize = 16;
 
 /// A control connection that finished the handshake.
+/// A control connection whose sender finished the handshake and whose
+/// Offer decrypted, so the sender is live: only these take the session.
 struct Handshaken {
     stream: TcpStream,
     keys: SessionKeys,
     peer: PublicKey,
+    offer: Msg,
+    /// The control stream's receive state after the Offer.
+    rx_cipher: CipherState,
 }
 
 impl Receiver {
@@ -218,9 +224,14 @@ impl Receiver {
         progress.set_phase(Phase::Handshaking);
         let cancelled = || progress.is_cancelled();
         let control = Io::new(h.stream, &cancelled);
-        let (mut tx, mut rx) =
-            wire::control_channel(control.try_clone()?, control, &h.keys, Role::Receiver);
-        let result = self.receive(h.keys, &mut rx, &mut tx, progress);
+        let (mut tx, _) = wire::control_channel(
+            std::io::empty(),
+            control.try_clone()?,
+            &h.keys,
+            Role::Receiver,
+        );
+        let mut rx = ControlRx::resume(control, h.rx_cipher);
+        let result = self.receive(h.keys, h.offer, &mut rx, &mut tx, progress);
         if let Err(e) = &result {
             tell_peer_about(e, progress, Some(&mut tx));
             net::linger(rx.into_inner().into_stream());
@@ -249,18 +260,12 @@ impl Receiver {
     fn receive(
         &self,
         keys: SessionKeys,
+        offer: Msg,
         rx: &mut Rx,
         tx: &mut Tx,
         progress: &Progress,
     ) -> Result<Outcome> {
-        // A replayed Noise message 1 gets this far too, so the peer has not
-        // proven it is live until its Offer decrypts. Bound the wait, or one
-        // silent peer would hold the single session slot forever.
-        rx.get_mut()
-            .set_deadline(Some(Instant::now() + OFFER_DEADLINE));
-        let offer = rx.recv().context("waiting for the Offer");
-        rx.get_mut().set_deadline(None);
-        let (manifest, cipher) = match offer? {
+        let (manifest, cipher) = match offer {
             Msg::Offer {
                 chunk_size,
                 cipher,
@@ -403,10 +408,23 @@ fn handshake(
         ConnKind::Data => return Ok(None),
     }
     let (keys, peer) = handshake_responder(&mut io, key, authorized)?;
+    // Message 1 can be replayed, so the handshake alone proves nothing
+    // about liveness; the Offer does, because only the real sender can
+    // seal it. Reading it here keeps unconfirmed peers out of the session.
+    let reader = Io::new(io.into_stream(), &cancelled).deadline(OFFER_DEADLINE);
+    let (_, mut rx) = wire::control_channel(reader, std::io::sink(), &keys, Role::Receiver);
+    let offer = rx.recv().context("waiting for the Offer")?;
+    ensure!(
+        matches!(offer, Msg::Offer { .. }),
+        "expected Offer, got {offer:?}"
+    );
+    let (reader, rx_cipher) = rx.into_parts()?;
     Ok(Some(Handshaken {
-        stream: io.into_stream(),
+        stream: reader.into_stream(),
         keys,
         peer,
+        offer,
+        rx_cipher,
     }))
 }
 
