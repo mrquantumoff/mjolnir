@@ -181,6 +181,22 @@ sender sends `Error` and fails instead of finishing with mixed old and new
 bytes. The receiver's saved state then no longer matches the file, so the
 next run starts that file over.
 
+## Chunks, frames, and the MTU
+
+The protocol assumes a standard 1500-byte Ethernet MTU and needs nothing
+larger. Gorynych runs over TCP, so the kernel cuts every frame into segments
+that fit the path MTU: at most 1460 payload bytes per packet over IPv4 and
+1440 over IPv6 on a 1500-byte link. Jumbo frames help if the network has
+them, but nothing depends on them.
+
+A chunk is the unit of encryption, resume bookkeeping, and work
+distribution, not a network packet. Each chunk costs 32 bytes on the wire
+(16-byte header, 16-byte tag), one AEAD call, and one bitmap bit. At the
+default 1 MiB that is about 0.003% overhead. A chunk the size of one packet
+(about 1.4 KiB) would cost about 2% of the bytes and roughly 700 times more
+per-chunk work, and TCP would still not keep it inside one packet. Hence the
+4 KiB minimum and the 1 MiB default.
+
 ## Data connections
 
 ```
