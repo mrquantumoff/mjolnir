@@ -96,6 +96,34 @@
             </div>
           </div>
 
+          <div class="field">
+            <label class="check">
+              <input id="send-hash" name="hash" type="checkbox">
+              <span>Verify with hash after delivery</span>
+            </label>
+            <p class="muted tiny">Re-reads every file here once it is delivered, and the receiver compares chunk digests and repairs any mismatch.</p>
+            <p class="field-error" data-field-error="hash" hidden></p>
+          </div>
+
+          <fieldset class="field plain">
+            <legend class="label">Preserve</legend>
+            <div class="check-row">
+              <label class="check">
+                <input id="send-preserve-perms" type="checkbox" checked>
+                <span>Permissions</span>
+              </label>
+              <label class="check">
+                <input id="send-preserve-times" type="checkbox">
+                <span>Times</span>
+              </label>
+              <label class="check">
+                <input id="send-preserve-owner" type="checkbox">
+                <span>Owner</span>
+              </label>
+            </div>
+            <p class="field-error" data-field-error="preserve" hidden></p>
+          </fieldset>
+
           <div class="form-actions">
             <button type="submit" class="button primary">Start send</button>
           </div>
@@ -144,6 +172,22 @@
             <p class="muted tiny">Reads every chunk back from disk and fetches again any that do not match.</p>
             <p class="field-error" data-field-error="verify" hidden></p>
           </div>
+
+          <details class="advanced">
+            <summary>Advanced</summary>
+            <div class="field">
+              <label class="check">
+                <input id="receive-allow-special" type="checkbox">
+                <span>Allow setuid/setgid bits</span>
+              </label>
+              <label class="check">
+                <input id="receive-allow-owner" type="checkbox">
+                <span>Apply ownership (root only)</span>
+              </label>
+              <p class="muted tiny">Both are off by default, so a sender cannot plant privileged files or give them away.</p>
+              <p class="field-error" data-field-error="apply" hidden></p>
+            </div>
+          </details>
 
           <div class="field">
             <label class="check">

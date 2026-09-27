@@ -11,7 +11,8 @@ use serde_json::{Value, json};
 use tiny_http::Method;
 
 use super::fs;
-use super::jobs::{Job, JobId, JobState, Jobs, Outcome, RemoveError, Report};
+use super::jobs::{FileHash, Job, JobId, JobState, Jobs, Outcome, RemoveError, Report};
+use crate::filemap::{ApplyPolicy, Preserve};
 use crate::keys::{PrivateKey, PublicKey};
 use crate::manifest::{MAX_CHUNK_SIZE, MIN_CHUNK_SIZE};
 use crate::{Cipher, Phase, Receiver, RecvConfig, RecvReport, SendConfig, SendReport};
@@ -86,6 +87,8 @@ pub enum JobSpec {
         chunk_size: u32,
         cipher: Cipher,
         threads: usize,
+        hash: bool,
+        preserve: Preserve,
     },
     Receive {
         listen: SocketAddr,
@@ -96,7 +99,15 @@ pub enum JobSpec {
         force: bool,
         verify: bool,
         threads: usize,
+        apply: ApplyPolicy,
     },
+}
+
+fn file_hashes(pairs: Vec<(String, String)>) -> Vec<FileHash> {
+    pairs
+        .into_iter()
+        .map(|(path, hash)| FileHash { path, hash })
+        .collect()
 }
 
 impl From<SendReport> for Report {
@@ -106,9 +117,14 @@ impl From<SendReport> for Report {
             bytes: r.bytes_sent,
             elapsed_ms: r.elapsed.as_millis() as u64,
             verified: r.verified,
+            hashed: r.hashed,
             chunks_resent: r.chunks_resent,
             repaired_chunks: 0,
+            hash_repaired_chunks: r.hash_repaired_chunks,
             duplicate_chunks: 0,
+            file_hashes: file_hashes(r.file_hashes),
+            warnings: r.warnings,
+            skipped: r.skipped,
         }
     }
 }
@@ -120,9 +136,14 @@ impl From<RecvReport> for Report {
             bytes: r.bytes_received,
             elapsed_ms: r.elapsed.as_millis() as u64,
             verified: r.verified,
+            hashed: r.hashed,
             chunks_resent: 0,
             repaired_chunks: r.repaired_chunks,
+            hash_repaired_chunks: r.hash_repaired_chunks,
             duplicate_chunks: r.duplicate_chunks,
+            file_hashes: file_hashes(r.file_hashes),
+            warnings: r.warnings,
+            skipped: r.skipped,
         }
     }
 }
@@ -206,6 +227,10 @@ struct SendRequest {
     cipher: Cipher,
     #[serde(default)]
     threads: usize,
+    #[serde(default)]
+    hash: bool,
+    #[serde(default)]
+    preserve: Preserve,
 }
 
 fn default_connections() -> usize {
@@ -226,6 +251,8 @@ struct ReceiveRequest {
     verify: bool,
     #[serde(default)]
     threads: usize,
+    #[serde(default)]
+    apply: ApplyPolicy,
 }
 
 fn default_verify() -> bool {
@@ -301,6 +328,8 @@ fn start_send(app: &App, req: SendRequest) -> Result<Reply, ApiError> {
         chunk_size: req.chunk_size,
         cipher: req.cipher,
         threads,
+        hash: req.hash,
+        preserve: req.preserve,
     };
     let cfg = SendConfig {
         addr,
@@ -311,8 +340,8 @@ fn start_send(app: &App, req: SendRequest) -> Result<Reply, ApiError> {
         cipher: req.cipher,
         threads,
         paths,
-        hash: false,
-        preserve: Default::default(),
+        hash: req.hash,
+        preserve: req.preserve,
     };
     let id = app.jobs.spawn(spec, move |progress| {
         crate::send(cfg, progress).map(Report::from)
@@ -352,7 +381,7 @@ fn start_receive(app: &App, req: ReceiveRequest) -> Result<Reply, ApiError> {
         force: req.force,
         verify: req.verify,
         threads,
-        apply: Default::default(),
+        apply: req.apply,
     })
     .map_err(|e| ApiError::field("listen", format!("{e:#}")))?;
     let bound_addr = receiver.local_addr();
@@ -365,6 +394,7 @@ fn start_receive(app: &App, req: ReceiveRequest) -> Result<Reply, ApiError> {
         force: req.force,
         verify: req.verify,
         threads,
+        apply: req.apply,
     };
     let id = app.jobs.spawn(spec, move |progress| {
         receiver.run(progress).map(Report::from)

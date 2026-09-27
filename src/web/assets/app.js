@@ -8,6 +8,7 @@ const POLL_ACTIVE_MS = 500;
 const POLL_IDLE_MS = 3000;
 const RATE_SMOOTHING = 0.3;
 const MAX_LISTED_PATHS = 3;
+const RATED_PHASES = new Set(['transferring', 'verifying', 'hashing']);
 const THREADS_ERROR = 'Use a whole number from 0 to 256, or leave empty for auto.';
 
 const STATUS = {
@@ -15,6 +16,7 @@ const STATUS = {
   handshaking: { label: 'Handshaking', tone: 'pending' },
   transferring: { label: 'Transferring', tone: 'active' },
   verifying: { label: 'Verifying', tone: 'active' },
+  hashing: { label: 'Hashing', tone: 'active' },
   finishing: { label: 'Finishing', tone: 'active' },
   done: { label: 'Done', tone: 'ok' },
   failed: { label: 'Failed', tone: 'bad' },
@@ -301,6 +303,12 @@ function readSendForm() {
     chunk_size: Number($('send-chunk').value),
     cipher: $('send-cipher').value,
     threads: readThreads('send-threads'),
+    hash: $('send-hash').checked,
+    preserve: {
+      perms: $('send-preserve-perms').checked,
+      times: $('send-preserve-times').checked,
+      owner: $('send-preserve-owner').checked,
+    },
   };
 }
 
@@ -312,6 +320,10 @@ function readReceiveForm() {
     force: $('receive-force').checked,
     verify: $('receive-verify').checked,
     threads: readThreads('receive-threads'),
+    apply: {
+      allow_special_bits: $('receive-allow-special').checked,
+      allow_owner: $('receive-allow-owner').checked,
+    },
   };
 }
 
@@ -368,6 +380,10 @@ function saveForms() {
       chunk_size: $('send-chunk').value,
       cipher: $('send-cipher').value,
       threads: $('send-threads').value,
+      hash: $('send-hash').checked,
+      preserve_perms: $('send-preserve-perms').checked,
+      preserve_times: $('send-preserve-times').checked,
+      preserve_owner: $('send-preserve-owner').checked,
     },
     receive: {
       listen: $('receive-listen').value,
@@ -387,6 +403,10 @@ function restoreValue(id, value) {
   el.value = value;
 }
 
+function restoreChecked(id, value) {
+  if (typeof value === 'boolean') $(id).checked = value;
+}
+
 function restoreForms() {
   const saved = loadJson(FORMS_KEY, null);
   if (!saved || typeof saved !== 'object') return;
@@ -398,12 +418,16 @@ function restoreForms() {
   restoreValue('send-chunk', send.chunk_size);
   restoreValue('send-cipher', send.cipher);
   restoreValue('send-threads', send.threads);
+  restoreChecked('send-hash', send.hash);
+  restoreChecked('send-preserve-perms', send.preserve_perms);
+  restoreChecked('send-preserve-times', send.preserve_times);
+  restoreChecked('send-preserve-owner', send.preserve_owner);
   restoreValue('receive-listen', receive.listen);
   restoreValue('receive-out', receive.out_dir);
   restoreValue('receive-authorized', receive.authorized);
   restoreValue('receive-threads', receive.threads);
-  if (typeof receive.force === 'boolean') $('receive-force').checked = receive.force;
-  if (typeof receive.verify === 'boolean') $('receive-verify').checked = receive.verify;
+  restoreChecked('receive-force', receive.force);
+  restoreChecked('receive-verify', receive.verify);
 }
 
 function loadRecentPeers() {
@@ -612,6 +636,11 @@ function threadsText(threads) {
   return threads > 0 ? plural(threads, 'CPU thread') : 'auto CPU threads';
 }
 
+function preserveText(preserve) {
+  const kept = ['perms', 'times', 'owner'].filter((k) => preserve && preserve[k]);
+  return kept.length > 0 ? ' \u00b7 keeps ' + kept.join(', ') : '';
+}
+
 function buildSendDetails(spec) {
   const shown = spec.paths.slice(0, MAX_LISTED_PATHS);
   const hidden = spec.paths.length - shown.length;
@@ -622,7 +651,9 @@ function buildSendDetails(spec) {
       ' \u00b7 ' + plural(spec.connections, 'connection'),
       ' \u00b7 ' + formatChunkSize(spec.chunk_size) + ' chunks',
       ' \u00b7 ' + (CIPHER_LABELS[spec.cipher] || spec.cipher),
-      ' \u00b7 ' + threadsText(spec.threads)),
+      ' \u00b7 ' + threadsText(spec.threads),
+      preserveText(spec.preserve),
+      spec.hash ? ' \u00b7 hash check' : ''),
     h('ul', { class: 'card-files' },
       shown.map((path) => h('li', null, h('code', { class: 'mono' }, path))),
       hidden > 0 ? h('li', { class: 'muted' }, '+' + hidden + ' more') : null),
@@ -647,7 +678,9 @@ function buildReceiveDetails(spec, refs) {
       h('code', { class: 'mono' }, spec.out_dir),
       ' \u00b7 ' + threadsText(spec.threads),
       spec.verify ? '' : ' \u00b7 no verification',
-      spec.force ? ' \u00b7 overwrites existing files' : ''),
+      spec.force ? ' \u00b7 overwrites existing files' : '',
+      spec.apply && spec.apply.allow_special_bits ? ' \u00b7 allows setuid/setgid' : '',
+      spec.apply && spec.apply.allow_owner ? ' \u00b7 applies ownership' : ''),
   ];
 }
 
@@ -685,7 +718,7 @@ function buildCard(transfer) {
 
 function sampleRate(transfer) {
   const p = transfer.progress;
-  if (transfer.state !== 'running' || (p.phase !== 'transferring' && p.phase !== 'verifying')) {
+  if (transfer.state !== 'running' || !RATED_PHASES.has(p.phase)) {
     app.rates.delete(transfer.id);
     return null;
   }
@@ -723,8 +756,10 @@ function reportText(report) {
   const parts = [plural(report.files, 'file'), formatBytes(report.bytes), formatDuration(report.elapsed_ms)];
   if (report.elapsed_ms > 0) parts.push(formatRate((report.bytes / report.elapsed_ms) * 1000) + ' average');
   parts.push(report.verified ? 'verified' : 'not verified');
+  if (report.hashed) parts.push('hash checked');
   const counts = [
     [report.repaired_chunks, 'repaired chunk'],
+    [report.hash_repaired_chunks, 'hash-repaired chunk'],
     [report.duplicate_chunks, 'duplicate chunk'],
     [report.chunks_resent, 'resent chunk'],
   ];
@@ -732,6 +767,27 @@ function reportText(report) {
     if (n > 0) parts.push(plural(n, word));
   }
   return parts.join(' \u00b7 ');
+}
+
+function reportList(title, items, tone) {
+  if (!items || items.length === 0) return null;
+  return h('div', { class: 'report-list ' + tone },
+    h('p', { class: 'small' }, title + ' (' + items.length + ')'),
+    h('ul', null, items.map((item) => h('li', { class: 'mono tiny' }, item))));
+}
+
+function buildReport(report) {
+  const hashes = report.file_hashes || [];
+  return [
+    h('p', { class: 'report-summary' }, reportText(report)),
+    reportList('Warnings', report.warnings, 'warn'),
+    reportList('Skipped', report.skipped, 'muted'),
+    hashes.length === 0 ? null : h('details', { class: 'hashes' },
+      h('summary', { class: 'small' }, 'File hashes (' + hashes.length + ')'),
+      h('ul', null, hashes.map((f) => h('li', { class: 'hash-row' },
+        h('code', { class: 'mono tiny hash-path' }, f.path),
+        h('code', { class: 'mono tiny hash-value' }, f.hash))))),
+  ];
 }
 
 function updateCard(refs, transfer) {
@@ -760,7 +816,11 @@ function updateCard(refs, transfer) {
   refs.error.hidden = !transfer.error;
   refs.error.textContent = transfer.error || '';
   refs.report.hidden = !transfer.report;
-  refs.report.textContent = transfer.report ? reportText(transfer.report) : '';
+  // Built once so an opened hashes section survives later polls.
+  if (transfer.report && !refs.reportBuilt) {
+    refs.report.replaceChildren(...buildReport(transfer.report).filter(Boolean));
+    refs.reportBuilt = true;
+  }
 
   if (refs.boundAddr) {
     const addr = transfer.bound_addr || transfer.spec.listen;

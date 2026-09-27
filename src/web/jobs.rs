@@ -19,9 +19,20 @@ pub struct Report {
     pub bytes: u64,
     pub elapsed_ms: u64,
     pub verified: bool,
+    pub hashed: bool,
     pub chunks_resent: u64,
     pub repaired_chunks: u64,
+    pub hash_repaired_chunks: u64,
     pub duplicate_chunks: u64,
+    pub file_hashes: Vec<FileHash>,
+    pub warnings: Vec<String>,
+    pub skipped: Vec<String>,
+}
+
+#[derive(Clone, Serialize)]
+pub struct FileHash {
+    pub path: String,
+    pub hash: String,
 }
 
 pub enum JobState {

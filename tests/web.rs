@@ -242,6 +242,44 @@ fn out_of_range_send_options_are_400() {
 }
 
 #[test]
+fn malformed_preserve_is_400() {
+    let ui = start();
+    let dir = tempfile::tempdir().unwrap();
+    let r = post(
+        &ui,
+        "/api/send",
+        json!({ "addr": "127.0.0.1:9", "peer": ui.public_key, "paths": [dir.path()], "preserve": "yes" }),
+    );
+    assert_eq!(r.status, 400, "{}", r.body);
+}
+
+#[test]
+fn receiver_apply_policy_defaults_off_and_is_echoed() {
+    let ui = start();
+    let out = tempfile::tempdir().unwrap();
+    let (id, _) = start_receiver(&ui, out.path());
+    assert_eq!(
+        transfer(&ui, id)["spec"]["apply"],
+        json!({ "allow_special_bits": false, "allow_owner": false })
+    );
+    let r = post(
+        &ui,
+        "/api/receive",
+        json!({
+            "listen": "127.0.0.1:0",
+            "authorized": [ui.public_key],
+            "out_dir": out.path(),
+            "apply": { "allow_special_bits": true, "allow_owner": false },
+        }),
+    );
+    assert_eq!(r.status, 200, "{}", r.body);
+    assert_eq!(r.body["spec"]["apply"]["allow_special_bits"], true);
+    for id in [id, r.body["id"].as_u64().unwrap()] {
+        post(&ui, &format!("/api/transfers/{id}/cancel"), json!({}));
+    }
+}
+
+#[test]
 fn receiver_on_a_busy_port_is_400() {
     let ui = start();
     let dir = tempfile::tempdir().unwrap();
@@ -337,11 +375,14 @@ fn send_a_directory_end_to_end() {
             "chunk_size": 64 * 1024,
             "cipher": "ChaCha20Poly1305",
             "threads": 2,
+            "hash": true,
+            "preserve": { "perms": true, "times": true, "owner": false },
         }),
     );
     assert_eq!(r.status, 200, "{}", r.body);
     assert_eq!(r.body["kind"], "send");
     assert_eq!(r.body["spec"]["threads"], 2);
+    assert_eq!(r.body["spec"]["preserve"]["times"], true);
     let send_id = r.body["id"].as_u64().unwrap();
 
     let sent = wait_until_ended(&ui, send_id);
@@ -350,6 +391,21 @@ fn send_a_directory_end_to_end() {
     assert_eq!(received["state"], "done", "{received}");
     assert_eq!(received["report"]["files"], files.len());
     assert_eq!(received["report"]["verified"], true);
+    assert_eq!(received["report"]["hashed"], true);
+    assert_eq!(sent["report"]["hashed"], true);
+    let hashes = sent["report"]["file_hashes"].as_array().unwrap();
+    assert_eq!(hashes.len(), files.len(), "{}", sent["report"]);
+    assert!(
+        hashes
+            .iter()
+            .all(|h| h["path"].is_string() && h["hash"].is_string())
+    );
+    assert_eq!(
+        received["report"]["warnings"],
+        json!([]),
+        "{}",
+        received["report"]
+    );
     assert_eq!(received["report"]["duplicate_chunks"], 0);
     let total: usize = files.iter().map(|(_, d)| d.len()).sum();
     assert_eq!(sent["progress"]["bytes_done"], total);

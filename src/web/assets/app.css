@@ -793,3 +793,69 @@ span.entry-name {
     margin-left: 0;
   }
 }
+
+fieldset.plain {
+  border: 0;
+  margin: 0;
+  padding: 0;
+  min-width: 0;
+}
+
+.check-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px 18px;
+}
+
+details.advanced {
+  margin: 4px 0 16px;
+}
+
+details.advanced > summary,
+details.hashes > summary {
+  cursor: pointer;
+  color: var(--muted);
+}
+
+details.advanced > summary {
+  margin-bottom: 10px;
+}
+
+.report-summary {
+  margin: 0;
+}
+
+.report-list {
+  margin-top: 8px;
+}
+
+.report-list p {
+  margin: 0 0 4px;
+}
+
+.report-list.warn p {
+  color: var(--pending);
+}
+
+.report-list ul,
+details.hashes ul {
+  margin: 0;
+  padding-left: 18px;
+  overflow-wrap: anywhere;
+}
+
+details.hashes {
+  margin-top: 8px;
+}
+
+.hash-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 2px 10px;
+  color: var(--text);
+}
+
+.hash-value {
+  color: var(--muted);
+  overflow-wrap: anywhere;
+}
