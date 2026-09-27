@@ -190,6 +190,13 @@ write to.
   extended attributes are not copied.
 - Private key files are stored unencrypted, protected only by file
   permissions.
+- A source that changes during a transfer is caught only by its size or
+  mtime, which the sender re-checks after every round. An in-place edit that
+  keeps both, such as a tool that restores the mtime, goes out as a mix of
+  old and new bytes, and every check still passes, because each chunk is
+  exactly what the sender read. `send --hash` re-reads every file after
+  delivery and resends any chunk that differs; use it when sources may
+  change while they are being sent.
 - Integrity is checked per chunk: the AEAD tag in transit, then a BLAKE3
   digest when the receiver reads the chunk back, and with `--hash` a digest
   of the sender's re-read. The `file_hash` both sides print with `--hash` is
