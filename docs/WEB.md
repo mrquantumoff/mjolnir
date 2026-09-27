@@ -34,8 +34,11 @@ line as `key [label]`. Tick "Overwrite existing files" to replace files that
 already exist in the output folder. "Verify after transfer" (on by default)
 reads every chunk back from disk before finishing and fetches again any that
 do not match. "CPU threads" sets how many workers open chunks; leave it
-empty for one per core. The receiver binds immediately, so a
-port that is already in use is reported on the form. Its card shows the bound
+empty for one per core. Under "Advanced", "Allow setuid/setgid bits" and
+"Apply ownership (root only)" let the sender's file map set those; both are
+off, so by default a sender cannot plant privileged files or choose their
+owner. The receiver binds immediately, so a port that is already in use is
+reported on the form. Its card shows the bound
 address with a Copy button, to paste into the sender's form. Each receiver
 takes one complete transfer, then finishes; a sender that fails the
 handshake or drops mid-session does not end it, and it goes back to waiting.
@@ -44,17 +47,27 @@ Several receivers can wait on different ports at once.
 **Send files.** Enter the receiver's address and public key, add files and
 folders with the file browser, and optionally tune the number of connections
 (1 to 64, default 8), the chunk size, the cipher, and the CPU threads that
-seal chunks (empty means one per core). Recent peers are remembered in the
-browser.
+seal chunks (empty means one per core). "Verify with hash after delivery"
+re-reads every file on this side once it is delivered; the receiver compares
+the chunk digests and fetches any mismatch again. "Preserve" chooses what
+the file map carries: permissions (on by default), modification times, and
+owner. Recent peers are remembered in the browser.
+
+![The send form](web-ui/send-form.png)
 
 ![The file browser: folders navigate, checkboxes select files and folders](web-ui/picker.png)
+
+![The receive form with Advanced open](web-ui/receive-form.png)
 
 Each transfer card shows its phase, a progress bar, bytes done and total,
 throughput and ETA (computed in the browser from successive polls), and the
 number of active connections. Running transfers have a Cancel button;
 finished ones have Remove. Failed transfers show the error. Finished ones show
 a summary: files, bytes, time, average speed, whether every chunk was
-verified, and any repaired, duplicate, or resent chunks.
+verified and hash checked, and any repaired, hash-repaired, duplicate, or
+resent chunks. Warnings (metadata the receiver could not apply) and skipped
+files (symbolic links and special files the sender left out) are listed when
+there are any, and the per-file hashes sit in a collapsible section.
 
 ![Finished transfers with their summaries](web-ui/done.png)
 
@@ -140,7 +153,9 @@ have the shape `{ "error": "message", "field": "name" | null }`, where
     "connections": 8,
     "chunk_size": 1048576,
     "cipher": "Aes256Gcm",
-    "threads": 0
+    "threads": 0,
+    "hash": true,
+    "preserve": { "perms": true, "times": false, "owner": false }
   },
   "created_at_ms": 1790000000000,
   "state": "running",
@@ -160,15 +175,28 @@ have the shape `{ "error": "message", "field": "name" | null }`, where
 ```
 
 - `kind` is `send` or `receive`. A receive `spec` is
-  `{ "listen", "authorized": [keys], "out_dir", "force", "verify", "threads" }`.
+  `{ "listen", "authorized": [keys], "out_dir", "force", "verify", "threads", "apply": { "allow_special_bits", "allow_owner" } }`.
 - `state` is `running`, `done`, `failed`, or `cancelled`. `error` is set
   when failed, `report` when done:
-  `{ "files", "bytes", "elapsed_ms", "verified", "chunks_resent", "repaired_chunks", "duplicate_chunks" }`.
-  Counts that do not apply to a side are 0.
+
+  ```json
+  {
+    "files": 9, "bytes": 9170000000, "elapsed_ms": 10400,
+    "verified": true, "hashed": true,
+    "chunks_resent": 0, "repaired_chunks": 0, "hash_repaired_chunks": 0, "duplicate_chunks": 0,
+    "file_hashes": [{ "path": "dataset/model.ckpt", "hash": "295b43bf..." }],
+    "warnings": [], "skipped": []
+  }
+  ```
+
+  Counts that do not apply to a side are 0. The receiver always lists file
+  hashes; the sender lists them only when `hash` was on. `skipped` is filled
+  on the sender, `warnings` mostly on the receiver.
 - `bound_addr` is the receiver's actual listening address, `null` for sends.
 - `progress.phase` is `connecting`, `handshaking`, `transferring`,
-  `verifying`, `finishing`, `done`, or `failed`. `bytes_total` is 0 until the
-  manifest is known. While verifying, `bytes_done` counts bytes read back.
+  `verifying`, `hashing`, `finishing`, `done`, or `failed`. `bytes_total` is 0
+  until the manifest is known. While verifying or hashing, `bytes_done` counts
+  bytes read back.
 - `elapsed_ms` counts from creation to now, or to the end once finished.
 
 ### `POST /api/send`
@@ -181,13 +209,16 @@ have the shape `{ "error": "message", "field": "name" | null }`, where
   "connections": 8,
   "chunk_size": 1048576,
   "cipher": "Aes256Gcm",
-  "threads": 0
+  "threads": 0,
+  "hash": false,
+  "preserve": { "perms": true, "times": false, "owner": false }
 }
 ```
 
 `connections` (1 to 64), `chunk_size` (4 KiB to 64 MiB), `cipher`
-(`Aes256Gcm` or `ChaCha20Poly1305`), and `threads` (0 to 256, 0 meaning one
-per core) are optional with the defaults shown.
+(`Aes256Gcm` or `ChaCha20Poly1305`), `threads` (0 to 256, 0 meaning one
+per core), `hash`, and `preserve` are optional with the defaults shown.
+`preserve` must name all three flags when given.
 `addr` may be a host name; it is resolved when the transfer starts. Every
 path must exist. Returns the new Transfer.
 
@@ -200,12 +231,13 @@ path must exist. Returns the new Transfer.
   "out_dir": "/incoming",
   "force": false,
   "verify": true,
-  "threads": 0
+  "threads": 0,
+  "apply": { "allow_special_bits": false, "allow_owner": false }
 }
 ```
 
-`listen` is an `ip:port`; port 0 picks a free one. `force`, `verify`, and
-`threads` are optional with the defaults shown. At least one authorized
+`listen` is an `ip:port`; port 0 picks a free one. `force`, `verify`,
+`threads`, and `apply` are optional with the defaults shown. At least one authorized
 key is required, and `out_dir` must be an existing folder. The listener binds
 before the response is sent, so a busy port is a 400 on `listen`, and the
 returned Transfer carries `bound_addr`.
