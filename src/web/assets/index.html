@@ -1,0 +1,171 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>gorynych</title>
+  <link rel="icon" href="data:,">
+  <link rel="stylesheet" href="/app.css">
+  <script src="/app.js" defer></script>
+</head>
+<body>
+  <div id="auth-error" class="auth-error" role="alert" hidden>
+    <h1>gorynych</h1>
+    <p>Missing or expired access token. Open the URL printed by <code>gorynych serve</code>.</p>
+  </div>
+
+  <div id="app" class="app" hidden>
+    <header class="header">
+      <h1 class="brand">gorynych</h1>
+      <div class="identity">
+        <span class="identity-label">Your public key</span>
+        <div class="key-row">
+          <code id="public-key" class="mono key">loading...</code>
+          <button type="button" id="copy-key" class="button small">Copy</button>
+        </div>
+        <div id="key-path" class="mono muted tiny"></div>
+      </div>
+    </header>
+
+    <div id="notice" class="notice" role="alert" hidden></div>
+
+    <main>
+      <div class="actions">
+        <button type="button" id="toggle-send" class="button primary" aria-expanded="false" aria-controls="send-panel">Send files</button>
+        <button type="button" id="toggle-receive" class="button primary" aria-expanded="false" aria-controls="receive-panel">Receive files</button>
+      </div>
+
+      <section id="send-panel" class="panel" aria-labelledby="send-title" hidden>
+        <h2 id="send-title" class="panel-title">Send files</h2>
+        <form id="send-form" novalidate>
+          <div class="form-error" data-form-error hidden></div>
+
+          <div class="field">
+            <label for="send-addr">Receiver address</label>
+            <input id="send-addr" name="addr" class="mono" type="text" placeholder="host:port" autocomplete="off" spellcheck="false" autocapitalize="off">
+            <div id="recent-peers" class="recent" hidden>
+              <span class="muted tiny">Recent:</span>
+              <div id="recent-peer-list" class="recent-list"></div>
+            </div>
+            <p class="field-error" data-field-error="addr" hidden></p>
+          </div>
+
+          <div class="field">
+            <label for="send-peer">Receiver public key</label>
+            <input id="send-peer" name="peer" class="mono" type="text" placeholder="44-character base64 key" autocomplete="off" spellcheck="false" autocapitalize="off">
+            <p class="field-error" data-field-error="peer" hidden></p>
+          </div>
+
+          <div class="field">
+            <span class="label" id="paths-label">Files and folders</span>
+            <ul id="send-paths" class="path-list" aria-labelledby="paths-label"></ul>
+            <div>
+              <button type="button" id="add-paths" class="button">Add files or folders</button>
+            </div>
+            <p class="field-error" data-field-error="paths" hidden></p>
+          </div>
+
+          <div class="field-row">
+            <div class="field">
+              <label for="send-connections">Connections</label>
+              <input id="send-connections" name="connections" type="number" min="1" max="64" step="1" value="8" inputmode="numeric">
+              <p class="field-error" data-field-error="connections" hidden></p>
+            </div>
+            <div class="field">
+              <label for="send-chunk">Chunk size</label>
+              <select id="send-chunk" name="chunk_size">
+                <option value="262144">256 KiB</option>
+                <option value="1048576" selected>1 MiB</option>
+                <option value="4194304">4 MiB</option>
+                <option value="16777216">16 MiB</option>
+              </select>
+              <p class="field-error" data-field-error="chunk_size" hidden></p>
+            </div>
+            <div class="field">
+              <label for="send-cipher">Cipher</label>
+              <select id="send-cipher" name="cipher">
+                <option value="Aes256Gcm" selected>AES-256-GCM</option>
+                <option value="ChaCha20Poly1305">ChaCha20-Poly1305</option>
+              </select>
+              <p class="field-error" data-field-error="cipher" hidden></p>
+            </div>
+          </div>
+
+          <div class="form-actions">
+            <button type="submit" class="button primary">Start send</button>
+          </div>
+        </form>
+      </section>
+
+      <section id="receive-panel" class="panel" aria-labelledby="receive-title" hidden>
+        <h2 id="receive-title" class="panel-title">Receive files</h2>
+        <form id="receive-form" novalidate>
+          <div class="form-error" data-form-error hidden></div>
+
+          <div class="field">
+            <label for="receive-listen">Listen address</label>
+            <input id="receive-listen" name="listen" class="mono" type="text" value="0.0.0.0:7777" autocomplete="off" spellcheck="false" autocapitalize="off">
+            <p class="field-error" data-field-error="listen" hidden></p>
+          </div>
+
+          <div class="field">
+            <label for="receive-out">Output folder</label>
+            <div class="input-row">
+              <input id="receive-out" name="out_dir" class="mono" type="text" autocomplete="off" spellcheck="false" autocapitalize="off">
+              <button type="button" id="browse-out" class="button">Browse</button>
+            </div>
+            <p class="field-error" data-field-error="out_dir" hidden></p>
+          </div>
+
+          <div class="field">
+            <label for="receive-authorized">Authorized sender keys</label>
+            <textarea id="receive-authorized" name="authorized" class="mono" rows="4" spellcheck="false" autocapitalize="off" placeholder="base64key= laptop&#10;# one key per line, optional label after a space"></textarea>
+            <p class="field-error" data-field-error="authorized" hidden></p>
+          </div>
+
+          <div class="field">
+            <label class="check">
+              <input id="receive-force" name="force" type="checkbox">
+              <span>Overwrite existing files</span>
+            </label>
+            <p class="field-error" data-field-error="force" hidden></p>
+          </div>
+
+          <div class="form-actions">
+            <button type="submit" class="button primary">Start receiver</button>
+          </div>
+        </form>
+      </section>
+
+      <section class="transfers" aria-labelledby="transfers-title">
+        <h2 id="transfers-title" class="section-title">Transfers</h2>
+        <p id="transfers-empty" class="empty">No transfers yet. Start a send or a receiver above.</p>
+        <ul id="transfer-list" class="transfer-list"></ul>
+      </section>
+    </main>
+  </div>
+
+  <div id="fs-modal" class="modal-backdrop" hidden>
+    <div class="modal" role="dialog" aria-modal="true" aria-labelledby="fs-title">
+      <div class="modal-head">
+        <h2 id="fs-title" class="modal-title">Choose files</h2>
+        <button type="button" id="fs-close" class="button small ghost" aria-label="Close">Close</button>
+      </div>
+      <div id="fs-roots" class="fs-roots"></div>
+      <div class="fs-nav">
+        <button type="button" id="fs-up" class="button small">Up</button>
+        <code id="fs-path" class="mono fs-path"></code>
+      </div>
+      <div id="fs-error" class="error-box" role="alert" hidden></div>
+      <ul id="fs-entries" class="fs-entries"></ul>
+      <div class="modal-foot">
+        <span id="fs-count" class="muted small"></span>
+        <div class="modal-buttons">
+          <button type="button" id="fs-cancel" class="button">Cancel</button>
+          <button type="button" id="fs-confirm" class="button primary">Add selected</button>
+        </div>
+      </div>
+    </div>
+  </div>
+</body>
+</html>
