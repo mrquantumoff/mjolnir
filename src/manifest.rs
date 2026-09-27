@@ -30,8 +30,15 @@ impl RelPath {
                 "." | ".." => bail!("{component:?} component in path {s:?}"),
                 c if c.contains(':') => bail!("':' (drive prefix or stream) in path {s:?}"),
                 c if c.contains('\0') => bail!("NUL in path {s:?}"),
+                c if c.ends_with('.') || c.ends_with(' ') => {
+                    bail!("component ending in '.' or ' ' in path {s:?}")
+                }
+                c if is_windows_device(c) => bail!("reserved device name in path {s:?}"),
                 _ => {}
             }
+        }
+        if RESERVED_SUFFIXES.iter().any(|suffix| s.ends_with(suffix)) {
+            bail!("path {s:?} ends in a suffix the receiver uses for its own files");
         }
         Ok(RelPath(s.to_owned()))
     }
@@ -40,12 +47,38 @@ impl RelPath {
         &self.0
     }
 
+    /// Names that case-insensitive file systems treat as one file share a key.
+    fn collision_key(&self) -> String {
+        self.0.to_lowercase()
+    }
+
     /// Joins component by component, so no component can reset the base.
     pub fn under(&self, root: &Path) -> PathBuf {
         let mut path = root.to_path_buf();
         path.extend(self.0.split('/'));
         path
     }
+}
+
+/// Suffixes of the receiver's side files; see `recv.rs`.
+pub const RESERVED_SUFFIXES: [&str; 4] = [
+    ".gorynych-part",
+    ".gorynych-state",
+    ".gorynych-state.tmp",
+    ".gorynych-sums",
+];
+
+/// `CON`, `nul.txt`, `COM1` and the like open devices on Windows.
+fn is_windows_device(component: &str) -> bool {
+    let stem = component
+        .split('.')
+        .next()
+        .unwrap_or_default()
+        .to_ascii_uppercase();
+    matches!(stem.as_str(), "CON" | "PRN" | "AUX" | "NUL")
+        || (stem.len() == 4
+            && (stem.starts_with("COM") || stem.starts_with("LPT"))
+            && matches!(stem.as_bytes()[3], b'1'..=b'9'))
 }
 
 pub const MIN_CHUNK_SIZE: u32 = 4 << 10;
@@ -129,9 +162,21 @@ impl Manifest {
         }
         let mut seen = HashSet::new();
         for f in &files {
-            if !seen.insert(f.path.as_str()) {
-                bail!("duplicate path {:?}", f.path.as_str());
+            if !seen.insert(f.path.collision_key()) {
+                bail!(
+                    "duplicate path {:?} (paths that differ only in case collide)",
+                    f.path.as_str()
+                );
             }
+        }
+        // The receiver's `Have` carries one bitmap per file plus a length
+        // prefix of up to 10 bytes, and must fit in one control message.
+        let have_bytes: u64 = files
+            .iter()
+            .map(|f| chunk_count(f.size, chunk_size).div_ceil(8) + 10)
+            .sum();
+        if have_bytes + 1024 > crate::wire::MAX_CONTROL_LEN as u64 {
+            bail!("too many chunks for one transfer; use a larger chunk size");
         }
         Ok(Manifest { chunk_size, files })
     }
@@ -260,7 +305,17 @@ mod tests {
 
     #[test]
     fn relpath_accepts_normal_paths() {
-        for ok in ["a", "a/b/c.txt", "dir/.hidden", "a..b/c", "space name/x"] {
+        for ok in [
+            "a",
+            "a/b/c.txt",
+            "dir/.hidden",
+            "a..b/c",
+            "space name/x",
+            "console",
+            "com10",
+            "nul_file",
+            "x.gorynych-partial",
+        ] {
             RelPath::parse(ok).unwrap_or_else(|e| panic!("{ok}: {e}"));
         }
     }
@@ -284,6 +339,19 @@ mod tests {
             "a/",
             "//server/share",
             "a/\0b",
+            "a.",
+            "a ",
+            "d./f",
+            "...",
+            "nul",
+            "NUL.txt",
+            "dir/com1",
+            "Lpt9.log",
+            "aux/x",
+            "big.iso.gorynych-part",
+            "x.gorynych-state",
+            "x.gorynych-state.tmp",
+            "x.gorynych-sums",
         ] {
             assert!(RelPath::parse(bad).is_err(), "accepted {bad:?}");
         }
@@ -309,6 +377,18 @@ mod tests {
     }
 
     #[test]
+    fn manifest_rejects_offers_whose_have_would_not_fit() {
+        let huge = FileEntry {
+            path: RelPath::parse("huge").unwrap(),
+            size: 1 << 50,
+            mtime: 0,
+        };
+        let err = Manifest::new(cs(4096), vec![huge.clone()]).unwrap_err();
+        assert!(err.to_string().contains("too many chunks"), "{err}");
+        assert!(Manifest::new(cs(MAX_CHUNK_SIZE), vec![huge]).is_ok());
+    }
+
+    #[test]
     fn manifest_rejects_duplicates() {
         let f = |p: &str| FileEntry {
             path: RelPath::parse(p).unwrap(),
@@ -317,6 +397,8 @@ mod tests {
         };
         assert!(Manifest::new(cs(4096), vec![f("a"), f("b/a")]).is_ok());
         let err = Manifest::new(cs(4096), vec![f("a"), f("b"), f("a")]).unwrap_err();
+        assert!(err.to_string().contains("duplicate"));
+        let err = Manifest::new(cs(4096), vec![f("README"), f("readme")]).unwrap_err();
         assert!(err.to_string().contains("duplicate"));
     }
 }

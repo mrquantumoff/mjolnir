@@ -470,3 +470,83 @@ fn source_changed_during_transfer_fails_the_sender() {
     rx.progress.cancel();
     assert!(rx.join().unwrap_err().is::<Cancelled>());
 }
+
+#[test]
+fn a_stalled_handshake_does_not_block_a_real_sender() {
+    use std::io::Write;
+    let src = TempDir::new().unwrap();
+    let file = src.path().join("f.bin");
+    write(&file, &noise(50_000, 11));
+    let out = TempDir::new().unwrap();
+    let (rk, _) = keypair();
+    let (sk, spub) = keypair();
+    let rx = start_receiver(rk, vec![spub], out.path());
+
+    let mut stall = std::net::TcpStream::connect(rx.addr).unwrap();
+    stall.write_all(b"GRYN\x01\x00\xff").unwrap();
+    thread::sleep(Duration::from_millis(100));
+
+    let started = Instant::now();
+    Send::to(sk, rx.public).run(rx.addr, &[&file]).unwrap();
+    rx.join().unwrap();
+    assert!(started.elapsed() < Duration::from_secs(5));
+    assert_file_eq(&file, &out.path().join("f.bin"));
+    drop(stall);
+}
+
+#[test]
+fn a_second_control_connection_is_closed_during_a_session() {
+    use std::io::{Read, Write};
+    let src = TempDir::new().unwrap();
+    let file = big_source(&src, 64);
+    let out = TempDir::new().unwrap();
+    let (rk, _) = keypair();
+    let (sk, spub) = keypair();
+    let rx = start_receiver(rk, vec![spub], out.path());
+    let mut send = Send::to(sk, rx.public);
+    send.connections = 2;
+    let progress = Arc::new(Progress::default());
+    let sender = {
+        let (cfg, progress) = (send.config(rx.addr, &[&file]), progress.clone());
+        thread::spawn(move || gorynych::send(cfg, progress))
+    };
+    while rx.progress.phase() != Phase::Transferring {
+        thread::sleep(Duration::from_millis(1));
+    }
+
+    let mut second = std::net::TcpStream::connect(rx.addr).unwrap();
+    second.write_all(b"GRYN\x01\x00").unwrap();
+    second
+        .set_read_timeout(Some(Duration::from_secs(3)))
+        .unwrap();
+    let mut buf = [0u8; 1];
+    let closed = match second.read(&mut buf) {
+        Ok(n) => n == 0,
+        Err(e) => !matches!(
+            e.kind(),
+            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+        ),
+    };
+    assert!(closed, "second control connection was answered");
+
+    sender.join().unwrap().unwrap();
+    rx.join().unwrap();
+    assert_file_eq(&file, &out.path().join("big.bin"));
+}
+
+#[test]
+fn receiver_cancel_is_prompt_with_a_silent_connection_pending() {
+    use std::io::Write;
+    let out = TempDir::new().unwrap();
+    let (rk, _) = keypair();
+    let (_, spub) = keypair();
+    let rx = start_receiver(rk, vec![spub], out.path());
+    let mut silent = std::net::TcpStream::connect(rx.addr).unwrap();
+    silent.write_all(b"GRYN\x01\x00").unwrap();
+    thread::sleep(Duration::from_millis(100));
+    let started = Instant::now();
+    rx.progress.cancel();
+    let err = rx.join().unwrap_err();
+    assert_eq!(err.downcast_ref::<Cancelled>(), Some(&Cancelled::Local));
+    assert!(started.elapsed() < Duration::from_secs(1));
+}

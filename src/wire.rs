@@ -2,7 +2,6 @@
 //! connection hello, and data frames.
 
 use std::io::{BufReader, Read, Write};
-use std::net::TcpStream;
 
 use anyhow::{Context, Result, bail, ensure};
 use serde::{Deserialize, Serialize};
@@ -74,41 +73,41 @@ pub enum Role {
 }
 
 /// Sending half of the control channel.
-pub struct ControlTx {
-    stream: TcpStream,
+pub struct ControlTx<W> {
+    writer: W,
     cipher: CipherState,
 }
 
 /// Receiving half of the control channel.
-pub struct ControlRx {
-    reader: BufReader<TcpStream>,
+pub struct ControlRx<R> {
+    reader: BufReader<R>,
     cipher: CipherState,
 }
 
-/// Splits a handshaken control connection into its two directions.
-pub fn control_channel(
-    stream: TcpStream,
+/// Wraps the two directions of a handshaken control connection.
+pub fn control_channel<R: Read, W: Write>(
+    reader: R,
+    writer: W,
     keys: &SessionKeys,
     role: Role,
-) -> Result<(ControlTx, ControlRx)> {
+) -> (ControlTx<W>, ControlRx<R>) {
     let (tx_key, rx_key) = match role {
         Role::Sender => (&keys.ctrl_s2r, &keys.ctrl_r2s),
         Role::Receiver => (&keys.ctrl_r2s, &keys.ctrl_s2r),
     };
-    let reader = BufReader::new(stream.try_clone()?);
-    Ok((
+    (
         ControlTx {
-            stream,
+            writer,
             cipher: CipherState::new(Cipher::ChaCha20Poly1305, tx_key),
         },
         ControlRx {
-            reader,
+            reader: BufReader::new(reader),
             cipher: CipherState::new(Cipher::ChaCha20Poly1305, rx_key),
         },
-    ))
+    )
 }
 
-impl ControlTx {
+impl<W: Write> ControlTx<W> {
     pub fn send(&mut self, msg: &Msg) -> Result<()> {
         let mut buf = postcard::to_allocvec(msg)?;
         buf.extend_from_slice(&[0u8; TAG_LEN]);
@@ -121,12 +120,12 @@ impl ControlTx {
         let mut framed = Vec::with_capacity(4 + buf.len());
         framed.extend_from_slice(&(buf.len() as u32).to_be_bytes());
         framed.extend_from_slice(&buf);
-        self.stream.write_all(&framed)?;
+        self.writer.write_all(&framed)?;
         Ok(())
     }
 }
 
-impl ControlRx {
+impl<R: Read> ControlRx<R> {
     pub fn recv(&mut self) -> Result<Msg> {
         let mut len = [0u8; 4];
         self.reader

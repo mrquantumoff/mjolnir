@@ -17,6 +17,9 @@ use crate::keys::{PrivateKey, PublicKey};
 const NOISE_PARAMS: &str = "Noise_IK_25519_ChaChaPoly_SHA256";
 const PROLOGUE: &[u8] = b"gorynych v1";
 const NOISE_MAX: usize = 65535;
+/// IK message 1 with an empty payload: `e` (32), encrypted `s` (32 + 16),
+/// and the empty payload's tag (16).
+const IK_MSG1_LEN: usize = 96;
 
 pub const TAG_LEN: usize = 16;
 
@@ -172,10 +175,12 @@ fn write_noise(w: &mut impl Write, msg: &[u8]) -> Result<()> {
     Ok(())
 }
 
-fn read_noise(r: &mut impl Read) -> std::io::Result<Vec<u8>> {
+fn read_noise(r: &mut impl Read, max: usize) -> Result<Vec<u8>> {
     let mut len = [0u8; 2];
     r.read_exact(&mut len)?;
-    let mut msg = vec![0u8; usize::from(u16::from_be_bytes(len))];
+    let len = usize::from(u16::from_be_bytes(len));
+    ensure!(len <= max, "Noise message of {len} bytes is too long");
+    let mut msg = vec![0u8; len];
     r.read_exact(&mut msg)?;
     Ok(msg)
 }
@@ -195,7 +200,7 @@ pub fn handshake_initiator(
     let mut buf = vec![0u8; NOISE_MAX];
     let n = hs.write_message(&[], &mut buf)?;
     write_noise(stream, &buf[..n]).context("sending Noise message 1")?;
-    let msg = read_noise(stream).map_err(|_| anyhow!(REJECTED))?;
+    let msg = read_noise(stream, NOISE_MAX).map_err(|_| anyhow!(REJECTED))?;
     let n = hs
         .read_message(&msg, &mut buf)
         .context("Noise message 2 did not authenticate")?;
@@ -216,7 +221,7 @@ pub fn handshake_responder(
         .local_private_key(local.as_bytes())?
         .prologue(PROLOGUE)?
         .build_responder()?;
-    let msg = read_noise(stream).context("reading Noise message 1")?;
+    let msg = read_noise(stream, IK_MSG1_LEN).context("reading Noise message 1")?;
     let mut buf = vec![0u8; NOISE_MAX];
     let n = hs.read_message(&msg, &mut buf).map_err(|_| {
         anyhow!(

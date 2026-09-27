@@ -3,7 +3,7 @@
 
 use std::fs::{self, File};
 use std::io::{Read, Write};
-use std::net::{Shutdown, SocketAddr, TcpStream};
+use std::net::{Shutdown, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering::Relaxed};
@@ -18,12 +18,12 @@ use crate::bitset::AtomicBitset;
 use crate::crypto::{Cipher, CipherState, SessionKeys, TAG_LEN, handshake_initiator};
 use crate::keys::{PrivateKey, PublicKey};
 use crate::manifest::{ChunkId, ChunkSize, FileEntry, Manifest, RelPath, chunk_span, mtime_of};
-use crate::net::{self, SharedTx, Sockets, send_ctrl, tell_peer_about, unexpected};
+use crate::net::{self, Io, tell_peer_about, unexpected};
 use crate::posio::read_exact_at;
-use crate::progress::{ActiveConnection, Cancelled, Phase, Progress, Stop};
+use crate::progress::{ActiveConnection, Cancelled, Phase, Progress};
 use crate::wire::{
-    self, ADMITTED, CHALLENGE_LEN, ConnKind, ControlRx, FrameHeader, HEADER_LEN, Msg, Role,
-    chunk_header, encode_hello, seal_frame,
+    self, ADMITTED, CHALLENGE_LEN, ConnKind, ControlRx, ControlTx, FrameHeader, HEADER_LEN, Msg,
+    Role, chunk_header, encode_hello, seal_frame,
 };
 
 #[derive(Clone, Debug, Serialize)]
@@ -53,6 +53,10 @@ pub struct SendReport {
 
 /// Rounds without progress tolerated before giving up.
 const MAX_FAILED_ROUNDS: u32 = 3;
+/// Handshakes and data connection hellos must finish within this.
+const HANDSHAKE_DEADLINE: Duration = Duration::from_secs(30);
+/// A data connection whose socket accepts no byte for this long is dropped.
+const DATA_IDLE: Duration = Duration::from_secs(60);
 
 pub fn send(cfg: SendConfig, progress: std::sync::Arc<Progress>) -> Result<SendReport> {
     progress.conclude(run(&cfg, &progress))
@@ -71,13 +75,15 @@ struct Ctx<'a> {
     manifest: &'a Manifest,
     files: &'a [File],
     paths: &'a [PathBuf],
-    sockets: &'a Sockets,
     progress: &'a Progress,
     chunks_sent: AtomicU64,
     bytes_sent: AtomicU64,
     /// A local read failure; fatal for the transfer, unlike network errors.
     fatal: Mutex<Option<anyhow::Error>>,
 }
+
+type Tx<'a> = ControlTx<Io<'a>>;
+type Rx<'a> = ControlRx<Io<'a>>;
 
 fn run(cfg: &SendConfig, progress: &Progress) -> Result<SendReport> {
     let start = Instant::now();
@@ -94,65 +100,49 @@ fn run(cfg: &SendConfig, progress: &Progress) -> Result<SendReport> {
         .collect::<Result<Vec<_>>>()?;
     let (entries, paths): (Vec<_>, Vec<_>) = sources.into_iter().map(|s| (s.entry, s.path)).unzip();
     let manifest = Manifest::new(chunk_size, entries)?;
-    check_bitmaps_fit(&manifest)?;
 
     let addrs = net::resolve(&cfg.addr)?;
-    let mut control = net::connect(&addrs)?;
+    let cancelled = || progress.is_cancelled();
+    let mut control = Io::new(net::connect(&addrs, progress)?, &cancelled);
     wire::write_preamble(&mut control, ConnKind::Control)?;
-
-    let tx: SharedTx = Mutex::new(None);
-    let sockets = Sockets::default();
-    let stop = Stop::default();
-    let watched = control.try_clone()?;
-    thread::scope(|s| {
-        s.spawn(|| net::watch_cancel(progress, &stop, &watched, &tx, &sockets));
-        let result = (|| {
-            progress.set_phase(Phase::Handshaking);
-            let keys = handshake_initiator(&mut control, &cfg.key, &cfg.peer)?;
-            let (ctx_tx, mut rx) = wire::control_channel(control, &keys, Role::Sender)?;
-            *tx.lock().unwrap() = Some(ctx_tx);
-            let ctx = Ctx {
-                addrs: &addrs,
-                keys: &keys,
-                cipher: cfg.cipher,
-                manifest: &manifest,
-                files: &files,
-                paths: &paths,
-                sockets: &sockets,
-                progress,
-                chunks_sent: AtomicU64::new(0),
-                bytes_sent: AtomicU64::new(0),
-                fatal: Mutex::new(None),
-            };
-            let rounds = transfer(&ctx, cfg.connections, &tx, &mut rx)?;
-            Ok(SendReport {
-                files: manifest.files.len(),
-                bytes_sent: ctx.bytes_sent.load(Relaxed),
-                chunks_sent: ctx.chunks_sent.load(Relaxed),
-                rounds,
-                elapsed: start.elapsed(),
-            })
-        })();
-        if let Err(e) = &result {
-            tell_peer_about(e, progress, &tx);
-        }
-        stop.stop();
-        sockets.shutdown_all();
-        result
+    progress.set_phase(Phase::Handshaking);
+    let mut handshake = control.try_clone()?.deadline(HANDSHAKE_DEADLINE);
+    let keys = handshake_initiator(&mut handshake, &cfg.key, &cfg.peer)?;
+    let (mut tx, mut rx) =
+        wire::control_channel(control.try_clone()?, control, &keys, Role::Sender);
+    let ctx = Ctx {
+        addrs: &addrs,
+        keys: &keys,
+        cipher: cfg.cipher,
+        manifest: &manifest,
+        files: &files,
+        paths: &paths,
+        progress,
+        chunks_sent: AtomicU64::new(0),
+        bytes_sent: AtomicU64::new(0),
+        fatal: Mutex::new(None),
+    };
+    let result = transfer(&ctx, cfg.connections, &mut tx, &mut rx);
+    if let Err(e) = &result {
+        tell_peer_about(e, progress, Some(&mut tx));
+    }
+    Ok(SendReport {
+        files: manifest.files.len(),
+        bytes_sent: ctx.bytes_sent.load(Relaxed),
+        chunks_sent: ctx.chunks_sent.load(Relaxed),
+        rounds: result?,
+        elapsed: start.elapsed(),
     })
 }
 
 /// Runs rounds until the receiver reports `Finished`. Returns the round count.
-fn transfer(ctx: &Ctx, connections: usize, tx: &SharedTx, rx: &mut ControlRx) -> Result<u32> {
+fn transfer(ctx: &Ctx, connections: usize, tx: &mut Tx, rx: &mut Rx) -> Result<u32> {
     let m = ctx.manifest;
-    send_ctrl(
-        tx,
-        &Msg::Offer {
-            chunk_size: m.chunk_size.get(),
-            cipher: ctx.cipher,
-            files: m.to_offer(),
-        },
-    )?;
+    tx.send(&Msg::Offer {
+        chunk_size: m.chunk_size.get(),
+        cipher: ctx.cipher,
+        files: m.to_offer(),
+    })?;
     let mut have = match rx.recv()? {
         Msg::Have { bitmaps } => parse_have(m, &bitmaps)?,
         other => return Err(unexpected(other, "Have")),
@@ -165,7 +155,7 @@ fn transfer(ctx: &Ctx, connections: usize, tx: &SharedTx, rx: &mut ControlRx) ->
     let mut failed_rounds = 0;
     for round in 0u32.. {
         let queue = missing(&have);
-        send_ctrl(tx, &Msg::RoundStart { round })?;
+        tx.send(&Msg::RoundStart { round })?;
         let admitted = run_round(ctx, round, connections, &queue);
         if ctx.progress.is_cancelled() {
             return Err(Cancelled::Local.into());
@@ -175,13 +165,10 @@ fn transfer(ctx: &Ctx, connections: usize, tx: &SharedTx, rx: &mut ControlRx) ->
         }
         check_unchanged(ctx)?;
         ctx.progress.set_phase(Phase::Finishing);
-        let sent = send_ctrl(
-            tx,
-            &Msg::RoundEnd {
-                round,
-                connections: admitted,
-            },
-        );
+        let sent = tx.send(&Msg::RoundEnd {
+            round,
+            connections: admitted,
+        });
         // Read even if the send failed: the peer may have said why it left.
         let reply = rx.recv().map_err(|e| sent.err().unwrap_or(e))?;
         match reply {
@@ -230,17 +217,19 @@ fn data_connection(
     cursor: &AtomicUsize,
     admitted: &AtomicU32,
 ) -> Result<()> {
-    let mut stream: TcpStream = net::connect(ctx.addrs)?;
-    ctx.sockets.add(&stream);
-    wire::write_preamble(&mut stream, ConnKind::Data)?;
+    let cancelled = || ctx.progress.is_cancelled();
+    let stream = net::connect(ctx.addrs, ctx.progress)?;
+    let mut hello = Io::new(stream, &cancelled).deadline(HANDSHAKE_DEADLINE);
+    wire::write_preamble(&mut hello, ConnKind::Data)?;
     let mut challenge = [0u8; CHALLENGE_LEN];
-    stream.read_exact(&mut challenge)?;
-    stream.write_all(&encode_hello(ctx.keys, &challenge, round, conn))?;
+    hello.read_exact(&mut challenge)?;
+    hello.write_all(&encode_hello(ctx.keys, &challenge, round, conn))?;
     let mut verdict = [0u8];
-    stream.read_exact(&mut verdict)?;
+    hello.read_exact(&mut verdict)?;
     ensure!(verdict[0] == ADMITTED, "receiver rejected the connection");
     admitted.fetch_add(1, Relaxed);
     let _active = ActiveConnection::new(ctx.progress);
+    let mut stream = Io::new(hello.into_stream(), &cancelled).idle(DATA_IDLE);
 
     let sid = &ctx.keys.session_id;
     let mut cipher = CipherState::new(ctx.cipher, &ctx.keys.data_key(round, conn));
@@ -272,7 +261,7 @@ fn data_connection(
     let end = &mut buf[..HEADER_LEN + TAG_LEN];
     seal_frame(&mut cipher, sid, FrameHeader::end(), end)?;
     stream.write_all(end)?;
-    stream.shutdown(Shutdown::Write)?;
+    stream.into_stream().shutdown(Shutdown::Write)?;
     Ok(())
 }
 
@@ -331,18 +320,6 @@ fn missing(have: &[AtomicBitset]) -> Vec<ChunkId> {
 
 fn missing_count(have: &[AtomicBitset]) -> u64 {
     have.iter().map(|b| b.len() - b.count_ones()).sum()
-}
-
-/// Refuses manifests whose `Have` reply would not fit in one control message.
-fn check_bitmaps_fit(m: &Manifest) -> Result<()> {
-    let bytes: u64 = (0..m.files.len() as u32)
-        .map(|j| m.chunk_count(j).div_ceil(8) + 10)
-        .sum();
-    ensure!(
-        bytes + 1024 <= wire::MAX_CONTROL_LEN as u64,
-        "too many chunks for one transfer; use a larger --chunk-size"
-    );
-    Ok(())
 }
 
 /// Walks the inputs. A file is named by its file name; a directory's files

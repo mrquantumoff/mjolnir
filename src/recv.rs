@@ -6,7 +6,8 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufReader, ErrorKind, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering::Relaxed};
+use std::sync::mpsc::{self, RecvTimeoutError};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, Scope};
 use std::time::{Duration, Instant};
@@ -18,12 +19,12 @@ use crate::bitset::{AtomicBitset, PartState};
 use crate::crypto::{Cipher, CipherState, SessionKeys, TAG_LEN, handshake_responder};
 use crate::keys::{PrivateKey, PublicKey, require_nonempty};
 use crate::manifest::{FileEntry, Manifest, chunk_count, chunk_span};
-use crate::net::{self, SharedTx, Sockets, send_ctrl, tell_peer_about, unexpected};
+use crate::net::{self, Io, tell_peer_about, unexpected};
 use crate::posio::write_all_at;
 use crate::progress::{ActiveConnection, Cancelled, Phase, Progress, Stop};
 use crate::wire::{
-    self, ADMITTED, CHALLENGE_LEN, ConnKind, ControlRx, FrameHeader, HEADER_LEN, HELLO_LEN, Msg,
-    REJECTED, Role, check_hello, open_frame,
+    self, ADMITTED, CHALLENGE_LEN, ConnKind, ControlRx, ControlTx, FrameHeader, HEADER_LEN,
+    HELLO_LEN, Msg, REJECTED, Role, check_hello, open_frame,
 };
 
 #[derive(Clone, Debug, Serialize)]
@@ -60,11 +61,27 @@ pub struct Receiver {
 }
 
 const CHECKPOINT_EVERY: Duration = Duration::from_secs(2);
-const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
-const DATA_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
+/// Preamble plus Noise message 1 must arrive within this, however slowly
+/// the bytes trickle in.
+const HANDSHAKE_DEADLINE: Duration = Duration::from_secs(10);
+/// Handshakes in progress at once; more connections are dropped at accept.
+const MAX_PENDING_HANDSHAKES: usize = 32;
+/// Data connections not yet admitted at once; more are dropped at accept.
+const MAX_PENDING_DATA: usize = 64;
+const DATA_IDLE: Duration = Duration::from_secs(60);
 /// How long a data connection may wait for its round's `RoundStart`.
 const ROUND_START_WAIT: Duration = Duration::from_secs(10);
+/// After `RoundEnd`, how long to wait for the round's connections to close
+/// before closing the round anyway.
+const ROUND_CLOSE_WAIT: Duration = Duration::from_secs(30);
 const ACCEPT_POLL: Duration = Duration::from_millis(5);
+
+/// A control connection that finished the handshake.
+struct Handshaken {
+    stream: TcpStream,
+    keys: SessionKeys,
+    peer: PublicKey,
+}
 
 impl Receiver {
     pub fn bind(cfg: RecvConfig) -> Result<Self> {
@@ -90,56 +107,82 @@ impl Receiver {
         progress.conclude(self.run_inner(&progress))
     }
 
-    /// Serves sessions until one completes. A failed handshake or a failed
-    /// session is logged and the receiver waits for the next sender; only a
-    /// finished transfer or a local cancel returns.
-    fn run_inner(&self, progress: &Progress) -> Result<RecvReport> {
+    /// Serves sessions until one completes. Handshakes run on their own
+    /// threads, so a slow or hostile peer cannot hold up a real sender. A
+    /// failed handshake or a failed session is logged and the receiver
+    /// waits for the next sender; only a finished transfer or a local
+    /// cancel returns.
+    fn run_inner(&self, progress: &Arc<Progress>) -> Result<RecvReport> {
+        let (done_tx, done_rx) = mpsc::channel::<Handshaken>();
+        let pending = Arc::new(AtomicUsize::new(0));
+        let authorized = Arc::new(self.cfg.authorized.clone());
         loop {
-            progress.set_phase(Phase::Connecting);
-            let control = accept_control(&self.listener, progress)?;
-            match self.session(control, progress) {
+            if progress.is_cancelled() {
+                return Err(Cancelled::Local.into());
+            }
+            match self.listener.accept() {
+                Ok((stream, from)) => {
+                    if pending.load(Relaxed) >= MAX_PENDING_HANDSHAKES {
+                        continue;
+                    }
+                    pending.fetch_add(1, Relaxed);
+                    let (key, authorized, progress) =
+                        (self.cfg.key.clone(), authorized.clone(), progress.clone());
+                    let (done_tx, pending) = (done_tx.clone(), pending.clone());
+                    thread::spawn(move || {
+                        match handshake(stream, &key, &authorized, &progress) {
+                            Ok(Some(h)) => {
+                                let _ = done_tx.send(h);
+                            }
+                            Ok(None) => {}
+                            Err(e) if progress.is_cancelled() => drop(e),
+                            Err(e) => eprintln!("gorynych: handshake with {from} failed: {e:#}"),
+                        }
+                        pending.fetch_sub(1, Relaxed);
+                    });
+                }
+                Err(e) if e.kind() == ErrorKind::WouldBlock => {}
+                Err(e) => eprintln!("gorynych: accept failed: {e}"),
+            }
+            let h = match done_rx.recv_timeout(ACCEPT_POLL) {
+                Ok(h) => h,
+                Err(RecvTimeoutError::Timeout) => continue,
+                Err(RecvTimeoutError::Disconnected) => unreachable!("run_inner holds a sender"),
+            };
+            let peer = h.peer;
+            match self.session(h, progress) {
                 Ok(report) => return Ok(report),
                 Err(e) if progress.is_cancelled() => return Err(e),
-                Err(e) => eprintln!("gorynych: {e:#}; waiting for the next sender"),
+                Err(e) => {
+                    eprintln!(
+                        "gorynych: session with {peer} failed: {e:#}; waiting for the next sender"
+                    )
+                }
             }
+            progress.set_phase(Phase::Connecting);
         }
     }
 
-    fn session(&self, mut control: TcpStream, progress: &Progress) -> Result<RecvReport> {
+    fn session(&self, h: Handshaken, progress: &Progress) -> Result<RecvReport> {
         let start = Instant::now();
-        progress.set_phase(Phase::Handshaking);
         progress.reset_counts();
-        let tx: SharedTx = Mutex::new(None);
-        let sockets = Sockets::default();
-        let stop = Stop::default();
-        let watched = control.try_clone()?;
-        thread::scope(|s| {
-            s.spawn(|| net::watch_cancel(progress, &stop, &watched, &tx, &sockets));
-            let result = (|| {
-                control.set_read_timeout(Some(HANDSHAKE_TIMEOUT))?;
-                let (keys, peer) =
-                    handshake_responder(&mut control, &self.cfg.key, &self.cfg.authorized)
-                        .context("handshake failed")?;
-                control.set_read_timeout(None)?;
-                let (ctl_tx, mut rx) = wire::control_channel(control, &keys, Role::Receiver)?;
-                *tx.lock().unwrap() = Some(ctl_tx);
-                let (totals, rounds) = self
-                    .receive(keys, &mut rx, &tx, &sockets, progress)
-                    .with_context(|| format!("session with {peer} failed"))?;
-                Ok(RecvReport {
-                    peer,
-                    files: totals.files,
-                    bytes_received: totals.bytes,
-                    chunks_received: totals.chunks,
-                    rounds,
-                    elapsed: start.elapsed(),
-                })
-            })();
-            if let Err(e) = &result {
-                tell_peer_about(e, progress, &tx);
-            }
-            stop.stop();
-            result
+        progress.set_phase(Phase::Handshaking);
+        let cancelled = || progress.is_cancelled();
+        let control = Io::new(h.stream, &cancelled);
+        let (mut tx, mut rx) =
+            wire::control_channel(control.try_clone()?, control, &h.keys, Role::Receiver);
+        let result = self.receive(h.keys, &mut rx, &mut tx, progress);
+        if let Err(e) = &result {
+            tell_peer_about(e, progress, Some(&mut tx));
+        }
+        let (totals, rounds) = result?;
+        Ok(RecvReport {
+            peer: h.peer,
+            files: totals.files,
+            bytes_received: totals.bytes,
+            chunks_received: totals.chunks,
+            rounds,
+            elapsed: start.elapsed(),
         })
     }
 
@@ -147,9 +190,8 @@ impl Receiver {
     fn receive(
         &self,
         keys: SessionKeys,
-        rx: &mut ControlRx,
-        tx: &SharedTx,
-        sockets: &Sockets,
+        rx: &mut Rx,
+        tx: &mut Tx,
         progress: &Progress,
     ) -> Result<(Totals, u32)> {
         let (manifest, cipher) = match rx.recv()? {
@@ -172,7 +214,8 @@ impl Receiver {
             }
         }
         progress.set_totals(chunks, bytes);
-        send_ctrl(tx, &have_msg(&targets))?;
+        tx.send(&have_msg(&targets))?;
+        progress.set_phase(Phase::Transferring);
 
         let session = Session {
             keys,
@@ -180,15 +223,14 @@ impl Receiver {
             manifest,
             targets,
             sync: RoundSync::default(),
-            sockets,
             progress,
             fatal: Mutex::new(None),
             checkpoint_lock: Mutex::new(()),
+            pending_data: AtomicUsize::new(0),
         };
-        let done = AtomicBool::new(false);
         let checkpoints = Stop::default();
         let rounds = thread::scope(|s| {
-            s.spawn(|| accept_data(s, &self.listener, &session, &done));
+            s.spawn(|| accept_data(s, &self.listener, &session));
             s.spawn(|| {
                 while !checkpoints.wait(CHECKPOINT_EVERY) {
                     if let Err(e) = session.checkpoint() {
@@ -197,24 +239,26 @@ impl Receiver {
                 }
             });
             let result = session.rounds(rx, tx);
-            done.store(true, Relaxed);
             checkpoints.stop();
-            sockets.shutdown_all();
-            if result.is_err()
-                && let Err(e) = session.checkpoint()
-            {
-                eprintln!("gorynych: checkpoint failed: {e:#}");
-            }
+            session.sync.shut();
             result
-        })?;
+        });
+        if rounds.is_err()
+            && let Err(e) = session.checkpoint()
+        {
+            eprintln!("gorynych: checkpoint failed: {e:#}");
+        }
         let totals = Totals {
             files: session.targets.len(),
             chunks: progress.chunks_done.load(Relaxed),
             bytes: progress.bytes_done.load(Relaxed),
         };
-        Ok((totals, rounds))
+        Ok((totals, rounds?))
     }
 }
+
+type Tx<'a> = ControlTx<Io<'a>>;
+type Rx<'a> = ControlRx<Io<'a>>;
 
 struct Totals {
     files: usize,
@@ -222,31 +266,27 @@ struct Totals {
     bytes: u64,
 }
 
-/// Waits for the first gorynych control connection, skipping strays.
-fn accept_control(listener: &TcpListener, progress: &Progress) -> Result<TcpStream> {
-    loop {
-        if progress.is_cancelled() {
-            return Err(Cancelled::Local.into());
-        }
-        let (mut stream, from) = match listener.accept() {
-            Ok(accepted) => accepted,
-            Err(e) if e.kind() == ErrorKind::WouldBlock => {
-                thread::sleep(ACCEPT_POLL * 4);
-                continue;
-            }
-            Err(e) => return Err(e.into()),
-        };
-        stream.set_nonblocking(false)?;
-        stream.set_nodelay(true)?;
-        stream.set_read_timeout(Some(HANDSHAKE_TIMEOUT))?;
-        match wire::read_preamble(&mut stream) {
-            Ok(ConnKind::Control) => return Ok(stream),
-            Ok(ConnKind::Data) => {
-                eprintln!("gorynych: ignoring data connection from {from} before the handshake")
-            }
-            Err(e) => eprintln!("gorynych: ignoring connection from {from}: {e:#}"),
-        }
+/// Reads the preamble and runs the Noise handshake, all within
+/// `HANDSHAKE_DEADLINE`. `Ok(None)` is a stray data connection.
+fn handshake(
+    stream: TcpStream,
+    key: &PrivateKey,
+    authorized: &[PublicKey],
+    progress: &Progress,
+) -> Result<Option<Handshaken>> {
+    net::prepare(&stream)?;
+    let cancelled = || progress.is_cancelled();
+    let mut io = Io::new(stream, &cancelled).deadline(HANDSHAKE_DEADLINE);
+    match wire::read_preamble(&mut io)? {
+        ConnKind::Control => {}
+        ConnKind::Data => return Ok(None),
     }
+    let (keys, peer) = handshake_responder(&mut io, key, authorized)?;
+    Ok(Some(Handshaken {
+        stream: io.into_stream(),
+        keys,
+        peer,
+    }))
 }
 
 /// One output file.
@@ -295,6 +335,11 @@ fn prepare_targets(out: &Path, m: &Manifest, force: bool) -> Result<Vec<Target>>
                     && s.chunk_size == m.chunk_size.get()
                     && s.bitmap.len() as u64 == count.div_ceil(8)
             });
+        // A stale state file goes before the part file is truncated, so no
+        // crash can leave a matching state next to zeroed data.
+        if resumed.is_none() {
+            remove_if_exists(&state_path)?;
+        }
         let file = OpenOptions::new()
             .write(true)
             .create(true)
@@ -304,10 +349,7 @@ fn prepare_targets(out: &Path, m: &Manifest, force: bool) -> Result<Vec<Target>>
         file.set_len(entry.size)?;
         let have = match &resumed {
             Some(state) => AtomicBitset::from_bytes(count, &state.bitmap),
-            None => {
-                remove_if_exists(&state_path)?;
-                AtomicBitset::new(count)
-            }
+            None => AtomicBitset::new(count),
         };
         targets.push(Target {
             entry: entry.clone(),
@@ -341,17 +383,18 @@ struct Session<'a> {
     manifest: Manifest,
     targets: Vec<Target>,
     sync: RoundSync,
-    sockets: &'a Sockets,
     progress: &'a Progress,
     /// A local write failure; ends the transfer at the end of the round.
     fatal: Mutex<Option<String>>,
     /// Serializes checkpoints so only one thread writes state files.
     checkpoint_lock: Mutex<()>,
+    /// Data connections accepted but not yet admitted or rejected.
+    pending_data: AtomicUsize,
 }
 
 impl Session<'_> {
     /// Drives the control channel until `Finished`. Returns the round count.
-    fn rounds(&self, rx: &mut ControlRx, tx: &SharedTx) -> Result<u32> {
+    fn rounds(&self, rx: &mut Rx, tx: &mut Tx) -> Result<u32> {
         loop {
             match rx.recv()? {
                 Msg::RoundStart { round } => {
@@ -367,10 +410,10 @@ impl Session<'_> {
                     if self.targets.iter().all(|t| t.have.is_full()) {
                         self.progress.set_phase(Phase::Finishing);
                         self.finalize()?;
-                        send_ctrl(tx, &Msg::Finished)?;
+                        tx.send(&Msg::Finished)?;
                         return Ok(round + 1);
                     }
-                    send_ctrl(tx, &have_msg(&self.targets))?;
+                    tx.send(&have_msg(&self.targets))?;
                 }
                 other => return Err(unexpected(other, "RoundStart or RoundEnd")),
             }
@@ -419,19 +462,18 @@ impl Session<'_> {
     }
 }
 
-/// Accepts data connections until `done`, one thread each.
-fn accept_data<'s, 'e>(
-    s: &'s Scope<'s, 'e>,
-    listener: &'e TcpListener,
-    session: &'e Session<'e>,
-    done: &'e AtomicBool,
-) {
-    while !done.load(Relaxed) && !session.progress.is_cancelled() {
+/// Accepts data connections until the session ends, one thread each.
+fn accept_data<'s, 'e>(s: &'s Scope<'s, 'e>, listener: &'e TcpListener, session: &'e Session<'e>) {
+    while !session.sync.is_shut() && !session.progress.is_cancelled() {
         match listener.accept() {
             Ok((stream, from)) => {
+                if session.pending_data.load(Relaxed) >= MAX_PENDING_DATA {
+                    continue;
+                }
+                session.pending_data.fetch_add(1, Relaxed);
                 s.spawn(move || {
                     if let Err(e) = serve_data(session, stream)
-                        && !done.load(Relaxed)
+                        && !session.sync.is_shut()
                         && !session.progress.is_cancelled()
                     {
                         eprintln!("gorynych: data connection from {from}: {e:#}");
@@ -447,30 +489,42 @@ fn accept_data<'s, 'e>(
     }
 }
 
-fn serve_data(session: &Session, mut stream: TcpStream) -> Result<()> {
-    stream.set_nonblocking(false)?;
-    stream.set_nodelay(true)?;
-    stream.set_read_timeout(Some(DATA_IDLE_TIMEOUT))?;
-    session.sockets.add(&stream);
+/// Decrements `pending_data` when dropped.
+struct PendingGuard<'a>(&'a AtomicUsize);
+
+impl Drop for PendingGuard<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Relaxed);
+    }
+}
+
+fn serve_data(session: &Session, stream: TcpStream) -> Result<()> {
+    let pending = PendingGuard(&session.pending_data);
+    net::prepare(&stream)?;
+    let ended = || session.sync.is_shut() || session.progress.is_cancelled();
+    let mut hello_io = Io::new(stream, &ended).deadline(HANDSHAKE_DEADLINE);
     ensure!(
-        wire::read_preamble(&mut stream)? == ConnKind::Data,
-        "control preamble on a data connection"
+        wire::read_preamble(&mut hello_io)? == ConnKind::Data,
+        "a second control connection during a session"
     );
     let mut challenge = [0u8; CHALLENGE_LEN];
     getrandom::fill(&mut challenge).map_err(|e| anyhow!("OS random number generator: {e}"))?;
-    stream.write_all(&challenge)?;
+    hello_io.write_all(&challenge)?;
     let mut hello = [0u8; HELLO_LEN];
-    stream.read_exact(&mut hello)?;
+    hello_io.read_exact(&mut hello)?;
     let admitted = check_hello(&session.keys, &challenge, &hello)
         .filter(|&(round, conn)| session.sync.admit(round, conn, session.progress));
     let Some((round, conn)) = admitted else {
-        stream.write_all(&[REJECTED])?;
+        hello_io.write_all(&[REJECTED])?;
         bail!("rejected data connection hello");
     };
     let _closed = ClosedGuard { session, round };
     let _active = ActiveConnection::new(session.progress);
-    stream.write_all(&[ADMITTED])?;
-    receive_frames(session, &stream, round, conn)
+    hello_io.write_all(&[ADMITTED])?;
+    drop(pending);
+    let round_over = || ended() || session.sync.is_closed(round);
+    let io = Io::new(hello_io.into_stream(), &round_over).idle(DATA_IDLE);
+    receive_frames(session, io, round, conn)
 }
 
 /// Counts an admitted connection as closed for its round when dropped.
@@ -485,17 +539,20 @@ impl Drop for ClosedGuard<'_> {
     }
 }
 
-fn receive_frames(session: &Session, stream: &TcpStream, round: u32, conn: u32) -> Result<()> {
+fn receive_frames(session: &Session, io: Io, round: u32, conn: u32) -> Result<()> {
     let m = &session.manifest;
     let sid = &session.keys.session_id;
     let mut cipher = CipherState::new(session.cipher, &session.keys.data_key(round, conn));
-    let mut reader = BufReader::with_capacity(256 << 10, stream);
+    let mut reader = BufReader::with_capacity(256 << 10, io);
     let mut body = vec![0u8; m.chunk_size.get() as usize + TAG_LEN];
     loop {
         let mut raw = [0u8; HEADER_LEN];
         reader
             .read_exact(&mut raw)
             .context("connection ended without the end marker")?;
+        if session.sync.is_closed(round) {
+            bail!("round {round} closed; dropping its late frames");
+        }
         let h = FrameHeader::decode(&raw);
         if h.is_end() {
             ensure!(h == FrameHeader::end(), "malformed end marker");
@@ -540,6 +597,8 @@ fn receive_frames(session: &Session, stream: &TcpStream, round: u32, conn: u32) 
 struct RoundSync {
     state: Mutex<RoundState>,
     cv: Condvar,
+    /// Rounds below this are closed. Read lock-free on every frame.
+    closed_below: AtomicU32,
 }
 
 enum RoundState {
@@ -550,6 +609,8 @@ enum RoundState {
         admitted: HashSet<u32>,
         closed: u32,
     },
+    /// The session is over; nothing more is admitted.
+    Shut,
 }
 
 impl Default for RoundState {
@@ -612,9 +673,19 @@ impl RoundSync {
         }
     }
 
-    /// Waits for `connections` admitted connections of `round` to close,
-    /// then closes the round to further connections.
+    fn is_closed(&self, round: u32) -> bool {
+        round < self.closed_below.load(Relaxed)
+    }
+
+    fn is_shut(&self) -> bool {
+        self.closed_below.load(Relaxed) == u32::MAX
+    }
+
+    /// Waits up to `ROUND_CLOSE_WAIT` for `connections` admitted
+    /// connections of `round` to close, then closes the round: connections
+    /// still open drop their buffered frames and hang up.
     fn end(&self, round: u32, connections: u32, progress: &Progress) -> Result<()> {
+        let deadline = Instant::now() + ROUND_CLOSE_WAIT;
         let mut state = self.state.lock().unwrap();
         loop {
             match &*state {
@@ -632,6 +703,12 @@ impl RoundSync {
             if progress.is_cancelled() {
                 return Err(Cancelled::Local.into());
             }
+            if Instant::now() >= deadline {
+                eprintln!(
+                    "gorynych: round {round}: closing with connections still open after {ROUND_CLOSE_WAIT:?}"
+                );
+                break;
+            }
             state = self
                 .cv
                 .wait_timeout(state, Duration::from_millis(100))
@@ -639,6 +716,15 @@ impl RoundSync {
                 .0;
         }
         *state = RoundState::Between { next: round + 1 };
+        self.closed_below.store(round + 1, Relaxed);
         Ok(())
+    }
+
+    /// Ends the session: releases connections waiting in `admit` and stops
+    /// every data connection.
+    fn shut(&self) {
+        *self.state.lock().unwrap() = RoundState::Shut;
+        self.closed_below.store(u32::MAX, Relaxed);
+        self.cv.notify_all();
     }
 }

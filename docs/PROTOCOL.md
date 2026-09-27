@@ -6,7 +6,11 @@ is sealed with an AEAD on its own, so every connection reads, encrypts, and
 sends independently, and the receiver decrypts and writes each chunk at its
 offset with a positional write. Nothing is encrypted as a whole file first.
 
-All integers on the wire are big-endian.
+Fixed-layout fields (preambles, length prefixes, Noise framing, data
+connection hellos, frame headers, nonces, and key-derivation inputs) are
+big-endian. Control messages are postcard-encoded, and postcard writes
+integers as LEB128 varints, strings and byte strings with a varint length
+prefix, and enum tags as varints.
 
 ## Roles
 
@@ -15,7 +19,10 @@ authenticate with their static key pairs, the sender offers a manifest, and
 then it opens data connections.
 
 A receiver serves one transfer at a time and stops after one transfer
-completes. Until then it keeps listening. A failed handshake (unknown key,
+completes. It runs each incoming handshake on its own thread (at most 32 at
+once) and requires the preamble and Noise message 1 to arrive within 10
+seconds, so a peer that trickles bytes cannot hold up a real sender.
+Message 1 must be exactly 96 bytes, its size in IK with an empty payload. Until then it keeps listening. A failed handshake (unknown key,
 garbage, a port scanner) drops only that connection. It is logged, and the
 receiver keeps waiting, so nobody who merely reaches the port can shut a
 receiver down. While a session is active, further control connections are
@@ -132,11 +139,16 @@ could carry in one 64 MiB message.
 
 `path` uses `/` separators and is relative. The receiver rejects absolute
 paths, drive or UNC prefixes, `\`, empty components, `.` and `..` components,
-components containing `:` or NUL, and duplicate paths. Rejecting every `:`
-rather than only a leading `C:` keeps the check the same on every OS: on
-Windows a component like `a:b` names an NTFS stream, and `C:x` joined onto a
-directory replaces it. A file name with `:` therefore cannot be sent.
-`file_id` is the index into `files`.
+components containing `:` or NUL, components ending in `.` or a space,
+Windows device names (`CON`, `PRN`, `AUX`, `NUL`, `COM1` to `COM9`, `LPT1`
+to `LPT9`, with or without an extension), paths ending in `.gorynych-part`,
+`.gorynych-state`, `.gorynych-state.tmp`, or `.gorynych-sums`, and paths
+that are equal after lowercasing. Every rule applies on every OS, so the
+same offer is valid or invalid everywhere. On Windows `a:b` names an NTFS
+stream, `C:x` joined onto a directory replaces it, `a.` and `a ` both open
+`a`, and `nul` opens a device; case-insensitive file systems (Windows,
+macOS) treat `README` and `readme` as one file. Such files therefore cannot
+be sent. `file_id` is the index into `files`.
 
 `chunk_size` is between 4 KiB and 64 MiB. File `j` has
 `ceil(size / chunk_size)` chunks. Chunk `k` covers bytes
@@ -155,8 +167,8 @@ loop round = 0, 1, ...:
     S -> R : RoundStart { round }
     S opens up to N data connections, sends every chunk missing from Have
     S -> R : RoundEnd { round, connections }
-    R waits until `connections` data connections of this round have closed,
-      then shuts down any of the round's connections still open
+    R waits until `connections` data connections of this round have closed
+      (at most 30 s), then shuts down any of the round's connections still open
     if every chunk is present:
         R syncs, reads every chunk back and checks its digest
         (see "Verification"); mismatches become missing again
