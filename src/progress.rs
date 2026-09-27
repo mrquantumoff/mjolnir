@@ -1,0 +1,198 @@
+//! Live transfer progress shared between a transfer and its UI, plus the
+//! cancellation flag the UI sets.
+
+use std::fmt;
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering::Relaxed};
+use std::sync::{Condvar, Mutex};
+use std::time::Duration;
+
+use serde::Serialize;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[repr(u8)]
+pub enum Phase {
+    Connecting,
+    Handshaking,
+    Transferring,
+    Finishing,
+    Done,
+    Failed,
+}
+
+const PHASES: [Phase; 6] = [
+    Phase::Connecting,
+    Phase::Handshaking,
+    Phase::Transferring,
+    Phase::Finishing,
+    Phase::Done,
+    Phase::Failed,
+];
+
+/// Counters a transfer updates as it runs. Share it through an `Arc`; every
+/// field is an atomic, so reading it never blocks the transfer. Totals and
+/// `*_done` count the chunks this session still had to move, not chunks a
+/// resumed transfer already held.
+#[derive(Debug)]
+pub struct Progress {
+    pub bytes_done: AtomicU64,
+    pub bytes_total: AtomicU64,
+    pub chunks_done: AtomicU64,
+    pub chunks_total: AtomicU64,
+    pub active_connections: AtomicU64,
+    phase: AtomicU8,
+    /// Set to stop the transfer. Sockets close promptly and the call returns
+    /// [`Cancelled::Local`]; the receiver keeps its part and state files so
+    /// a later run resumes.
+    pub cancel: AtomicBool,
+}
+
+impl Default for Progress {
+    fn default() -> Self {
+        Progress {
+            bytes_done: AtomicU64::new(0),
+            bytes_total: AtomicU64::new(0),
+            chunks_done: AtomicU64::new(0),
+            chunks_total: AtomicU64::new(0),
+            active_connections: AtomicU64::new(0),
+            phase: AtomicU8::new(Phase::Connecting as u8),
+            cancel: AtomicBool::new(false),
+        }
+    }
+}
+
+/// A plain copy of [`Progress`] at one instant.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+pub struct ProgressSnapshot {
+    pub bytes_done: u64,
+    pub bytes_total: u64,
+    pub chunks_done: u64,
+    pub chunks_total: u64,
+    pub active_connections: u64,
+    pub phase: Phase,
+    pub cancelled: bool,
+}
+
+impl Progress {
+    pub fn phase(&self) -> Phase {
+        PHASES[usize::from(self.phase.load(Relaxed))]
+    }
+
+    pub(crate) fn set_phase(&self, phase: Phase) {
+        self.phase.store(phase as u8, Relaxed);
+    }
+
+    pub fn cancel(&self) {
+        self.cancel.store(true, Relaxed);
+    }
+
+    pub fn is_cancelled(&self) -> bool {
+        self.cancel.load(Relaxed)
+    }
+
+    pub(crate) fn set_totals(&self, chunks: u64, bytes: u64) {
+        self.chunks_total.store(chunks, Relaxed);
+        self.bytes_total.store(bytes, Relaxed);
+    }
+
+    pub(crate) fn reset_counts(&self) {
+        self.set_totals(0, 0);
+        self.chunks_done.store(0, Relaxed);
+        self.bytes_done.store(0, Relaxed);
+    }
+
+    pub(crate) fn add_chunk(&self, bytes: u64) {
+        self.chunks_done.fetch_add(1, Relaxed);
+        self.bytes_done.fetch_add(bytes, Relaxed);
+    }
+
+    pub fn snapshot(&self) -> ProgressSnapshot {
+        ProgressSnapshot {
+            bytes_done: self.bytes_done.load(Relaxed),
+            bytes_total: self.bytes_total.load(Relaxed),
+            chunks_done: self.chunks_done.load(Relaxed),
+            chunks_total: self.chunks_total.load(Relaxed),
+            active_connections: self.active_connections.load(Relaxed),
+            phase: self.phase(),
+            cancelled: self.is_cancelled(),
+        }
+    }
+
+    /// Records the outcome: `Done` or `Failed`, and any error from a
+    /// cancelled run becomes [`Cancelled::Local`].
+    pub(crate) fn conclude<T>(&self, result: anyhow::Result<T>) -> anyhow::Result<T> {
+        match result {
+            Ok(v) => {
+                self.set_phase(Phase::Done);
+                Ok(v)
+            }
+            Err(e) => {
+                self.set_phase(Phase::Failed);
+                if self.is_cancelled() && e.downcast_ref::<Cancelled>().is_none() {
+                    Err(Cancelled::Local.into())
+                } else {
+                    Err(e)
+                }
+            }
+        }
+    }
+}
+
+/// Counts one live data connection for as long as it is held.
+pub(crate) struct ActiveConnection<'a>(&'a Progress);
+
+impl<'a> ActiveConnection<'a> {
+    pub(crate) fn new(progress: &'a Progress) -> Self {
+        progress.active_connections.fetch_add(1, Relaxed);
+        ActiveConnection(progress)
+    }
+}
+
+impl Drop for ActiveConnection<'_> {
+    fn drop(&mut self) {
+        self.0.active_connections.fetch_sub(1, Relaxed);
+    }
+}
+
+/// The error a cancelled transfer returns.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Cancelled {
+    /// This side's `Progress::cancel` was set.
+    Local,
+    /// The peer cancelled and said so on the control channel.
+    Peer,
+}
+
+impl fmt::Display for Cancelled {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Cancelled::Local => "transfer cancelled",
+            Cancelled::Peer => "the peer cancelled the transfer",
+        })
+    }
+}
+
+impl std::error::Error for Cancelled {}
+
+/// A one-shot stop signal that a periodic thread can sleep on.
+#[derive(Default)]
+pub(crate) struct Stop {
+    stopped: Mutex<bool>,
+    cv: Condvar,
+}
+
+impl Stop {
+    pub(crate) fn stop(&self) {
+        *self.stopped.lock().unwrap() = true;
+        self.cv.notify_all();
+    }
+
+    /// Sleeps up to `timeout`; returns true once stopped.
+    pub(crate) fn wait(&self, timeout: Duration) -> bool {
+        let guard = self.stopped.lock().unwrap();
+        *self
+            .cv
+            .wait_timeout_while(guard, timeout, |stopped| !*stopped)
+            .unwrap()
+            .0
+    }
+}
