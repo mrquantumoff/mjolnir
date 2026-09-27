@@ -251,9 +251,14 @@ fn start_send(app: &App, req: SendRequest) -> Result<Reply, ApiError> {
     }
     let paths: Vec<PathBuf> = req.paths.iter().map(PathBuf::from).collect();
     if let Some(missing) = paths.iter().find(|p| !p.exists()) {
+        let hint = if missing.to_string_lossy().contains('\u{FFFD}') {
+            "; its name is not valid Unicode, so select its parent folder instead"
+        } else {
+            ""
+        };
         return Err(ApiError::field(
             "paths",
-            format!("{} does not exist", missing.display()),
+            format!("{} does not exist{hint}", missing.display()),
         ));
     }
     if !(1..=MAX_CONNECTIONS).contains(&req.connections) {

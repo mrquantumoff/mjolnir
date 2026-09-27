@@ -7,18 +7,25 @@ use serde::Serialize;
 
 #[derive(Serialize)]
 pub struct Listing {
-    pub path: PathBuf,
-    pub parent: Option<PathBuf>,
-    pub roots: Vec<PathBuf>,
+    pub path: String,
+    pub parent: Option<String>,
+    pub roots: Vec<String>,
     pub entries: Vec<Entry>,
 }
 
+/// `name` is shown lossily. `path` is `None` when the full path is not valid
+/// Unicode: the API cannot name such an entry exactly, so the UI offers only
+/// its parent folder, whose recursion handles the raw name.
 #[derive(Serialize)]
 pub struct Entry {
     pub name: String,
-    pub path: PathBuf,
+    pub path: Option<String>,
     pub is_dir: bool,
     pub size: Option<u64>,
+}
+
+fn lossy(p: &Path) -> String {
+    p.to_string_lossy().into_owned()
 }
 
 pub fn home_dir() -> PathBuf {
@@ -36,9 +43,9 @@ pub fn list(dir: Option<&Path>) -> std::io::Result<Listing> {
             let meta = std::fs::metadata(&path).or_else(|_| e.metadata()).ok()?;
             Some(Entry {
                 name: e.file_name().to_string_lossy().into_owned(),
+                path: path.to_str().map(str::to_owned),
                 is_dir: meta.is_dir(),
                 size: meta.is_file().then_some(meta.len()),
-                path,
             })
         })
         .collect();
@@ -47,22 +54,22 @@ pub fn list(dir: Option<&Path>) -> std::io::Result<Listing> {
         other => other,
     });
     Ok(Listing {
-        parent: path.parent().map(Path::to_path_buf),
+        path: lossy(&path),
+        parent: path.parent().map(lossy),
         roots: roots(),
         entries,
-        path,
     })
 }
 
 #[cfg(windows)]
-fn roots() -> Vec<PathBuf> {
+fn roots() -> Vec<String> {
     (b'A'..=b'Z')
-        .map(|d| PathBuf::from(format!("{}:\\", d as char)))
-        .filter(|p| p.exists())
+        .map(|d| format!("{}:\\", d as char))
+        .filter(|p| Path::new(p).exists())
         .collect()
 }
 
 #[cfg(not(windows))]
-fn roots() -> Vec<PathBuf> {
-    vec![PathBuf::from("/")]
+fn roots() -> Vec<String> {
+    vec!["/".to_string()]
 }

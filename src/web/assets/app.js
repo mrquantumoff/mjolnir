@@ -549,7 +549,15 @@ function renderDirectory(listing) {
   updateBrowserFooter();
 }
 
+function renderUnnamedEntry(entry) {
+  return h('li', { class: 'fs-entry is-disabled', title: 'This name is not valid Unicode. Select its parent folder instead.' },
+    h('span', { class: 'entry-name muted' }, entry.name + (entry.is_dir ? '/' : '')),
+    h('span', { class: 'entry-size muted tiny' }, 'select parent folder'),
+  );
+}
+
 function renderEntry(entry) {
+  if (entry.path == null) return renderUnnamedEntry(entry);
   const size = entry.is_dir || entry.size == null ? '' : formatBytes(entry.size);
   const folderOnly = fsModal.mode === 'folder';
   const name = entry.is_dir

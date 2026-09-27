@@ -80,6 +80,10 @@ fn raw(ui: &Ui, method: &str, path: &str, headers: &[(&str, &str)], body: &[u8])
     }
 }
 
+fn encode(text: &str) -> String {
+    text.bytes().map(|b| format!("%{b:02X}")).collect()
+}
+
 fn get(ui: &Ui, path: &str) -> Response {
     raw(ui, "GET", path, &[], b"")
 }
@@ -272,7 +276,7 @@ fn fs_lists_a_directory_dirs_first() {
     std::fs::write(dir.path().join("a.txt"), b"hello").unwrap();
     std::fs::create_dir(dir.path().join("zdir")).unwrap();
     let path = dir.path().to_str().unwrap();
-    let encoded: String = path.bytes().map(|b| format!("%{b:02X}")).collect();
+    let encoded = encode(path);
     let r = get(&ui, &format!("/api/fs?path={encoded}"));
     assert_eq!(r.status, 200, "{}", r.body);
     let entries = r.body["entries"].as_array().unwrap();
@@ -434,4 +438,49 @@ fn cancel_an_idle_receiver() {
     let c = post(&ui, &format!("/api/transfers/{id}/cancel"), json!({}));
     assert_eq!(c.status, 200);
     assert_eq!(wait_until_ended(&ui, id)["state"], "cancelled");
+}
+
+#[cfg(unix)]
+fn non_unicode_name() -> std::ffi::OsString {
+    use std::os::unix::ffi::OsStrExt;
+    std::ffi::OsStr::from_bytes(b"caf\xe9.bin").to_owned()
+}
+
+#[cfg(windows)]
+fn non_unicode_name() -> std::ffi::OsString {
+    use std::os::windows::ffi::OsStringExt;
+    let mut wide: Vec<u16> = "caf".encode_utf16().collect();
+    wide.push(0xD800);
+    wide.extend(".bin".encode_utf16());
+    std::ffi::OsString::from_wide(&wide)
+}
+
+#[test]
+fn non_unicode_names_are_listed_but_must_be_sent_via_their_parent() {
+    let ui = start();
+    let dir = tempfile::tempdir().unwrap();
+    let raw = dir.path().join(non_unicode_name());
+    if std::fs::write(&raw, b"x").is_err() {
+        eprintln!("this filesystem rejects non-UTF-8 names; skipping");
+        return;
+    }
+    let listing = get(
+        &ui,
+        &format!("/api/fs?path={}", encode(dir.path().to_str().unwrap())),
+    );
+    assert_eq!(listing.status, 200, "{}", listing.body);
+    let entry = &listing.body["entries"][0];
+    assert_eq!(entry["name"], "caf\u{FFFD}.bin");
+    assert!(entry["path"].is_null(), "{entry}");
+
+    let lossy = dir.path().join("caf\u{FFFD}.bin");
+    let r = post(
+        &ui,
+        "/api/send",
+        json!({ "addr": "127.0.0.1:9", "peer": ui.public_key, "paths": [lossy] }),
+    );
+    assert_eq!(r.status, 400);
+    assert_eq!(r.body["field"], "paths");
+    let message = r.body["error"].as_str().unwrap();
+    assert!(message.contains("parent folder"), "{message}");
 }

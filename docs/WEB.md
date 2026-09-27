@@ -224,6 +224,12 @@ directory.
 Directories come first, then files, each sorted by name. On Windows `roots`
 lists the drive letters that exist. An unreadable path is a 400 on `path`.
 
+Names are shown lossily. An entry whose full path is not valid Unicode has
+`"path": null`, because JSON cannot name it exactly. The picker shows it
+greyed out; select its parent folder instead, since sending a folder walks
+the raw names. A send that names such a path directly gets a 400 on `paths`
+saying so.
+
 ## Code layout
 
 | File | Role |
