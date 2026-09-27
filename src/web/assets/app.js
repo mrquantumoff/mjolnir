@@ -8,11 +8,13 @@ const POLL_ACTIVE_MS = 500;
 const POLL_IDLE_MS = 3000;
 const RATE_SMOOTHING = 0.3;
 const MAX_LISTED_PATHS = 3;
+const THREADS_ERROR = 'Use a whole number from 0 to 256, or leave empty for auto.';
 
 const STATUS = {
   connecting: { label: 'Connecting', tone: 'pending' },
   handshaking: { label: 'Handshaking', tone: 'pending' },
   transferring: { label: 'Transferring', tone: 'active' },
+  verifying: { label: 'Verifying', tone: 'active' },
   finishing: { label: 'Finishing', tone: 'active' },
   done: { label: 'Done', tone: 'ok' },
   failed: { label: 'Failed', tone: 'bad' },
@@ -281,6 +283,15 @@ async function submitJob(form, path, body) {
   }
 }
 
+function readThreads(id) {
+  const text = $(id).value.trim();
+  return text === '' ? 0 : Number(text);
+}
+
+function validThreads(n) {
+  return Number.isInteger(n) && n >= 0 && n <= 256;
+}
+
 function readSendForm() {
   return {
     addr: $('send-addr').value.trim(),
@@ -289,6 +300,7 @@ function readSendForm() {
     connections: Number($('send-connections').value),
     chunk_size: Number($('send-chunk').value),
     cipher: $('send-cipher').value,
+    threads: readThreads('send-threads'),
   };
 }
 
@@ -298,6 +310,8 @@ function readReceiveForm() {
     authorized: parseAuthorized($('receive-authorized').value),
     out_dir: $('receive-out').value.trim(),
     force: $('receive-force').checked,
+    verify: $('receive-verify').checked,
+    threads: readThreads('receive-threads'),
   };
 }
 
@@ -322,6 +336,10 @@ async function onSendSubmit(event) {
     showFormError(form, 'connections', 'Use a whole number from 1 to 64.');
     return;
   }
+  if (!validThreads(body.threads)) {
+    showFormError(form, 'threads', THREADS_ERROR);
+    return;
+  }
   if (await submitJob(form, '/api/send', body)) {
     rememberPeer(body.addr, body.peer);
     app.sendPaths = [];
@@ -333,7 +351,12 @@ function onReceiveSubmit(event) {
   event.preventDefault();
   const form = event.currentTarget;
   clearErrors(form);
-  submitJob(form, '/api/receive', readReceiveForm());
+  const body = readReceiveForm();
+  if (!validThreads(body.threads)) {
+    showFormError(form, 'threads', THREADS_ERROR);
+    return;
+  }
+  submitJob(form, '/api/receive', body);
 }
 
 function saveForms() {
@@ -344,12 +367,15 @@ function saveForms() {
       connections: $('send-connections').value,
       chunk_size: $('send-chunk').value,
       cipher: $('send-cipher').value,
+      threads: $('send-threads').value,
     },
     receive: {
       listen: $('receive-listen').value,
       out_dir: $('receive-out').value,
       authorized: $('receive-authorized').value,
       force: $('receive-force').checked,
+      verify: $('receive-verify').checked,
+      threads: $('receive-threads').value,
     },
   });
 }
@@ -371,10 +397,13 @@ function restoreForms() {
   restoreValue('send-connections', send.connections);
   restoreValue('send-chunk', send.chunk_size);
   restoreValue('send-cipher', send.cipher);
+  restoreValue('send-threads', send.threads);
   restoreValue('receive-listen', receive.listen);
   restoreValue('receive-out', receive.out_dir);
   restoreValue('receive-authorized', receive.authorized);
+  restoreValue('receive-threads', receive.threads);
   if (typeof receive.force === 'boolean') $('receive-force').checked = receive.force;
+  if (typeof receive.verify === 'boolean') $('receive-verify').checked = receive.verify;
 }
 
 function loadRecentPeers() {
@@ -571,6 +600,10 @@ function isUnspecifiedHost(addr) {
   return /^(0\.0\.0\.0|\[::\]):\d+$/.test(addr);
 }
 
+function threadsText(threads) {
+  return threads > 0 ? plural(threads, 'CPU thread') : 'auto CPU threads';
+}
+
 function buildSendDetails(spec) {
   const shown = spec.paths.slice(0, MAX_LISTED_PATHS);
   const hidden = spec.paths.length - shown.length;
@@ -580,7 +613,8 @@ function buildSendDetails(spec) {
       h('code', { class: 'mono', title: spec.peer }, abbreviateKey(spec.peer)),
       ' \u00b7 ' + plural(spec.connections, 'connection'),
       ' \u00b7 ' + formatChunkSize(spec.chunk_size) + ' chunks',
-      ' \u00b7 ' + (CIPHER_LABELS[spec.cipher] || spec.cipher)),
+      ' \u00b7 ' + (CIPHER_LABELS[spec.cipher] || spec.cipher),
+      ' \u00b7 ' + threadsText(spec.threads)),
     h('ul', { class: 'card-files' },
       shown.map((path) => h('li', null, h('code', { class: 'mono' }, path))),
       hidden > 0 ? h('li', { class: 'muted' }, '+' + hidden + ' more') : null),
@@ -603,6 +637,8 @@ function buildReceiveDetails(spec, refs) {
       plural(spec.authorized.length, 'authorized key'),
       ' \u00b7 into ',
       h('code', { class: 'mono' }, spec.out_dir),
+      ' \u00b7 ' + threadsText(spec.threads),
+      spec.verify ? '' : ' \u00b7 no verification',
       spec.force ? ' \u00b7 overwrites existing files' : ''),
   ];
 }
@@ -641,7 +677,7 @@ function buildCard(transfer) {
 
 function sampleRate(transfer) {
   const p = transfer.progress;
-  if (transfer.state !== 'running' || p.phase !== 'transferring') {
+  if (transfer.state !== 'running' || (p.phase !== 'transferring' && p.phase !== 'verifying')) {
     app.rates.delete(transfer.id);
     return null;
   }
@@ -676,6 +712,15 @@ function progressPercent(transfer) {
 function reportText(report) {
   const parts = [plural(report.files, 'file'), formatBytes(report.bytes), formatDuration(report.elapsed_ms)];
   if (report.elapsed_ms > 0) parts.push(formatRate((report.bytes / report.elapsed_ms) * 1000) + ' average');
+  parts.push(report.verified ? 'verified' : 'not verified');
+  const counts = [
+    [report.repaired_chunks, 'repaired chunk'],
+    [report.duplicate_chunks, 'duplicate chunk'],
+    [report.chunks_resent, 'resent chunk'],
+  ];
+  for (const [n, word] of counts) {
+    if (n > 0) parts.push(plural(n, word));
+  }
   return parts.join(' \u00b7 ');
 }
 

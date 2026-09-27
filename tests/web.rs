@@ -342,6 +342,8 @@ fn send_a_directory_end_to_end() {
     let received = wait_until_ended(&ui, recv_id);
     assert_eq!(received["state"], "done", "{received}");
     assert_eq!(received["report"]["files"], files.len());
+    assert_eq!(received["report"]["verified"], true);
+    assert_eq!(received["report"]["duplicate_chunks"], 0);
     let total: usize = files.iter().map(|(_, d)| d.len()).sum();
     assert_eq!(sent["progress"]["bytes_done"], total);
 

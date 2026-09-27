@@ -89,6 +89,11 @@
               </select>
               <p class="field-error" data-field-error="cipher" hidden></p>
             </div>
+            <div class="field">
+              <label for="send-threads">CPU threads</label>
+              <input id="send-threads" name="threads" type="number" min="0" max="256" step="1" placeholder="auto" inputmode="numeric">
+              <p class="field-error" data-field-error="threads" hidden></p>
+            </div>
           </div>
 
           <div class="form-actions">
@@ -121,6 +126,23 @@
             <label for="receive-authorized">Authorized sender keys</label>
             <textarea id="receive-authorized" name="authorized" class="mono" rows="4" spellcheck="false" autocapitalize="off" placeholder="base64key= laptop&#10;# one key per line, optional label after a space"></textarea>
             <p class="field-error" data-field-error="authorized" hidden></p>
+          </div>
+
+          <div class="field-row">
+            <div class="field">
+              <label for="receive-threads">CPU threads</label>
+              <input id="receive-threads" name="threads" type="number" min="0" max="256" step="1" placeholder="auto" inputmode="numeric">
+              <p class="field-error" data-field-error="threads" hidden></p>
+            </div>
+          </div>
+
+          <div class="field">
+            <label class="check">
+              <input id="receive-verify" name="verify" type="checkbox" checked>
+              <span>Verify after transfer</span>
+            </label>
+            <p class="muted tiny">Reads every chunk back from disk and fetches again any that do not match.</p>
+            <p class="field-error" data-field-error="verify" hidden></p>
           </div>
 
           <div class="field">

@@ -92,6 +92,7 @@ pub enum JobSpec {
         authorized: Vec<String>,
         out_dir: PathBuf,
         force: bool,
+        verify: bool,
     },
 }
 
@@ -101,6 +102,10 @@ impl From<SendReport> for Report {
             files: r.files as u64,
             bytes: r.bytes_sent,
             elapsed_ms: r.elapsed.as_millis() as u64,
+            verified: r.verified,
+            chunks_resent: r.chunks_resent,
+            repaired_chunks: 0,
+            duplicate_chunks: 0,
         }
     }
 }
@@ -111,6 +116,10 @@ impl From<RecvReport> for Report {
             files: r.files as u64,
             bytes: r.bytes_received,
             elapsed_ms: r.elapsed.as_millis() as u64,
+            verified: r.verified,
+            chunks_resent: 0,
+            repaired_chunks: r.repaired_chunks,
+            duplicate_chunks: r.duplicate_chunks,
         }
     }
 }
@@ -208,6 +217,12 @@ struct ReceiveRequest {
     out_dir: String,
     #[serde(default)]
     force: bool,
+    #[serde(default = "default_verify")]
+    verify: bool,
+}
+
+fn default_verify() -> bool {
+    true
 }
 
 fn parse_key(field: &'static str, text: &str) -> Result<PublicKey, ApiError> {
@@ -306,7 +321,7 @@ fn start_receive(app: &App, req: ReceiveRequest) -> Result<Reply, ApiError> {
         authorized: authorized.clone(),
         out_dir: out_dir.clone(),
         force: req.force,
-        verify: true,
+        verify: req.verify,
     })
     .map_err(|e| ApiError::field("listen", format!("{e:#}")))?;
     let bound_addr = receiver.local_addr();
@@ -317,6 +332,7 @@ fn start_receive(app: &App, req: ReceiveRequest) -> Result<Reply, ApiError> {
         authorized: authorized.iter().map(ToString::to_string).collect(),
         out_dir,
         force: req.force,
+        verify: req.verify,
     };
     let id = app.jobs.spawn(spec, move |progress| {
         receiver.run(progress).map(Report::from)

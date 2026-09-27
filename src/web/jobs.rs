@@ -18,6 +18,10 @@ pub struct Report {
     pub files: u64,
     pub bytes: u64,
     pub elapsed_ms: u64,
+    pub verified: bool,
+    pub chunks_resent: u64,
+    pub repaired_chunks: u64,
+    pub duplicate_chunks: u64,
 }
 
 pub enum JobState {
