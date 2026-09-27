@@ -1,6 +1,6 @@
-# Gorynych protocol, version 1
+# Mjolnir protocol, version 1
 
-Gorynych moves large files between two hosts over N parallel TCP connections.
+Mjolnir moves large files between two hosts over N parallel TCP connections.
 Files are split into fixed-size chunks (the sender picks the size). Each chunk
 is sealed with an AEAD on its own, so every connection reads, encrypts, and
 sends independently, and the receiver decrypts and writes each chunk at its
@@ -33,7 +33,7 @@ sender can simply run again and resume.
 
 ## Identities
 
-Every host has a static X25519 key pair, created with `gorynych keygen`.
+Every host has a static X25519 key pair, created with `mjolnir keygen`.
 Keys are encoded as standard base64 of the 32 raw bytes (44 characters), the
 same form WireGuard uses.
 
@@ -51,7 +51,7 @@ same form WireGuard uses.
 Every TCP connection starts with the sender writing 6 bytes:
 
 ```
-"GRYN" (4 bytes) | version u8 = 1 | kind u8 (0 = control, 1 = data)
+"MJLN" (4 bytes) | version u8 = 1 | kind u8 (0 = control, 1 = data)
 ```
 
 The first connection must be the control connection. Data connections are
@@ -60,7 +60,7 @@ accepted only after the control handshake has finished.
 ## Control handshake (Noise IK)
 
 The control connection runs `Noise_IK_25519_ChaChaPoly_SHA256` with prologue
-`gorynych v1`. The sender is the initiator and already knows the receiver's
+`mjolnir v1`. The sender is the initiator and already knows the receiver's
 static public key. Each Noise message is framed with a length:
 
 ```
@@ -141,8 +141,8 @@ could carry in one 64 MiB message.
 paths, drive or UNC prefixes, `\`, empty components, `.` and `..` components,
 components containing `:` or NUL, components ending in `.` or a space,
 Windows device names (`CON`, `PRN`, `AUX`, `NUL`, `COM1` to `COM9`, `LPT1`
-to `LPT9`, with or without an extension), paths ending in `.gorynych-part`,
-`.gorynych-state`, `.gorynych-state.tmp`, or `.gorynych-sums`, and paths
+to `LPT9`, with or without an extension), paths ending in `.mjolnir-part`,
+`.mjolnir-state`, `.mjolnir-state.tmp`, or `.mjolnir-sums`, and paths
 that are equal after lowercasing. Every rule applies on every OS, so the
 same offer is valid or invalid everywhere. On Windows `a:b` names an NTFS
 stream, `C:x` joined onto a directory replaces it, `a.` and `a ` both open
@@ -201,7 +201,7 @@ next run starts that file over.
 ## Chunks, frames, and the MTU
 
 The protocol assumes a standard 1500-byte Ethernet MTU and needs nothing
-larger. Gorynych runs over TCP, so the kernel cuts every frame into segments
+larger. Mjolnir runs over TCP, so the kernel cuts every frame into segments
 that fit the path MTU: at most 1460 payload bytes per packet over IPv4 and
 1440 over IPv6 on a 1500-byte link. Jumbo frames help if the network has
 them, but nothing depends on them.
@@ -350,7 +350,7 @@ the write path. So before finishing, the receiver checks its own disk.
 
 - On receipt, after a chunk authenticates, the receiver computes
   `digest = BLAKE3(plaintext)` truncated to 16 bytes. It writes the digest
-  at offset `chunk_index * 16` of `out/<path>.gorynych-sums`, after writing
+  at offset `chunk_index * 16` of `out/<path>.mjolnir-sums`, after writing
   the chunk and before setting its `present` bit. Digests live on disk, not
   in memory, so the cost scales to any file size.
 - When every chunk is present, the receiver syncs the part and sums files.
@@ -376,9 +376,9 @@ is not proof that the media holds the bytes; that is the filesystem's job.
 
 ## Receiver storage and resume
 
-For a target `out/<path>` the receiver writes `out/<path>.gorynych-part`,
-keeps chunk digests in `out/<path>.gorynych-sums`, and keeps state in
-`out/<path>.gorynych-state`. The state holds
+For a target `out/<path>` the receiver writes `out/<path>.mjolnir-part`,
+keeps chunk digests in `out/<path>.mjolnir-sums`, and keeps state in
+`out/<path>.mjolnir-state`. The state holds
 `{ size, mtime, chunk_size, bitmap }`.
 
 Every 2 seconds, at the end of each round, and when a session ends early,

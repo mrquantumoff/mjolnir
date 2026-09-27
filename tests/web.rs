@@ -3,8 +3,8 @@ use std::net::{SocketAddr, TcpStream};
 use std::path::Path;
 use std::time::{Duration, Instant};
 
-use gorynych::keys::PrivateKey;
-use gorynych::web::{ServeConfig, WebServer};
+use mjolnir::keys::PrivateKey;
+use mjolnir::web::{ServeConfig, WebServer};
 use serde_json::{Value, json};
 
 struct Ui {
@@ -309,7 +309,7 @@ fn send_a_directory_end_to_end() {
             "a.bin",
             (0..3_000_000u32).map(|i| (i * 7 % 251) as u8).collect(),
         ),
-        ("nested/b.txt", b"hello from gorynych\n".to_vec()),
+        ("nested/b.txt", b"hello from mjolnir\n".to_vec()),
         (
             "nested/deeper/c.bin",
             (0..70_000u32).map(|i| (i % 13) as u8).collect(),

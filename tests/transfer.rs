@@ -7,10 +7,10 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::Result;
-use gorynych::bitset::{AtomicBitset, PartState};
-use gorynych::crypto::REJECTED;
-use gorynych::manifest::mtime_of;
-use gorynych::{
+use mjolnir::bitset::{AtomicBitset, PartState};
+use mjolnir::crypto::REJECTED;
+use mjolnir::manifest::mtime_of;
+use mjolnir::{
     Cancelled, Cipher, Phase, PrivateKey, Progress, PublicKey, Receiver, RecvConfig, RecvReport,
     SendConfig, SendReport,
 };
@@ -110,7 +110,7 @@ impl Send {
     }
 
     fn run(&self, addr: SocketAddr, paths: &[&Path]) -> Result<SendReport> {
-        gorynych::send(self.config(addr, paths), Arc::new(Progress::default()))
+        mjolnir::send(self.config(addr, paths), Arc::new(Progress::default()))
     }
 }
 
@@ -247,15 +247,15 @@ fn resume_sends_only_missing_chunks_and_rewrites_absent_bytes() {
             part[span].fill(0xAA);
         }
     }
-    fs::write(out.path().join("big.bin.gorynych-part"), &part).unwrap();
-    fs::write(out.path().join("big.bin.gorynych-sums"), &sums).unwrap();
+    fs::write(out.path().join("big.bin.mjolnir-part"), &part).unwrap();
+    fs::write(out.path().join("big.bin.mjolnir-sums"), &sums).unwrap();
     PartState {
         size: content.len() as u64,
         mtime: mtime_of(&fs::metadata(&file).unwrap()),
         chunk_size: CHUNK,
         bitmap: have.to_bytes(),
     }
-    .save(&out.path().join("big.bin.gorynych-state"))
+    .save(&out.path().join("big.bin.mjolnir-state"))
     .unwrap();
 
     let (rk, _) = keypair();
@@ -271,8 +271,8 @@ fn resume_sends_only_missing_chunks_and_rewrites_absent_bytes() {
     );
     assert_eq!(recv.chunks_received, chunks / 2);
     assert_file_eq(&file, &out.path().join("big.bin"));
-    assert!(!out.path().join("big.bin.gorynych-state").exists());
-    assert!(!out.path().join("big.bin.gorynych-part").exists());
+    assert!(!out.path().join("big.bin.mjolnir-state").exists());
+    assert!(!out.path().join("big.bin.mjolnir-part").exists());
 }
 
 #[test]
@@ -283,7 +283,7 @@ fn stale_state_is_ignored() {
     write(&file, &content);
     let out = TempDir::new().unwrap();
     fs::write(
-        out.path().join("f.bin.gorynych-part"),
+        out.path().join("f.bin.mjolnir-part"),
         vec![0u8; content.len()],
     )
     .unwrap();
@@ -293,7 +293,7 @@ fn stale_state_is_ignored() {
         chunk_size: CHUNK,
         bitmap: vec![0x0F],
     }
-    .save(&out.path().join("f.bin.gorynych-state"))
+    .save(&out.path().join("f.bin.mjolnir-state"))
     .unwrap();
 
     let (rk, _) = keypair();
@@ -371,7 +371,7 @@ fn sender_cancel_is_prompt_and_a_second_send_resumes() {
 
     let progress = Arc::new(Progress::default());
     let cancelled_at = cancel_when(progress.clone(), 8 << 20);
-    let err = gorynych::send(send.config(rx.addr, &[&file]), progress.clone()).unwrap_err();
+    let err = mjolnir::send(send.config(rx.addr, &[&file]), progress.clone()).unwrap_err();
     let latency = cancelled_at.join().unwrap().elapsed();
     assert_eq!(
         err.downcast_ref::<Cancelled>(),
@@ -385,7 +385,7 @@ fn sender_cancel_is_prompt_and_a_second_send_resumes() {
     assert_eq!(progress.phase(), Phase::Failed);
 
     rx.assert_waiting();
-    assert!(out.path().join("big.bin.gorynych-part").exists());
+    assert!(out.path().join("big.bin.mjolnir-part").exists());
 
     let report = send.run(rx.addr, &[&file]).unwrap();
     rx.join().unwrap();
@@ -463,7 +463,7 @@ fn source_changed_during_transfer_fails_the_sender() {
                 .unwrap();
         })
     };
-    let err = gorynych::send(send.config(rx.addr, &[&file]), progress).unwrap_err();
+    let err = mjolnir::send(send.config(rx.addr, &[&file]), progress).unwrap_err();
     touch.join().unwrap();
     assert!(
         err.to_string()
@@ -488,7 +488,7 @@ fn a_stalled_handshake_does_not_block_a_real_sender() {
     let rx = start_receiver(rk, vec![spub], out.path());
 
     let mut stall = std::net::TcpStream::connect(rx.addr).unwrap();
-    stall.write_all(b"GRYN\x01\x00\xff").unwrap();
+    stall.write_all(b"MJLN\x01\x00\xff").unwrap();
     thread::sleep(Duration::from_millis(100));
 
     let started = Instant::now();
@@ -513,14 +513,14 @@ fn a_second_control_connection_is_closed_during_a_session() {
     let progress = Arc::new(Progress::default());
     let sender = {
         let (cfg, progress) = (send.config(rx.addr, &[&file]), progress.clone());
-        thread::spawn(move || gorynych::send(cfg, progress))
+        thread::spawn(move || mjolnir::send(cfg, progress))
     };
     while rx.progress.phase() != Phase::Transferring {
         thread::sleep(Duration::from_millis(1));
     }
 
     let mut second = std::net::TcpStream::connect(rx.addr).unwrap();
-    second.write_all(b"GRYN\x01\x00").unwrap();
+    second.write_all(b"MJLN\x01\x00").unwrap();
     second
         .set_read_timeout(Some(Duration::from_secs(3)))
         .unwrap();
@@ -547,7 +547,7 @@ fn receiver_cancel_is_prompt_with_a_silent_connection_pending() {
     let (_, spub) = keypair();
     let rx = start_receiver(rk, vec![spub], out.path());
     let mut silent = std::net::TcpStream::connect(rx.addr).unwrap();
-    silent.write_all(b"GRYN\x01\x00").unwrap();
+    silent.write_all(b"MJLN\x01\x00").unwrap();
     thread::sleep(Duration::from_millis(100));
     let started = Instant::now();
     rx.progress.cancel();

@@ -60,7 +60,7 @@ mod tests {
 
     #[test]
     fn positional_roundtrip_and_eof() {
-        let path = std::env::temp_dir().join(format!("gorynych-posio-{}", std::process::id()));
+        let path = std::env::temp_dir().join(format!("mjolnir-posio-{}", std::process::id()));
         let file = File::options()
             .read(true)
             .write(true)

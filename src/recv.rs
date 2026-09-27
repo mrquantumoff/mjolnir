@@ -150,13 +150,13 @@ impl Receiver {
                             }
                             Ok(None) => {}
                             Err(e) if progress.is_cancelled() => drop(e),
-                            Err(e) => eprintln!("gorynych: handshake with {from} failed: {e:#}"),
+                            Err(e) => eprintln!("mjolnir: handshake with {from} failed: {e:#}"),
                         }
                         pending.fetch_sub(1, Relaxed);
                     });
                 }
                 Err(e) if e.kind() == ErrorKind::WouldBlock => {}
-                Err(e) => eprintln!("gorynych: accept failed: {e}"),
+                Err(e) => eprintln!("mjolnir: accept failed: {e}"),
             }
             let h = match done_rx.recv_timeout(ACCEPT_POLL) {
                 Ok(h) => h,
@@ -169,7 +169,7 @@ impl Receiver {
                 Err(e) if progress.is_cancelled() => return Err(e),
                 Err(e) => {
                     eprintln!(
-                        "gorynych: session with {peer} failed: {e:#}; waiting for the next sender"
+                        "mjolnir: session with {peer} failed: {e:#}; waiting for the next sender"
                     )
                 }
             }
@@ -247,7 +247,7 @@ impl Receiver {
             s.spawn(|| {
                 while !checkpoints.wait(CHECKPOINT_EVERY) {
                     if let Err(e) = session.checkpoint() {
-                        eprintln!("gorynych: checkpoint failed: {e:#}");
+                        eprintln!("mjolnir: checkpoint failed: {e:#}");
                     }
                 }
             });
@@ -259,7 +259,7 @@ impl Receiver {
         if rounds.is_err()
             && let Err(e) = session.checkpoint()
         {
-            eprintln!("gorynych: checkpoint failed: {e:#}");
+            eprintln!("mjolnir: checkpoint failed: {e:#}");
         }
         let rounds = rounds?;
         Ok(Outcome {
@@ -408,9 +408,9 @@ fn prepare_targets(out: &Path, m: &Manifest, force: bool) -> Result<Vec<Target>>
         if let Some(parent) = final_path.parent() {
             fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
         }
-        let part_path = with_suffix(&final_path, ".gorynych-part");
-        let sums_path = with_suffix(&final_path, ".gorynych-sums");
-        let state_path = with_suffix(&final_path, ".gorynych-state");
+        let part_path = with_suffix(&final_path, ".mjolnir-part");
+        let sums_path = with_suffix(&final_path, ".mjolnir-sums");
+        let state_path = with_suffix(&final_path, ".mjolnir-state");
         let count = chunk_count(entry.size, m.chunk_size);
         let resumed = (part_path.exists() && sums_path.exists())
             .then(|| PartState::load(&state_path).ok())
@@ -699,13 +699,13 @@ fn accept_data<'s, 'e>(s: &'s Scope<'s, 'e>, listener: &'e TcpListener, session:
                         && !session.sync.is_shut()
                         && !session.progress.is_cancelled()
                     {
-                        eprintln!("gorynych: data connection from {from}: {e:#}");
+                        eprintln!("mjolnir: data connection from {from}: {e:#}");
                     }
                 });
             }
             Err(e) if e.kind() == ErrorKind::WouldBlock => thread::sleep(ACCEPT_POLL),
             Err(e) => {
-                eprintln!("gorynych: accept failed: {e}");
+                eprintln!("mjolnir: accept failed: {e}");
                 thread::sleep(ACCEPT_POLL);
             }
         }
@@ -920,7 +920,7 @@ impl RoundSync {
             }
             if Instant::now() >= deadline {
                 eprintln!(
-                    "gorynych: round {round}: closing with connections still open after {ROUND_CLOSE_WAIT:?}"
+                    "mjolnir: round {round}: closing with connections still open after {ROUND_CLOSE_WAIT:?}"
                 );
                 break;
             }
@@ -963,7 +963,7 @@ mod tests {
     }
 
     fn tempdir(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("gorynych-{name}-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("mjolnir-{name}-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         dir

@@ -1,8 +1,8 @@
 'use strict';
 
-const TOKEN_KEY = 'gorynych.token';
-const FORMS_KEY = 'gorynych.forms';
-const PEERS_KEY = 'gorynych.recentPeers';
+const TOKEN_KEY = 'mjolnir.token';
+const FORMS_KEY = 'mjolnir.forms';
+const PEERS_KEY = 'mjolnir.recentPeers';
 const MAX_RECENT_PEERS = 8;
 const POLL_ACTIVE_MS = 500;
 const POLL_IDLE_MS = 3000;
@@ -129,7 +129,7 @@ async function api(method, path, body) {
   try {
     res = await fetch(path, options);
   } catch {
-    throw new ApiError(0, 'Cannot reach gorynych serve. Is it still running?', null);
+    throw new ApiError(0, 'Cannot reach mjolnir serve. Is it still running?', null);
   }
   if (res.status === 401) {
     showAuthError();

@@ -7,7 +7,7 @@ the text says "not documented" instead of guessing.
 
 The question: which existing tools move very large files quickly by splitting
 them into chunks and sending the chunks over several connections or streams at
-once, with encryption in transit? And is there room for Gorynych
+once, with encryption in transit? And is there room for Mjolnir
 ([PROTOCOL.md](PROTOCOL.md)): Noise IK with pinned X25519 keys, per-chunk AEAD,
 N parallel TCP connections that each read, seal and send on their own thread,
 positional writes on the receiver, and round-based resend with crash-safe
@@ -23,7 +23,7 @@ in parallel.
 
 | Tool | Encrypted by default? (crypto) | Peer authentication | Par | Chunk size tunable | Transport | Resume / integrity | License, language | Status (Sep 2026) |
 |---|---|---|---|---|---|---|---|---|
-| **Gorynych** (this repo) | Yes. AES-256-GCM (default) or ChaCha20-Poly1305 on each chunk; keys from Noise IK + HKDF | Pinned static X25519 keys on both sides (`known_hosts`/`authorized_keys` style) | Intra-file, N TCP connections on one port, one thread each | Yes, 4 KiB to 64 MiB | TCP | Bitmap resume with fsync ordering; each chunk authenticated by AEAD with AAD bound to (session, file, index) | MIT/Apache-2.0, Rust | In development (v0.1.0) |
+| **Mjolnir** (this repo) | Yes. AES-256-GCM (default) or ChaCha20-Poly1305 on each chunk; keys from Noise IK + HKDF | Pinned static X25519 keys on both sides (`known_hosts`/`authorized_keys` style) | Intra-file, N TCP connections on one port, one thread each | Yes, 4 KiB to 64 MiB | TCP | Bitmap resume with fsync ordering; each chunk authenticated by AEAD with AAD bound to (session, file, index) | MIT/Apache-2.0, Rust | In development (v0.1.0) |
 | **mscp** [1][2][3] | Yes, SSH (cipher set with `-c`) | SSH (keys/password, via patched libssh) | Intra-file, N SSH/SFTP connections, `-n` default `floor(log(cores)*2)+1` | Yes, `-s` min (default 16 MiB) and `-S` max | TCP (SSH) | Checkpoint `-W`/resume `-R`; integrity is SSH's per-connection MAC | GPL-3.0, C | Active. v0.2.4 (2025-11-08), pushed 2026-07 [4] |
 | **HPN-SSH** [5][6][7] | Yes, SSH. Adds multithreaded AES-CTR and ChaCha20 ciphers. An optional NONE cipher sends data in the clear after auth | SSH | **No.** One connection; the speedup comes from matching SSH window to TCP buffer and from parallel ciphers | No chunking (SSH buffers) | TCP (SSH) | `hpnscp` resume compares a BLAKE2b-512 hash of the file | BSD-style (OpenSSH), C | Very active. hpn-18.11.1 (2026-09-17), based on OpenSSH 10.5p1 |
 | **bbcp** [8][9] | **No** for the data. SSH is used only to start the remote side; the help text has compression but no cipher option | SSH login to both ends | Intra-file, `-s` streams (default 4) | Yes, `-B` buffer size, `-w` window | TCP | `-a` append/restart; `-e`/`-E` MD5 and other checksums | GPL-3.0/LGPL files (GitHub mirror), C++ | Unmaintained. The SLAC page is gone; MPCDF lists it "only ... for legacy reasons" |
@@ -63,7 +63,7 @@ Also relevant, briefly:
 - Checkpoint (`-W`) and resume (`-R`) exist [2].
 - It needs a patched libssh and a standard `sshd` on the far side [1].
 - The PEARC '23 paper reports mscp at up to 240 times faster than scp in the Data Mover Challenge 2023 [3].
-- This is the closest match to Gorynych in *security model and use case*: key-authenticated, host-to-host, intra-file parallel over TCP. The difference is that every data connection is a full SSH session.
+- This is the closest match to Mjolnir in *security model and use case*: key-authenticated, host-to-host, intra-file parallel over TCP. The difference is that every data connection is a full SSH session.
 
 ### HPN-SSH
 - A soft fork of OpenSSH that sizes the application receive buffer to match the TCP buffer. It reports up to more than 100 times OpenSSH's throughput on some paths [5].
@@ -102,7 +102,7 @@ Also relevant, briefly:
 - `ascp` defaults to aes-128-gcm. It also offers 192/256-bit keys in CFB or GCM, and the server can force a stronger cipher [18].
 - FileCatalyst: UDP acceleration, AES-256 on data, TLS 1.3 on control [20].
 - Signiant: a proprietary UDP protocol, AES-256, TLS [21].
-- These are the benchmark Gorynych will be compared against on long-RTT, lossy paths, which is exactly where TCP is weakest.
+- These are the benchmark Mjolnir will be compared against on long-RTT, lossy paths, which is exactly where TCP is weakest.
 
 ### FDT (Caltech)
 - Java NIO. "Transfers data in parallel on multiple TCP streams" [22].
@@ -160,9 +160,9 @@ Also relevant, briefly:
 
 ---
 
-## 3. Is there a gap for Gorynych?
+## 3. Is there a gap for Mjolnir?
 
-### What Gorynych combines
+### What Mjolnir combines
 1. **No SSH dependency, no PKI, no bearer secrets.** It uses WireGuard-style pinned static keys with Noise IK: mutual authentication, forward secrecy, and one round trip for the handshake.
 2. **Intra-file parallelism over N TCP connections on a single port.** Admission uses a cheap HMAC over a fresh challenge, so there is no second handshake per connection.
 3. **Per-chunk AEAD with keys derived per (round, connection).** Connections never coordinate nonces, so the crypto scales with cores the way mscp scales by running N SSH sessions. There is no SSH channel/window layer and no SFTP request/response round trips.
@@ -180,7 +180,7 @@ Also relevant, briefly:
 
 **Verdict:** the gap is real but narrow. No maintained, standalone, open-source tool found here combines modern public-key mutual authentication (Noise/WireGuard style), intra-file parallel TCP, independent per-chunk AEAD, and crash-safe resume in one small cross-platform binary. WDT comes closest and is weaker on authentication and maintenance. mscp covers the same ground by sitting on SSH. The niche is **server-to-server or workstation-to-server bulk moves over high-bandwidth-delay-product links where you control both ends and can open one TCP port.**
 
-### What Gorynych has to beat them on (and prove with numbers)
+### What Mjolnir has to beat them on (and prove with numbers)
 - **Throughput per host at 10/25/100 Gbit/s**, and CPU cost per GB, against mscp, HPN-SSH (parallel ciphers), WDT, rclone/lftp over SFTP, croc, sendme and qcp. Use the same hardware, with `netem` RTTs of 1/50/150/300 ms and loss of 0 / 0.01% / 0.1% / 1%.
   - AES-256-GCM with AES-NI/VAES should reach several GB/s per core. The per-chunk design has to actually scale linearly with N and cores: no global lock on the file, and no serialized writes.
 - **Setup cost.** One Noise handshake plus N HMAC admissions, against N SSH handshakes (mscp) or N segment logins (lftp). Many small files: check manifest size and the per-file cost of the round logic.
@@ -192,15 +192,15 @@ Also relevant, briefly:
   - Clear error messages.
 - **Straggler handling.** Chunks should be pulled from a shared queue (work stealing), not pre-assigned. Otherwise one slow TCP flow holds up the whole round. The spec does not say how chunks are distributed. That choice drives tail latency on real WAN paths, which is where mscp and WDT compete.
 
-### Where Gorynych is honestly worse
-- **No NAT traversal or relay.** The receiver must accept inbound TCP. croc (DERP/WireGuard plus its own relay), sendme/iroh (hole punching plus relay), magic-wormhole (transit relay) and Syncthing all work between two NATed laptops. Gorynych does not (PROTOCOL.md says so).
+### Where Mjolnir is honestly worse
+- **No NAT traversal or relay.** The receiver must accept inbound TCP. croc (DERP/WireGuard plus its own relay), sendme/iroh (hole punching plus relay), magic-wormhole (transit relay) and Syncthing all work between two NATed laptops. Mjolnir does not (PROTOCOL.md says so).
 - **No short-code pairing (PAKE).** Keys must be swapped ahead of time, which is fine for servers and clumsy for ad-hoc person-to-person sends.
 - **TCP congestion control, not UDP rate control.**
   - On long, lossy paths, each TCP flow's loss-based congestion control (CUBIC; BBR if the OS is set up for it) backs off. FASP, FileCatalyst, Signiant, UDT and Tsunami keep sending at the measured capacity.
   - N parallel flows cover much of this gap, which is why GridFTP, bbcp, WDT and mscp all use them.
   - But they take N shares of a shared bottleneck, which is unfair to other traffic. They also still suffer at high loss.
   - There is no multipath across interfaces, which iroh 1.x has.
-- **No SSH ecosystem.** mscp, HPN-SSH, lftp and rclone reuse existing `sshd`, keys, agents, bastions, FIDO tokens and audit logging. Gorynych needs its own listener and its own key distribution. Revocation means editing a file.
+- **No SSH ecosystem.** mscp, HPN-SSH, lftp and rclone reuse existing `sshd`, keys, agents, bastions, FIDO tokens and audit logging. Mjolnir needs its own listener and its own key distribution. Revocation means editing a file.
 - **Single-shot receiver.** One process serves one transfer, then exits. There is no daemon mode, no multi-tenant access control, no third-party transfers (GridFTP/Globus/FDT do these) and no multicast (UFTP).
   - Also note: after message 1, the receiver "closes ... and exits" on an unauthorized key. Anyone who can reach the port can therefore end a waiting receiver with a single bogus handshake. Consider dropping the connection and continuing to listen.
 - **Integrity scope.** The per-chunk AEAD proves that chunks arrived intact from the authenticated sender. Some gaps remain:
@@ -208,7 +208,7 @@ Also relevant, briefly:
   - No re-check of already-written data when resuming.
   - Resume matching uses `size`, `mtime` and `chunk_size` only.
 - **Metadata leakage.** File sizes and timing are visible, since there is no padding. XFTP pads its chunks [53].
-- **Maturity.** Every tool above has years of field use or a published evaluation (mscp: PEARC '23; WDT: Facebook production; FASP: industry standard). Gorynych has none yet.
+- **Maturity.** Every tool above has years of field use or a published evaluation (mscp: PEARC '23; WDT: Facebook production; FASP: industry standard). Mjolnir has none yet.
 
 ### Bottom line
 Build it if the target is "the fastest *self-contained*, key-pinned, resumable host-to-host copy over fat TCP pipes". Measure it first against **mscp**, the incumbent open tool in this niche, and **WDT**, the architectural twin. If it cannot clearly beat mscp on throughput per core and on resume robustness, the operational cost of not being SSH will be hard to justify. Anything that needs NAT traversal, ad-hoc pairing or lossy intercontinental links belongs to croc, sendme or iroh, or to commercial UDP accelerators.

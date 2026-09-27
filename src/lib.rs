@@ -1,4 +1,4 @@
-//! Gorynych: move large files over N parallel TCP connections, each chunk
+//! Mjolnir: move large files over N parallel TCP connections, each chunk
 //! sealed on its own with an AEAD, peers authenticated by static keys with
 //! Noise IK. The protocol is specified in `docs/PROTOCOL.md`.
 //!

@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 use crate::crypto::{Cipher, CipherState, SessionKeys, TAG_LEN};
 use crate::manifest::{ChunkId, END_FILE_ID, OfferFile};
 
-pub const MAGIC: &[u8; 4] = b"GRYN";
+pub const MAGIC: &[u8; 4] = b"MJLN";
 pub const VERSION: u8 = 1;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -30,7 +30,7 @@ pub fn write_preamble(w: &mut impl Write, kind: ConnKind) -> Result<()> {
 pub fn read_preamble(r: &mut impl Read) -> Result<ConnKind> {
     let mut p = [0u8; 6];
     r.read_exact(&mut p)?;
-    ensure!(&p[..4] == MAGIC, "not a gorynych connection");
+    ensure!(&p[..4] == MAGIC, "not a mjolnir connection");
     ensure!(p[4] == VERSION, "unsupported protocol version {}", p[4]);
     match p[5] {
         0 => Ok(ConnKind::Control),
@@ -347,9 +347,9 @@ mod tests {
     fn preamble_roundtrip_and_rejects() {
         let mut buf = Vec::new();
         write_preamble(&mut buf, ConnKind::Data).unwrap();
-        assert_eq!(buf, b"GRYN\x01\x01");
+        assert_eq!(buf, b"MJLN\x01\x01");
         assert_eq!(read_preamble(&mut &buf[..]).unwrap(), ConnKind::Data);
-        assert!(read_preamble(&mut &b"GRYN\x02\x00"[..]).is_err());
+        assert!(read_preamble(&mut &b"MJLN\x02\x00"[..]).is_err());
         assert!(read_preamble(&mut &b"HTTP/1"[..]).is_err());
     }
 

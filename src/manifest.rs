@@ -62,10 +62,10 @@ impl RelPath {
 
 /// Suffixes of the receiver's side files; see `recv.rs`.
 pub const RESERVED_SUFFIXES: [&str; 4] = [
-    ".gorynych-part",
-    ".gorynych-state",
-    ".gorynych-state.tmp",
-    ".gorynych-sums",
+    ".mjolnir-part",
+    ".mjolnir-state",
+    ".mjolnir-state.tmp",
+    ".mjolnir-sums",
 ];
 
 /// `CON`, `nul.txt`, `COM1` and the like open devices on Windows.
@@ -314,7 +314,7 @@ mod tests {
             "console",
             "com10",
             "nul_file",
-            "x.gorynych-partial",
+            "x.mjolnir-partial",
         ] {
             RelPath::parse(ok).unwrap_or_else(|e| panic!("{ok}: {e}"));
         }
@@ -348,10 +348,10 @@ mod tests {
             "dir/com1",
             "Lpt9.log",
             "aux/x",
-            "big.iso.gorynych-part",
-            "x.gorynych-state",
-            "x.gorynych-state.tmp",
-            "x.gorynych-sums",
+            "big.iso.mjolnir-part",
+            "x.mjolnir-state",
+            "x.mjolnir-state.tmp",
+            "x.mjolnir-sums",
         ] {
             assert!(RelPath::parse(bad).is_err(), "accepted {bad:?}");
         }

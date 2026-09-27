@@ -1,5 +1,5 @@
 [package]
-name = "gorynych"
+name = "mjolnir"
 version = "0.1.0"
 edition = "2024"
 description = "Fast authenticated file transfer: per-chunk AEAD over parallel TCP connections"

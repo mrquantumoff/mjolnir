@@ -220,7 +220,7 @@ fn run_round(ctx: &Ctx, round: u32, connections: usize, queue: &[ChunkId]) -> u3
                 if let Err(e) = data_connection(ctx, round, conn, queue, cursor, admitted)
                     && !ctx.progress.is_cancelled()
                 {
-                    eprintln!("gorynych: data connection {conn} of round {round}: {e:#}");
+                    eprintln!("mjolnir: data connection {conn} of round {round}: {e:#}");
                 }
             });
         }

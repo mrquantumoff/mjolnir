@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Result, bail};
 use clap::{Parser, Subcommand};
 
-use gorynych::{
+use mjolnir::{
     Cipher, Phase, PrivateKey, Progress, PublicKey, Receiver, RecvConfig, SendConfig,
     load_authorized_keys, parse_size, web,
 };
@@ -26,7 +26,7 @@ struct Cli {
 enum Cmd {
     /// Create a private key file and print its public key.
     Keygen {
-        #[arg(long, default_value = "gorynych.key")]
+        #[arg(long, default_value = "mjolnir.key")]
         out: PathBuf,
     },
     /// Print the public key of an existing private key file.
@@ -91,7 +91,7 @@ enum Cmd {
 
 fn main() {
     if let Err(e) = run(Cli::parse().cmd) {
-        eprintln!("gorynych: error: {e:#}");
+        eprintln!("mjolnir: error: {e:#}");
         std::process::exit(1);
     }
 }
@@ -172,7 +172,7 @@ fn run(cmd: Cmd) -> Result<()> {
             };
             let progress = Arc::new(Progress::default());
             let report =
-                with_progress("sent", &progress, || gorynych::send(cfg, progress.clone()))?;
+                with_progress("sent", &progress, || mjolnir::send(cfg, progress.clone()))?;
             summary(
                 "sent",
                 report.bytes_sent,

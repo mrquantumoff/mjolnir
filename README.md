@@ -1,6 +1,6 @@
-# gorynych
+# mjolnir
 
-gorynych copies large files between two hosts you control. It splits each
+mjolnir copies large files between two hosts you control. It splits each
 file into chunks, encrypts every chunk on its own with an AEAD, and sends
 them over several TCP connections at once. The receiver decrypts each chunk
 and writes it at its offset. Both hosts authenticate with static key pairs,
@@ -12,20 +12,20 @@ On each host, create a key pair. `keygen` writes the private key and prints
 the public key:
 
 ```sh
-gorynych keygen --out gorynych.key
+mjolnir keygen --out mjolnir.key
 ```
 
 Swap public keys through any channel you trust. On the receiver, allow the
 sender's key and start listening:
 
 ```sh
-gorynych recv --key gorynych.key --allow <SENDER_PUBLIC_KEY> --out ./incoming
+mjolnir recv --key mjolnir.key --allow <SENDER_PUBLIC_KEY> --out ./incoming
 ```
 
 On the sender, pin the receiver's key and send files or directories:
 
 ```sh
-gorynych send receiver.example:7777 --key gorynych.key \
+mjolnir send receiver.example:7777 --key mjolnir.key \
     --peer <RECEIVER_PUBLIC_KEY> big.iso photos/
 ```
 
@@ -34,14 +34,14 @@ at the end.
 
 ## Commands and flags
 
-`gorynych keygen [--out PATH]` writes a new private key (default
-`gorynych.key`) and prints its public key. It refuses to overwrite an
+`mjolnir keygen [--out PATH]` writes a new private key (default
+`mjolnir.key`) and prints its public key. It refuses to overwrite an
 existing file. On Unix the file has mode `0600`.
 
-`gorynych pubkey --key PATH` prints the public key of an existing private
+`mjolnir pubkey --key PATH` prints the public key of an existing private
 key.
 
-`gorynych recv` receives one transfer:
+`mjolnir recv` receives one transfer:
 
 | Flag | Default | Meaning |
 |---|---|---|
@@ -55,7 +55,7 @@ key.
 At least one of `--authorized` or `--allow` is required. On start the
 receiver prints its public key and listen address.
 
-`gorynych send <HOST:PORT> <PATH>...` sends files and directories.
+`mjolnir send <HOST:PORT> <PATH>...` sends files and directories.
 Directories are sent recursively under their own name, so `photos/` arrives
 as `incoming/photos/...`.
 
@@ -67,7 +67,7 @@ as `incoming/photos/...`.
 | `-c, --chunk-size SIZE` | `1MiB` | chunk size, 4 KiB to 64 MiB; accepts `64K`, `256KiB`, `1M`, `4MiB` |
 | `--cipher NAME` | `aes256gcm` | `aes256gcm` or `chacha20poly1305` |
 
-`gorynych serve [--listen 127.0.0.1:7878] [--key PATH] [--no-open]` starts a
+`mjolnir serve [--listen 127.0.0.1:7878] [--key PATH] [--no-open]` starts a
 local web UI; see [docs/WEB.md](docs/WEB.md).
 
 ## How it works
@@ -81,12 +81,12 @@ chunks it already holds from an earlier attempt. The sender then opens N data
 connections that pull chunk numbers from one shared queue, read each chunk
 with a positional read, seal it with a key unique to that connection, and
 stream it. The receiver opens each chunk, writes it with a positional write
-into `<name>.gorynych-part`, and marks it present. Every two seconds it
+into `<name>.mjolnir-part`, and marks it present. Every two seconds it
 syncs the part files and saves the bitmap, so a crash or a cancel loses at
 most a few seconds of work. When every chunk is present it renames the part
 files into place. The wire format is specified in
 [docs/PROTOCOL.md](docs/PROTOCOL.md), and [docs/prior-art.md](docs/prior-art.md)
-compares gorynych with existing tools.
+compares mjolnir with existing tools.
 
 ## Security model
 
@@ -94,7 +94,7 @@ Keys are pinned in the WireGuard and SSH style. The sender only talks to the
 holder of the receiver key it passed with `--peer`, and the receiver only
 accepts senders whose keys it was given. There are no certificates and no
 trust on first use. The handshake is `Noise_IK_25519_ChaChaPoly_SHA256` as
-implemented by the [snow](https://crates.io/crates/snow) crate; gorynych does
+implemented by the [snow](https://crates.io/crates/snow) crate; mjolnir does
 not implement Noise itself. The session secret travels under ephemeral
 Diffie-Hellman keys, so recorded traffic stays private even if both static
 keys later leak. Every chunk is authenticated together with the session,

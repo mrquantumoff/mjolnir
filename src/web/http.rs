@@ -266,7 +266,7 @@ mod tests {
         let g = guard("10.0.0.5:7878");
         assert!(g.host_allowed("10.0.0.5:7878"));
         assert!(!g.host_allowed("10.0.0.6:7878"));
-        assert!(!g.host_allowed("gorynych.lan:7878"));
+        assert!(!g.host_allowed("mjolnir.lan:7878"));
     }
 
     #[test]

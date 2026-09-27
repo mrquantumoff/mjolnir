@@ -111,7 +111,7 @@ impl PrivateKey {
         Ok(())
     }
 
-    /// Loads `<config dir>/gorynych/gorynych.key`, generating it first if it
+    /// Loads `<config dir>/mjolnir/mjolnir.key`, generating it first if it
     /// does not exist. Returns the key and its path.
     pub fn load_or_create_default() -> Result<(Self, PathBuf)> {
         let path = default_key_path()?;
@@ -126,7 +126,7 @@ impl PrivateKey {
     }
 }
 
-/// `<config dir>/gorynych/gorynych.key`, where the config dir is
+/// `<config dir>/mjolnir/mjolnir.key`, where the config dir is
 /// `%APPDATA%` on Windows, `~/Library/Application Support` on macOS, and
 /// `$XDG_CONFIG_HOME` or `~/.config` elsewhere.
 pub fn default_key_path() -> Result<PathBuf> {
@@ -146,7 +146,7 @@ pub fn default_key_path() -> Result<PathBuf> {
             None => home()?.join(".config"),
         }
     };
-    Ok(config.join("gorynych").join("gorynych.key"))
+    Ok(config.join("mjolnir").join("mjolnir.key"))
 }
 
 /// Parses an authorized-keys file: one `<base64 key> [comment]` per line;

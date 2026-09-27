@@ -1,18 +1,18 @@
 # Web UI
 
-`gorynych serve` runs a small local web app for starting and watching
+`mjolnir serve` runs a small local web app for starting and watching
 transfers. It uses the same key as the command line and runs the same library
 code, so a transfer started in the browser is identical to one started with
-`gorynych send` or `gorynych recv`.
+`mjolnir send` or `mjolnir recv`.
 
 ```
-gorynych serve [--listen 127.0.0.1:7878] [--key PATH] [--no-open]
+mjolnir serve [--listen 127.0.0.1:7878] [--key PATH] [--no-open]
 ```
 
 It prints a URL like
 
 ```
-gorynych web UI: http://127.0.0.1:7878/#token=3f9c0d6e1a2b4c5d6e7f8091a2b3c4d5
+mjolnir web UI: http://127.0.0.1:7878/#token=3f9c0d6e1a2b4c5d6e7f8091a2b3c4d5
 ```
 
 and opens it in the default browser unless `--no-open` is given. Without
@@ -117,7 +117,7 @@ have the shape `{ "error": "message", "field": "name" | null }`, where
 ### `GET /api/identity`
 
 ```json
-{ "public_key": "base64", "key_path": "/home/me/.config/gorynych/key" }
+{ "public_key": "base64", "key_path": "/home/me/.config/mjolnir/key" }
 ```
 
 ### `GET /api/transfers`

@@ -1,4 +1,4 @@
-//! Local web control plane for managing transfers, served by `gorynych serve`.
+//! Local web control plane for managing transfers, served by `mjolnir serve`.
 //! See docs/WEB.md for the security model and the API.
 
 mod api;
@@ -99,7 +99,7 @@ pub fn serve(cfg: ServeConfig) -> Result<()> {
         );
     }
     let url = server.url();
-    println!("gorynych web UI: {url}");
+    println!("mjolnir web UI: {url}");
     if open_browser && let Err(e) = open_in_browser(&url) {
         eprintln!("could not open a browser ({e}); open the URL above yourself");
     }

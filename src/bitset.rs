@@ -78,7 +78,7 @@ impl AtomicBitset {
     }
 }
 
-/// The receiver's `.gorynych-state` file contents.
+/// The receiver's `.mjolnir-state` file contents.
 #[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PartState {
     pub size: u64,
@@ -166,9 +166,9 @@ mod tests {
 
     #[test]
     fn state_file_persist_roundtrip() {
-        let dir = std::env::temp_dir().join(format!("gorynych-bitset-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("mjolnir-bitset-{}", std::process::id()));
         fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("f.gorynych-state");
+        let path = dir.join("f.mjolnir-state");
         let bits = AtomicBitset::new(100);
         for k in (0..100).step_by(3) {
             bits.set(k);

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Loopback benchmark: a release `gorynych recv` and `gorynych send` as two
+# Loopback benchmark: a release `mjolnir recv` and `mjolnir send` as two
 # processes on 127.0.0.1, one random file, several connection counts, chunk
 # sizes, and both ciphers. Every run's output is checked with SHA-256.
 #
@@ -16,7 +16,7 @@ repeat="${REPEAT:-3}"
 port="${PORT:-7799}"
 
 cargo build --release --quiet --manifest-path "$root/Cargo.toml"
-bin="$root/target/release/gorynych"
+bin="$root/target/release/mjolnir"
 [ -x "$bin" ] || bin="$bin.exe"
 
 mkdir -p "$work"
