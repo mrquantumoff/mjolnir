@@ -11,7 +11,7 @@
 #
 # usage: scripts/bench.sh [WORKDIR]
 #   SIZE_MIB  file size in MiB (default 2048)
-#   REPEAT    runs per configuration; the table shows the median (default 3)
+#   REPEAT    runs per configuration; rates show median and range (default 3)
 #   PORT      listen port (default 7799)
 #   ROWS      only run rows whose "connections threads chunk cipher verify
 #             hash mode" matches this extended regex, e.g. ROWS='^8 0 1MiB'
@@ -106,7 +106,7 @@ $(transfer_rate "$work/recv.log") $(cores "$work/send.log") $(cores "$work/recv.
 
 median() { sort -n | awk '{ v[NR] = $1 } END { print v[int((NR + 1) / 2)] }'; }
 
-echo "| connections | threads | chunk | cipher | verify | hash | mode | MiB/s | transfer phase MiB/s | sender cores | receiver cores | machine CPU % |"
+echo "| connections | threads | chunk | cipher | verify | hash | mode | MiB/s, median (min-max) | transfer phase MiB/s, median (min-max) | sender cores | receiver cores | machine CPU % |"
 echo "|---|---|---|---|---|---|---|---|---|---|---|---|"
 : > "$work/phase-table"
 bench() {
@@ -114,9 +114,14 @@ bench() {
   local runs
   runs="$(for _ in $(seq "$repeat"); do run_once "$@"; done)"
   col() { echo "$runs" | cut -d' ' -f"$1" | median; }
+  # "median (min-max)" for the rate columns.
+  spread() {
+    echo "$runs" | cut -d' ' -f"$1" | sort -n |
+      awk '{ v[NR] = $1 } END { printf "%.0f (%.0f-%.0f)", v[int((NR + 1) / 2)], v[1], v[NR] }'
+  }
   local threads="$2"
   [ "$threads" = 0 ] && threads=auto
-  echo "| $1 | $threads | $3 | $4 | $5 | $6 | $7 | $(col 1) | $(col 2) | $(col 3) | $(col 4) | $(col 5) |"
+  echo "| $1 | $threads | $3 | $4 | $5 | $6 | $7 | $(spread 1) | $(spread 2) | $(col 3) | $(col 4) | $(col 5) |"
   { echo "$*"; sed 's/^/  /' "$work/phases"; } >> "$work/phase-table"
 }
 for n in 1 4 8 16; do bench "$n" 0 1MiB aes256gcm on off disk; done
