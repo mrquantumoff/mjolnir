@@ -6,7 +6,7 @@ use std::io::{BufReader, Read, Write};
 use anyhow::{Context, Result, bail, ensure};
 use serde::{Deserialize, Serialize};
 
-use crate::crypto::{Cipher, CipherState, SessionKeys, TAG_LEN};
+use crate::crypto::{Cipher, CipherState, FrameKey, SessionKeys, TAG_LEN};
 use crate::manifest::{ChunkId, END_FILE_ID, OfferFile};
 
 pub const MAGIC: &[u8; 4] = b"MJLN";
@@ -128,6 +128,11 @@ impl<W: Write> ControlTx<W> {
 }
 
 impl<R: Read> ControlRx<R> {
+    /// The underlying reader; bytes already buffered are dropped.
+    pub fn into_inner(self) -> R {
+        self.reader.into_inner()
+    }
+
     pub fn recv(&mut self) -> Result<Msg> {
         let mut len = [0u8; 4];
         self.reader
@@ -221,11 +226,12 @@ fn frame_aad(session_id: &[u8; 16], header: &[u8; HEADER_LEN]) -> [u8; 32] {
     aad
 }
 
-/// Seals a frame in place. `frame` is laid out as
+/// Seals a connection's frame number `k` in place. `frame` is laid out as
 /// `[header space: 16][plaintext][tag space: 16]` and is exactly that long;
 /// afterwards the whole slice is the wire frame.
 pub fn seal_frame(
-    cipher: &mut CipherState,
+    key: &FrameKey,
+    k: u64,
     session_id: &[u8; 16],
     header: FrameHeader,
     frame: &mut [u8],
@@ -234,18 +240,19 @@ pub fn seal_frame(
     let (h, body) = frame.split_at_mut(HEADER_LEN);
     let encoded = header.encode();
     h.copy_from_slice(&encoded);
-    cipher.seal(&frame_aad(session_id, &encoded), body)
+    key.seal(k, &frame_aad(session_id, &encoded), body)
 }
 
-/// Opens a frame body (`ct_len` bytes) in place; the plaintext is
-/// `body[..ct_len - 16]`.
+/// Opens the body (`ct_len` bytes) of a connection's frame number `k` in
+/// place; the plaintext is `body[..ct_len - 16]`.
 pub fn open_frame(
-    cipher: &mut CipherState,
+    key: &FrameKey,
+    k: u64,
     session_id: &[u8; 16],
     header: &[u8; HEADER_LEN],
     body: &mut [u8],
 ) -> Result<()> {
-    cipher.open(&frame_aad(session_id, header), body)
+    key.open(k, &frame_aad(session_id, header), body)
 }
 
 /// The header of the frame that carries `chunk`, `len` plaintext bytes long.
@@ -264,19 +271,19 @@ mod tests {
     const SID: [u8; 16] = [3u8; 16];
 
     fn sealed(cipher: Cipher, chunk: ChunkId, data: &[u8]) -> Vec<u8> {
-        let mut tx = CipherState::new(cipher, &[7u8; 32]);
+        let key = FrameKey::new(cipher, &[7u8; 32]);
         let header = chunk_header(chunk, data.len() as u32);
         let mut frame = vec![0u8; HEADER_LEN + header.ct_len as usize];
         frame[HEADER_LEN..HEADER_LEN + data.len()].copy_from_slice(data);
-        seal_frame(&mut tx, &SID, header, &mut frame).unwrap();
+        seal_frame(&key, 0, &SID, header, &mut frame).unwrap();
         frame
     }
 
     fn open(cipher: Cipher, frame: &[u8]) -> Result<Vec<u8>> {
-        let mut rx = CipherState::new(cipher, &[7u8; 32]);
+        let key = FrameKey::new(cipher, &[7u8; 32]);
         let header: [u8; HEADER_LEN] = frame[..HEADER_LEN].try_into().unwrap();
         let mut body = frame[HEADER_LEN..].to_vec();
-        open_frame(&mut rx, &SID, &header, &mut body)?;
+        open_frame(&key, 0, &SID, &header, &mut body)?;
         body.truncate(body.len() - TAG_LEN);
         Ok(body)
     }
@@ -337,10 +344,10 @@ mod tests {
     #[test]
     fn frame_from_other_session_fails() {
         let frame = sealed(Cipher::Aes256Gcm, CHUNK, b"chunk bytes");
-        let mut rx = CipherState::new(Cipher::Aes256Gcm, &[7u8; 32]);
+        let key = FrameKey::new(Cipher::Aes256Gcm, &[7u8; 32]);
         let header: [u8; HEADER_LEN] = frame[..HEADER_LEN].try_into().unwrap();
         let mut body = frame[HEADER_LEN..].to_vec();
-        assert!(open_frame(&mut rx, &[4u8; 16], &header, &mut body).is_err());
+        assert!(open_frame(&key, 0, &[4u8; 16], &header, &mut body).is_err());
     }
 
     #[test]

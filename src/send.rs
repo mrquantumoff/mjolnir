@@ -5,8 +5,8 @@ use std::fs::{self, File};
 use std::io::{Read, Write};
 use std::net::{Shutdown, SocketAddr};
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering::Relaxed};
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -15,10 +15,11 @@ use serde::Serialize;
 use walkdir::WalkDir;
 
 use crate::bitset::AtomicBitset;
-use crate::crypto::{Cipher, CipherState, SessionKeys, TAG_LEN, handshake_initiator};
+use crate::crypto::{Cipher, FrameKey, SessionKeys, TAG_LEN, handshake_initiator};
 use crate::keys::{PrivateKey, PublicKey};
 use crate::manifest::{ChunkId, ChunkSize, FileEntry, Manifest, RelPath, chunk_span, mtime_of};
 use crate::net::{self, Io, tell_peer_about, unexpected};
+use crate::pool::{Buffers, Pool, buffer_count, resolve_threads};
 use crate::posio::read_exact_at;
 use crate::progress::{ActiveConnection, Cancelled, Phase, Progress};
 use crate::wire::{
@@ -37,6 +38,8 @@ pub struct SendConfig {
     pub connections: usize,
     pub chunk_size: u32,
     pub cipher: Cipher,
+    /// Workers that read and seal chunks; 0 means one per CPU core.
+    pub threads: usize,
     /// Files or directories; a directory is sent recursively under its name.
     pub paths: Vec<PathBuf>,
 }
@@ -61,6 +64,8 @@ const MAX_FAILED_ROUNDS: u32 = 3;
 const HANDSHAKE_DEADLINE: Duration = Duration::from_secs(30);
 /// A data connection whose socket accepts no byte for this long is dropped.
 const DATA_IDLE: Duration = Duration::from_secs(60);
+/// Frames per connection being read and sealed ahead of the socket.
+const DEPTH: usize = 4;
 
 pub fn send(cfg: SendConfig, progress: std::sync::Arc<Progress>) -> Result<SendReport> {
     progress.conclude(run(&cfg, &progress))
@@ -87,6 +92,48 @@ struct Ctx<'a> {
     sent: Vec<AtomicBitset>,
     /// A local read failure; fatal for the transfer, unlike network errors.
     fatal: Mutex<Option<anyhow::Error>>,
+    pool: &'a Pool<SealJob>,
+    buffers: &'a Buffers,
+}
+
+/// "Read `chunk` and seal it as frame `k` of `conn`", run on the pool.
+struct SealJob {
+    conn: Arc<SendConn>,
+    k: u64,
+    chunk: ChunkId,
+    buf: Vec<u8>,
+}
+
+/// One data connection's key and its ring of `DEPTH` result slots; frame
+/// `k` lands in slot `k % DEPTH`.
+struct SendConn {
+    key: FrameKey,
+    slots: [Slot; DEPTH],
+}
+
+/// A sealed frame (its buffer and length) handed from a worker to the
+/// connection's writer.
+#[derive(Default)]
+struct Slot {
+    sealed: Mutex<Option<(Vec<u8>, Result<usize>)>>,
+    cv: Condvar,
+}
+
+impl Slot {
+    fn put(&self, buf: Vec<u8>, frame_len: Result<usize>) {
+        *self.sealed.lock().unwrap() = Some((buf, frame_len));
+        self.cv.notify_one();
+    }
+
+    fn take(&self) -> (Vec<u8>, Result<usize>) {
+        let mut sealed = self.sealed.lock().unwrap();
+        loop {
+            if let Some(done) = sealed.take() {
+                return done;
+            }
+            sealed = self.cv.wait(sealed).unwrap();
+        }
+    }
 }
 
 type Tx<'a> = ControlTx<Io<'a>>;
@@ -117,6 +164,12 @@ fn run(cfg: &SendConfig, progress: &Progress) -> Result<SendReport> {
     let keys = handshake_initiator(&mut handshake, &cfg.key, &cfg.peer)?;
     let (mut tx, mut rx) =
         wire::control_channel(control.try_clone()?, control, &keys, Role::Sender);
+    let pool = Pool::new(resolve_threads(cfg.threads));
+    let buf_len = HEADER_LEN + chunk_size.get() as usize + TAG_LEN;
+    let buffers = Buffers::new(
+        buffer_count(pool.threads(), cfg.connections, buf_len),
+        buf_len,
+    );
     let ctx = Ctx {
         addrs: &addrs,
         keys: &keys,
@@ -132,10 +185,20 @@ fn run(cfg: &SendConfig, progress: &Progress) -> Result<SendReport> {
             .map(|j| AtomicBitset::new(manifest.chunk_count(j)))
             .collect(),
         fatal: Mutex::new(None),
+        pool: &pool,
+        buffers: &buffers,
     };
-    let result = transfer(&ctx, cfg.connections, &mut tx, &mut rx);
+    let result = thread::scope(|s| {
+        for _ in 0..pool.threads() {
+            s.spawn(|| pool.work(|job| seal(&ctx, job)));
+        }
+        let result = transfer(&ctx, cfg.connections, &mut tx, &mut rx);
+        pool.close();
+        result
+    });
     if let Err(e) = &result {
         tell_peer_about(e, progress, Some(&mut tx));
+        net::linger(rx.into_inner().into_stream());
     }
     let (rounds, verified) = result?;
     Ok(SendReport {
@@ -249,42 +312,121 @@ fn data_connection(
     admitted.fetch_add(1, Relaxed);
     let _active = ActiveConnection::new(ctx.progress);
     let mut stream = Io::new(hello.into_stream(), &cancelled).idle(DATA_IDLE);
+    let conn = Arc::new(SendConn {
+        key: FrameKey::new(ctx.cipher, &ctx.keys.data_key(round, conn)),
+        slots: Default::default(),
+    });
+    let result = stream_frames(ctx, &conn, &mut stream, queue, cursor);
+    stream.into_stream().shutdown(Shutdown::Write)?;
+    result
+}
 
-    let sid = &ctx.keys.session_id;
-    let mut cipher = CipherState::new(ctx.cipher, &ctx.keys.data_key(round, conn));
-    let chunk_size = ctx.manifest.chunk_size;
-    let mut buf = vec![0u8; HEADER_LEN + chunk_size.get() as usize + TAG_LEN];
-    loop {
-        if ctx.progress.is_cancelled() {
-            return Err(Cancelled::Local.into());
+/// Keeps up to `DEPTH` frames of this connection sealing on the pool while
+/// earlier ones go out, and writes them strictly in frame order.
+fn stream_frames(
+    ctx: &Ctx,
+    conn: &Arc<SendConn>,
+    stream: &mut Io,
+    queue: &[ChunkId],
+    cursor: &AtomicUsize,
+) -> Result<()> {
+    // Frames `written..submitted` are sealing or sealed but not yet sent;
+    // frame k carries `chunks[k % DEPTH]`.
+    let (mut written, mut submitted) = (0u64, 0u64);
+    let mut chunks = [ChunkId { file: 0, index: 0 }; DEPTH];
+    let result = (|| {
+        let mut exhausted = false;
+        loop {
+            while !exhausted && submitted - written < DEPTH as u64 {
+                // Block for a buffer only with nothing in flight; otherwise
+                // a writer holding sealed frames could starve the others.
+                let buf = if submitted == written {
+                    let stop = || ctx.progress.is_cancelled();
+                    match ctx.buffers.take(&stop) {
+                        Some(buf) => buf,
+                        None => return Err(Cancelled::Local.into()),
+                    }
+                } else {
+                    match ctx.buffers.try_take() {
+                        Some(buf) => buf,
+                        None => break,
+                    }
+                };
+                let Some(&chunk) = queue.get(cursor.fetch_add(1, Relaxed)) else {
+                    ctx.buffers.give(buf);
+                    exhausted = true;
+                    break;
+                };
+                chunks[submitted as usize % DEPTH] = chunk;
+                ctx.pool.submit(SealJob {
+                    conn: conn.clone(),
+                    k: submitted,
+                    chunk,
+                    buf,
+                });
+                submitted += 1;
+            }
+            if written == submitted {
+                break;
+            }
+            let slot = written as usize % DEPTH;
+            let (buf, frame_len) = conn.slots[slot].take();
+            written += 1;
+            let sent = frame_len.and_then(|n| Ok(stream.write_all(&buf[..n])?));
+            ctx.buffers.give(buf);
+            sent?;
+            let chunk = chunks[slot];
+            let len = u64::from(ctx.manifest.chunk_len(chunk));
+            ctx.chunks_sent.fetch_add(1, Relaxed);
+            if !ctx.sent[chunk.file as usize].set(chunk.index) {
+                ctx.chunks_resent.fetch_add(1, Relaxed);
+            }
+            ctx.bytes_sent.fetch_add(len, Relaxed);
+            ctx.progress.add_chunk(len);
+            if ctx.progress.is_cancelled() {
+                return Err(Cancelled::Local.into());
+            }
         }
-        let Some(&chunk) = queue.get(cursor.fetch_add(1, Relaxed)) else {
-            break;
-        };
-        let size = ctx.manifest.files[chunk.file as usize].size;
-        let (offset, len) = chunk_span(size, chunk_size, chunk.index);
-        let frame = &mut buf[..HEADER_LEN + len as usize + TAG_LEN];
-        let plain = &mut frame[HEADER_LEN..HEADER_LEN + len as usize];
-        if let Err(e) = read_exact_at(&ctx.files[chunk.file as usize], plain, offset) {
+        let mut end = [0u8; HEADER_LEN + TAG_LEN];
+        let sid = &ctx.keys.session_id;
+        seal_frame(&conn.key, submitted, sid, FrameHeader::end(), &mut end)?;
+        stream.write_all(&end)?;
+        Ok(())
+    })();
+    // Frames still sealing hold pool buffers; collect them before leaving.
+    while written < submitted {
+        let (buf, _) = conn.slots[written as usize % DEPTH].take();
+        ctx.buffers.give(buf);
+        written += 1;
+    }
+    result
+}
+
+/// Pool worker: reads a chunk and seals it as its connection's frame `k`.
+fn seal(ctx: &Ctx, job: SealJob) {
+    let SealJob {
+        conn,
+        k,
+        chunk,
+        mut buf,
+    } = job;
+    let size = ctx.manifest.files[chunk.file as usize].size;
+    let (offset, len) = chunk_span(size, ctx.manifest.chunk_size, chunk.index);
+    let frame_len = HEADER_LEN + len as usize + TAG_LEN;
+    let frame = &mut buf[..frame_len];
+    let plain = &mut frame[HEADER_LEN..HEADER_LEN + len as usize];
+    let sealed = read_exact_at(&ctx.files[chunk.file as usize], plain, offset)
+        .map_err(|e| {
             let path = ctx.manifest.files[chunk.file as usize].path.as_str();
             let e = anyhow!(e).context(format!("reading {path} at offset {offset}"));
             *ctx.fatal.lock().unwrap() = Some(anyhow!("{e:#}"));
-            return Err(e);
-        }
-        seal_frame(&mut cipher, sid, chunk_header(chunk, len), frame)?;
-        stream.write_all(frame)?;
-        ctx.chunks_sent.fetch_add(1, Relaxed);
-        if !ctx.sent[chunk.file as usize].set(chunk.index) {
-            ctx.chunks_resent.fetch_add(1, Relaxed);
-        }
-        ctx.bytes_sent.fetch_add(u64::from(len), Relaxed);
-        ctx.progress.add_chunk(u64::from(len));
-    }
-    let end = &mut buf[..HEADER_LEN + TAG_LEN];
-    seal_frame(&mut cipher, sid, FrameHeader::end(), end)?;
-    stream.write_all(end)?;
-    stream.into_stream().shutdown(Shutdown::Write)?;
-    Ok(())
+            e
+        })
+        .and_then(|()| {
+            let sid = &ctx.keys.session_id;
+            seal_frame(&conn.key, k, sid, chunk_header(chunk, len), frame)
+        });
+    conn.slots[k as usize % DEPTH].put(buf, sealed.map(|()| frame_len));
 }
 
 /// Fails if any source's size or mtime differs from the offer.

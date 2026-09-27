@@ -11,6 +11,7 @@ pub mod keys;
 pub mod manifest;
 mod net;
 pub mod posio;
+mod pool;
 pub mod progress;
 pub mod recv;
 pub mod send;

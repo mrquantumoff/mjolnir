@@ -17,6 +17,11 @@ use mjolnir::{
 use tempfile::TempDir;
 
 const CHUNK: u32 = 16 << 10;
+/// Crypto workers per side. `MJOLNIR_TEST_THREADS` overrides it, so the
+/// whole suite can run at 1 and at 8 threads.
+static THREADS: std::sync::LazyLock<usize> = std::sync::LazyLock::new(|| {
+    std::env::var("MJOLNIR_TEST_THREADS").map_or(4, |v| v.parse().unwrap())
+});
 
 /// Deterministic pseudo-random bytes (xorshift), distinct per seed.
 fn noise(len: usize, seed: u64) -> Vec<u8> {
@@ -51,6 +56,7 @@ fn recv_config(key: PrivateKey, authorized: Vec<PublicKey>, out: &Path) -> RecvC
         out_dir: out.to_owned(),
         force: false,
         verify: true,
+        threads: *THREADS,
     }
 }
 
@@ -91,6 +97,7 @@ struct Send {
     connections: usize,
     chunk_size: u32,
     cipher: Cipher,
+    threads: usize,
 }
 
 impl Send {
@@ -101,6 +108,7 @@ impl Send {
             connections: 8,
             chunk_size: CHUNK,
             cipher: Cipher::Aes256Gcm,
+            threads: *THREADS,
         }
     }
 
@@ -112,6 +120,7 @@ impl Send {
             connections: self.connections,
             chunk_size: self.chunk_size,
             cipher: self.cipher,
+            threads: self.threads,
             paths: paths.iter().map(|p| p.to_path_buf()).collect(),
         }
     }
@@ -647,4 +656,27 @@ fn receiver_cancel_is_prompt_with_a_silent_connection_pending() {
     let err = rx.join().unwrap_err();
     assert_eq!(err.downcast_ref::<Cancelled>(), Some(&Cancelled::Local));
     assert!(started.elapsed() < Duration::from_secs(1));
+}
+
+#[test]
+fn one_connection_many_workers_completes_out_of_order() {
+    let src = TempDir::new().unwrap();
+    let file = src.path().join("f.bin");
+    write(&file, &noise(2000 * 4096 + 17, 15));
+    let out = TempDir::new().unwrap();
+    let (rk, _) = keypair();
+    let (sk, spub) = keypair();
+    let mut cfg = recv_config(rk, vec![spub], out.path());
+    cfg.threads = 8;
+    let rx = start(cfg);
+    let mut send = Send::to(sk, rx.public);
+    send.connections = 1;
+    send.threads = 8;
+    send.chunk_size = 4096;
+    let report = send.run(rx.addr, &[&file]).unwrap();
+    let recv = rx.join().unwrap();
+    assert_eq!(report.chunks_sent, 2001);
+    assert_eq!(recv.chunks_received, 2001);
+    assert_eq!(recv.duplicate_chunks, 0);
+    assert_file_eq(&file, &out.path().join("f.bin"));
 }

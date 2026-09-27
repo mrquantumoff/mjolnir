@@ -152,6 +152,25 @@ pub(crate) fn connect(addrs: &[SocketAddr], progress: &Progress) -> Result<TcpSt
     Err(last.expect("addrs is non-empty"))
 }
 
+/// Closes a control connection after a goodbye without resetting it. Our
+/// half is shut, then whatever the peer still sends (say, a `RoundEnd` in
+/// flight) is read and dropped for up to a second. Closing a socket with
+/// unread bytes sends a reset, and on Windows a reset makes the peer
+/// discard our goodbye before it reads it.
+pub(crate) fn linger(mut stream: TcpStream) {
+    let _ = stream.shutdown(std::net::Shutdown::Write);
+    let deadline = Instant::now() + Duration::from_secs(1);
+    let mut scratch = [0u8; 4096];
+    while Instant::now() < deadline {
+        match stream.read(&mut scratch) {
+            Ok(0) => return,
+            Ok(_) => {}
+            Err(e) if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {}
+            Err(_) => return,
+        }
+    }
+}
+
 /// Best effort: tell the peer why this side is leaving, `Cancel` for a local
 /// cancel and `Error` for a local failure. Errors the peer caused are not
 /// echoed back.

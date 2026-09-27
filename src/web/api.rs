@@ -284,6 +284,7 @@ fn start_send(app: &App, req: SendRequest) -> Result<Reply, ApiError> {
         connections: req.connections,
         chunk_size: req.chunk_size,
         cipher: req.cipher,
+        threads: 0,
         paths,
     };
     let id = app.jobs.spawn(spec, move |progress| {
@@ -322,6 +323,7 @@ fn start_receive(app: &App, req: ReceiveRequest) -> Result<Reply, ApiError> {
         out_dir: out_dir.clone(),
         force: req.force,
         verify: req.verify,
+        threads: 0,
     })
     .map_err(|e| ApiError::field("listen", format!("{e:#}")))?;
     let bound_addr = receiver.local_addr();

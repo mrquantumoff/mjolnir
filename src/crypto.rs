@@ -41,40 +41,33 @@ enum AnyAead {
     ChaCha(Box<ChaCha20Poly1305>),
 }
 
-/// One direction of an AEAD stream: a key and a nonce counter that starts at
-/// 0 and increments per message. Nonce = `0u32 | counter u64`.
-pub struct CipherState {
-    aead: AnyAead,
-    counter: u64,
+/// An AEAD key whose nonce for message `counter` is `0u32 | counter u64`.
+/// It holds no state, so one key can seal or open many messages of a
+/// stream at once, in any order, from many threads.
+pub struct FrameKey(AnyAead);
+
+fn nonce(counter: u64) -> [u8; 12] {
+    let mut nonce = [0u8; 12];
+    nonce[4..].copy_from_slice(&counter.to_be_bytes());
+    nonce
 }
 
-impl CipherState {
+impl FrameKey {
     pub fn new(cipher: Cipher, key: &[u8; 32]) -> Self {
-        let aead = match cipher {
+        FrameKey(match cipher {
             Cipher::Aes256Gcm => AnyAead::Aes(Box::new(Aes256Gcm::new(key.into()))),
             Cipher::ChaCha20Poly1305 => {
                 AnyAead::ChaCha(Box::new(ChaCha20Poly1305::new(key.into())))
             }
-        };
-        CipherState { aead, counter: 0 }
-    }
-
-    fn next_nonce(&mut self) -> [u8; 12] {
-        let mut nonce = [0u8; 12];
-        nonce[4..].copy_from_slice(&self.counter.to_be_bytes());
-        self.counter = self
-            .counter
-            .checked_add(1)
-            .expect("nonce counter exhausted");
-        nonce
+        })
     }
 
     /// `buf` is plaintext followed by `TAG_LEN` spare bytes. Encrypts in
-    /// place and writes the tag into the spare bytes.
-    pub fn seal(&mut self, aad: &[u8], buf: &mut [u8]) -> Result<()> {
-        let nonce = self.next_nonce();
+    /// place as message `counter` and writes the tag into the spare bytes.
+    pub fn seal(&self, counter: u64, aad: &[u8], buf: &mut [u8]) -> Result<()> {
+        let nonce = nonce(counter);
         let (body, tag_out) = buf.split_at_mut(buf.len() - TAG_LEN);
-        let tag = match &self.aead {
+        let tag = match &self.0 {
             AnyAead::Aes(a) => a.encrypt_in_place_detached(&nonce.into(), aad, body),
             AnyAead::ChaCha(a) => a.encrypt_in_place_detached(&nonce.into(), aad, body),
         }
@@ -83,18 +76,50 @@ impl CipherState {
         Ok(())
     }
 
-    /// `buf` is ciphertext followed by the tag. On success the plaintext is
-    /// `buf[..buf.len() - TAG_LEN]`.
-    pub fn open(&mut self, aad: &[u8], buf: &mut [u8]) -> Result<()> {
+    /// `buf` is ciphertext followed by the tag of message `counter`. On
+    /// success the plaintext is `buf[..buf.len() - TAG_LEN]`.
+    pub fn open(&self, counter: u64, aad: &[u8], buf: &mut [u8]) -> Result<()> {
         ensure!(buf.len() >= TAG_LEN, "ciphertext shorter than the tag");
-        let nonce = self.next_nonce();
+        let nonce = nonce(counter);
         let (body, tag) = buf.split_at_mut(buf.len() - TAG_LEN);
         let tag = (&*tag).into();
-        match &self.aead {
+        match &self.0 {
             AnyAead::Aes(a) => a.decrypt_in_place_detached(&nonce.into(), aad, body, tag),
             AnyAead::ChaCha(a) => a.decrypt_in_place_detached(&nonce.into(), aad, body, tag),
         }
         .map_err(|_| anyhow!("authentication failed"))
+    }
+}
+
+/// One direction of an in-order AEAD stream: a key and a counter that starts
+/// at 0 and increments per message.
+pub struct CipherState {
+    key: FrameKey,
+    counter: u64,
+}
+
+impl CipherState {
+    pub fn new(cipher: Cipher, key: &[u8; 32]) -> Self {
+        CipherState {
+            key: FrameKey::new(cipher, key),
+            counter: 0,
+        }
+    }
+
+    fn next(&mut self) -> u64 {
+        let counter = self.counter;
+        self.counter = counter.checked_add(1).expect("nonce counter exhausted");
+        counter
+    }
+
+    pub fn seal(&mut self, aad: &[u8], buf: &mut [u8]) -> Result<()> {
+        let counter = self.next();
+        self.key.seal(counter, aad, buf)
+    }
+
+    pub fn open(&mut self, aad: &[u8], buf: &mut [u8]) -> Result<()> {
+        let counter = self.next();
+        self.key.open(counter, aad, buf)
     }
 }
 
@@ -338,6 +363,20 @@ mod tests {
                 rx.open(b"aad", &mut buf).unwrap();
                 assert_eq!(&buf[..msg.len()], msg);
             }
+        }
+    }
+
+    #[test]
+    fn frame_k_does_not_open_as_k_plus_one() {
+        for cipher in [Cipher::Aes256Gcm, Cipher::ChaCha20Poly1305] {
+            let key = FrameKey::new(cipher, &[6u8; 32]);
+            let mut buf = vec![3u8; 100 + TAG_LEN];
+            key.seal(41, b"aad", &mut buf).unwrap();
+            let mut wrong = buf.clone();
+            assert!(key.open(42, b"aad", &mut wrong).is_err());
+            assert!(key.open(40, b"aad", &mut buf.clone()).is_err());
+            key.open(41, b"aad", &mut buf).unwrap();
+            assert_eq!(&buf[..100], &[3u8; 100][..]);
         }
     }
 

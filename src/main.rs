@@ -54,6 +54,9 @@ enum Cmd {
         /// Skip reading every chunk back to check its digest.
         #[arg(long)]
         no_verify: bool,
+        /// Workers that decrypt, write, and verify chunks (0 = one per core).
+        #[arg(long, default_value_t = 0)]
+        threads: usize,
     },
     /// Send files or directories to a receiver.
     Send {
@@ -72,6 +75,9 @@ enum Cmd {
         chunk_size: u32,
         #[arg(long, value_enum, default_value_t = Cipher::Aes256Gcm)]
         cipher: Cipher,
+        /// Workers that read and encrypt chunks (0 = one per core).
+        #[arg(long, default_value_t = 0)]
+        threads: usize,
         #[arg(required = true)]
         paths: Vec<PathBuf>,
     },
@@ -113,6 +119,7 @@ fn run(cmd: Cmd) -> Result<()> {
             out,
             force,
             no_verify,
+            threads,
         } => {
             if let Some(path) = authorized {
                 allow.extend(load_authorized_keys(&path)?);
@@ -127,6 +134,7 @@ fn run(cmd: Cmd) -> Result<()> {
                 out_dir: out,
                 force,
                 verify: !no_verify,
+                threads,
             })?;
             eprintln!("public key {}", receiver.public_key());
             eprintln!("listening on {}", receiver.local_addr());
@@ -159,6 +167,7 @@ fn run(cmd: Cmd) -> Result<()> {
             connections,
             chunk_size,
             cipher,
+            threads,
             paths,
         } => {
             let cfg = SendConfig {
@@ -168,11 +177,11 @@ fn run(cmd: Cmd) -> Result<()> {
                 connections,
                 chunk_size,
                 cipher,
+                threads,
                 paths,
             };
             let progress = Arc::new(Progress::default());
-            let report =
-                with_progress("sent", &progress, || mjolnir::send(cfg, progress.clone()))?;
+            let report = with_progress("sent", &progress, || mjolnir::send(cfg, progress.clone()))?;
             summary(
                 "sent",
                 report.bytes_sent,

@@ -17,10 +17,11 @@ use anyhow::{Context, Result, anyhow, bail, ensure};
 use serde::Serialize;
 
 use crate::bitset::{AtomicBitset, PartState};
-use crate::crypto::{Cipher, CipherState, SessionKeys, TAG_LEN, handshake_responder};
+use crate::crypto::{Cipher, FrameKey, SessionKeys, TAG_LEN, handshake_responder};
 use crate::keys::{PrivateKey, PublicKey, require_nonempty};
 use crate::manifest::{ChunkSize, FileEntry, Manifest, chunk_count, chunk_span};
 use crate::net::{self, Io, tell_peer_about, unexpected};
+use crate::pool::{Buffers, InFlight, Pool, buffer_count, resolve_threads};
 use crate::posio::{read_exact_at, write_all_at};
 use crate::progress::{ActiveConnection, Cancelled, Phase, Progress, Stop};
 use crate::wire::{
@@ -40,6 +41,8 @@ pub struct RecvConfig {
     pub force: bool,
     /// Read every chunk back and check its digest before finishing.
     pub verify: bool,
+    /// Workers that open, write, and verify chunks; 0 means one per core.
+    pub threads: usize,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -89,6 +92,8 @@ const MAX_VERIFY_FAILURES: u8 = 3;
 /// Bytes of BLAKE3 kept per chunk in the sums file.
 const DIGEST_LEN: usize = 16;
 const MAX_VERIFY_THREADS: usize = 16;
+/// Connections the buffer pool is sized for; more still work, sharing it.
+const EXPECTED_CONNECTIONS: usize = 16;
 
 /// A control connection that finished the handshake.
 struct Handshaken {
@@ -188,6 +193,7 @@ impl Receiver {
         let result = self.receive(h.keys, &mut rx, &mut tx, progress);
         if let Err(e) = &result {
             tell_peer_about(e, progress, Some(&mut tx));
+            net::linger(rx.into_inner().into_stream());
         }
         let o = result?;
         Ok(RecvReport {
@@ -227,6 +233,20 @@ impl Receiver {
         tx.send(&have_msg(&targets))?;
         progress.set_phase(Phase::Transferring);
 
+        let pool = Pool::new(resolve_threads(self.cfg.threads));
+        let buf_len = manifest.chunk_size.get() as usize + TAG_LEN;
+        let buffers = Buffers::new(
+            buffer_count(pool.threads(), EXPECTED_CONNECTIONS, buf_len),
+            buf_len,
+        );
+        let starts = targets
+            .iter()
+            .scan(0, |next, t| {
+                let first = *next;
+                *next += t.present.len();
+                Some(first)
+            })
+            .collect();
         let session = Session {
             keys,
             cipher,
@@ -240,9 +260,20 @@ impl Receiver {
             checkpoint_lock: Mutex::new(()),
             pending_data: AtomicUsize::new(0),
             verify_failures: Mutex::new(HashMap::new()),
+            pool: &pool,
+            buffers: &buffers,
+            in_flight: InFlight::default(),
+            verify_run: VerifyRun {
+                starts,
+                cursor: AtomicU64::new(0),
+                failure: Mutex::new(None),
+            },
         };
         let checkpoints = Stop::default();
         let rounds = thread::scope(|s| {
+            for _ in 0..pool.threads() {
+                s.spawn(|| pool.work(|job| session.run(job)));
+            }
             s.spawn(|| accept_data(s, &self.listener, &session));
             s.spawn(|| {
                 while !checkpoints.wait(CHECKPOINT_EVERY) {
@@ -254,8 +285,12 @@ impl Receiver {
             let result = session.rounds(rx, tx);
             checkpoints.stop();
             session.sync.shut();
+            pool.close();
             result
         });
+        // Data connections still queued in the listener would wait out
+        // their hello deadline; hang up on them now.
+        while self.listener.accept().is_ok() {}
         if rounds.is_err()
             && let Err(e) = session.checkpoint()
         {
@@ -504,6 +539,39 @@ struct Session<'a> {
     pending_data: AtomicUsize,
     /// Verification failures per `(file, chunk)` this session.
     verify_failures: Mutex<HashMap<(u32, u64), u8>>,
+    pool: &'a Pool<RecvJob>,
+    buffers: &'a Buffers,
+    /// Frames handed to the pool and not yet landed, plus verify jobs.
+    in_flight: InFlight,
+    verify_run: VerifyRun,
+}
+
+/// Work for the pool.
+enum RecvJob {
+    /// Open frame `k` of `conn`, then land its chunk. `buf` holds the body.
+    Frame {
+        conn: Arc<RecvConn>,
+        k: u64,
+        header: [u8; HEADER_LEN],
+        buf: Vec<u8>,
+    },
+    /// Read chunks back from `verify_run.cursor` until none are left.
+    Verify,
+}
+
+/// A data connection as the pool sees it.
+struct RecvConn {
+    key: FrameKey,
+    /// Set when one of its frames fails to open; its reader then stops.
+    dead: AtomicBool,
+}
+
+/// Shared state of one verification pass.
+struct VerifyRun {
+    /// `starts[j]` is the global number of file j's first chunk.
+    starts: Vec<u64>,
+    cursor: AtomicU64,
+    failure: Mutex<Option<anyhow::Error>>,
 }
 
 impl Session<'_> {
@@ -517,6 +585,7 @@ impl Session<'_> {
                 }
                 Msg::RoundEnd { round, connections } => {
                     self.sync.end(round, connections, self.progress)?;
+                    self.in_flight.wait_idle();
                     if let Some(message) = self.fatal.lock().unwrap().take() {
                         bail!(message);
                     }
@@ -566,8 +635,9 @@ impl Session<'_> {
         }
     }
 
-    /// Syncs, then reads every chunk back on a small thread pool and
-    /// compares it with its digest. Mismatches become missing again.
+    /// Syncs, then reads every chunk back on the worker pool (at most
+    /// `MAX_VERIFY_THREADS` at once) and compares each with its digest.
+    /// Mismatches become missing again.
     fn verify_all(&self) -> Result<()> {
         for t in &self.targets {
             t.part.sync_data()?;
@@ -577,46 +647,69 @@ impl Session<'_> {
         let total_chunks: u64 = self.targets.iter().map(|t| t.present.len()).sum();
         self.progress.reset_counts();
         self.progress.set_totals(total_chunks, total_bytes);
-        // `starts[j]` is the global number of file j's first chunk.
-        let starts: Vec<u64> = self
-            .targets
-            .iter()
-            .scan(0, |next, t| {
-                let first = *next;
-                *next += t.present.len();
-                Some(first)
-            })
-            .collect();
-        let cursor = AtomicU64::new(0);
-        let threads = thread::available_parallelism()
-            .map_or(4, |n| n.get())
-            .min(MAX_VERIFY_THREADS);
-        let failure = Mutex::new(None);
-        thread::scope(|s| {
-            for _ in 0..threads {
-                s.spawn(|| {
-                    let mut buf = vec![0u8; self.manifest.chunk_size.get() as usize];
-                    while let n = cursor.fetch_add(1, Relaxed)
-                        && n < total_chunks
-                        && !self.progress.is_cancelled()
-                    {
-                        let file = starts.partition_point(|&first| first <= n) - 1;
-                        let (t, index) = (&self.targets[file], n - starts[file]);
-                        if let Err(e) = self.verify_chunk(file as u32, t, index, &mut buf) {
-                            *failure.lock().unwrap() = Some(e);
-                            return;
-                        }
-                    }
-                });
-            }
-        });
+        let run = &self.verify_run;
+        run.cursor.store(0, Relaxed);
+        for _ in 0..self.pool.threads().min(MAX_VERIFY_THREADS) {
+            self.in_flight.add();
+            self.pool.submit(RecvJob::Verify);
+        }
+        self.in_flight.wait_idle();
         if self.progress.is_cancelled() {
             return Err(Cancelled::Local.into());
         }
-        match failure.into_inner().unwrap() {
+        match run.failure.lock().unwrap().take() {
             Some(e) => Err(e),
             None => Ok(()),
         }
+    }
+
+    /// One pool worker's share of a verification pass.
+    fn verify_some(&self) {
+        let run = &self.verify_run;
+        let total = self.targets.iter().map(|t| t.present.len()).sum();
+        let mut buf = vec![0u8; self.manifest.chunk_size.get() as usize];
+        while let n = run.cursor.fetch_add(1, Relaxed)
+            && n < total
+            && !self.progress.is_cancelled()
+        {
+            let file = run.starts.partition_point(|&first| first <= n) - 1;
+            let (t, index) = (&self.targets[file], n - run.starts[file]);
+            if let Err(e) = self.verify_chunk(file as u32, t, index, &mut buf) {
+                *run.failure.lock().unwrap() = Some(e);
+                return;
+            }
+        }
+    }
+
+    /// Runs one pool job.
+    fn run(&self, job: RecvJob) {
+        match job {
+            RecvJob::Frame {
+                conn,
+                k,
+                header,
+                mut buf,
+            } => {
+                let h = FrameHeader::decode(&header);
+                let target = &self.targets[h.file_id as usize];
+                let body = &mut buf[..h.ct_len as usize];
+                let sid = &self.keys.session_id;
+                if open_frame(&conn.key, k, sid, &header, body).is_ok() {
+                    let len = body.len() - TAG_LEN;
+                    // A failed write is recorded in `fatal` for the round.
+                    let _ = self.land(target, h.chunk_index, &body[..len]);
+                } else if !conn.dead.swap(true, Relaxed) {
+                    eprintln!(
+                        "mjolnir: frame {k} (chunk {} of file {}) failed to authenticate; \
+                         dropping its connection",
+                        h.chunk_index, h.file_id
+                    );
+                }
+                self.buffers.give(buf);
+            }
+            RecvJob::Verify => self.verify_some(),
+        }
+        self.in_flight.done();
     }
 
     fn verify_chunk(&self, file: u32, t: &Target, index: u64, buf: &mut [u8]) -> Result<()> {
@@ -745,9 +838,13 @@ fn serve_data(session: &Session, stream: TcpStream) -> Result<()> {
     let _active = ActiveConnection::new(session.progress);
     hello_io.write_all(&[ADMITTED])?;
     drop(pending);
-    let round_over = || ended() || session.sync.is_closed(round);
-    let io = Io::new(hello_io.into_stream(), &round_over).idle(DATA_IDLE);
-    receive_frames(session, io, round, conn)
+    let conn = Arc::new(RecvConn {
+        key: FrameKey::new(session.cipher, &session.keys.data_key(round, conn)),
+        dead: AtomicBool::new(false),
+    });
+    let stop = || ended() || session.sync.is_closed(round) || conn.dead.load(Relaxed);
+    let io = Io::new(hello_io.into_stream(), &stop).idle(DATA_IDLE);
+    receive_frames(session, io, round, &conn, &stop)
 }
 
 /// Counts an admitted connection as closed for its round when dropped.
@@ -762,26 +859,33 @@ impl Drop for ClosedGuard<'_> {
     }
 }
 
-fn receive_frames(session: &Session, io: Io, round: u32, conn: u32) -> Result<()> {
-    let m = &session.manifest;
+/// The connection's reader: does I/O only. It checks each header, reads
+/// the body into a pooled buffer, numbers the frame, and hands it to the
+/// pool, which opens and lands it.
+fn receive_frames(
+    session: &Session,
+    io: Io,
+    round: u32,
+    conn: &Arc<RecvConn>,
+    stop: &dyn Fn() -> bool,
+) -> Result<()> {
     let sid = &session.keys.session_id;
-    let mut cipher = CipherState::new(session.cipher, &session.keys.data_key(round, conn));
     let mut reader = BufReader::with_capacity(256 << 10, io);
-    let mut body = vec![0u8; m.chunk_size.get() as usize + TAG_LEN];
-    loop {
-        let mut raw = [0u8; HEADER_LEN];
+    for k in 0u64.. {
+        let mut header = [0u8; HEADER_LEN];
         reader
-            .read_exact(&mut raw)
+            .read_exact(&mut header)
             .context("connection ended without the end marker")?;
         if session.sync.is_closed(round) {
             bail!("round {round} closed; dropping its late frames");
         }
-        let h = FrameHeader::decode(&raw);
+        ensure!(!conn.dead.load(Relaxed), "a frame failed to authenticate");
+        let h = FrameHeader::decode(&header);
         if h.is_end() {
             ensure!(h == FrameHeader::end(), "malformed end marker");
-            let tag = &mut body[..TAG_LEN];
-            reader.read_exact(tag)?;
-            return open_frame(&mut cipher, sid, &raw, tag).context("end marker");
+            let mut tag = [0u8; TAG_LEN];
+            reader.read_exact(&mut tag)?;
+            return open_frame(&conn.key, k, sid, &header, &mut tag).context("end marker");
         }
         let target = session
             .targets
@@ -799,12 +903,22 @@ fn receive_frames(session: &Session, io: Io, round: u32, conn: u32) -> Result<()
             "ct_len {} does not match chunk length {len}",
             h.ct_len
         );
-        let frame = &mut body[..h.ct_len as usize];
-        reader.read_exact(frame)?;
-        open_frame(&mut cipher, sid, &raw, frame)
-            .with_context(|| format!("chunk {} of file {}", h.chunk_index, h.file_id))?;
-        session.land(target, h.chunk_index, &frame[..len as usize])?;
+        let Some(mut buf) = session.buffers.take(stop) else {
+            bail!("connection stopped");
+        };
+        if let Err(e) = reader.read_exact(&mut buf[..h.ct_len as usize]) {
+            session.buffers.give(buf);
+            return Err(e.into());
+        }
+        session.in_flight.add();
+        session.pool.submit(RecvJob::Frame {
+            conn: conn.clone(),
+            k,
+            header,
+            buf,
+        });
     }
+    unreachable!("u64 frame numbers exhausted")
 }
 
 /// Round bookkeeping shared by the control thread and data threads.
