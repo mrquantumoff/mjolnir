@@ -9,9 +9,14 @@
 #   SIZE_MIB  file size in MiB (default 2048)
 #   REPEAT    runs per configuration; the table shows the median (default 3)
 #   PORT      listen port (default 7799)
+#   ROWS      only run rows whose "connections threads chunk cipher verify"
+#             matches this extended regex, e.g. ROWS='^8 0 1MiB'
 set -euo pipefail
+# Git Bash on Windows rewrites arguments that start with '/' into Windows
+# paths, and a base64 key can start with '/'.
+export MSYS_NO_PATHCONV=1
 
-root="$(cd "$(dirname "$0")/.." && pwd)"
+root="$(cd "$(dirname "$0")/.." && { pwd -W 2> /dev/null || pwd; })"
 work="${1:-$root/target/bench}"
 size_mib="${SIZE_MIB:-2048}"
 repeat="${REPEAT:-3}"
@@ -51,12 +56,16 @@ run_once() {
   if $have_typeperf; then
     typeperf '\Processor(_Total)\% Processor Time' -si 1 > "$work/cpu.txt" 2>&1 &
   fi
-  "$bin" send "127.0.0.1:$port" --key "$work/s.key" --peer "$rpub" \
-    -n "$n" --threads "$threads" -c "$chunk" --cipher "$cipher" "$src" 2> "$work/send.log"
+  if ! "$bin" send "127.0.0.1:$port" --key "$work/s.key" --peer "$rpub" \
+    -n "$n" --threads "$threads" -c "$chunk" --cipher "$cipher" "$src" 2> "$work/send.log"; then
+    kill "$rpid" 2> /dev/null || true
+    cat "$work/send.log" >&2
+    exit 1
+  fi
   wait "$rpid"
   local cpu="-"
   if $have_typeperf; then
-    taskkill //F //IM typeperf.exe > /dev/null 2>&1 || true
+    taskkill /F /IM typeperf.exe > /dev/null 2>&1 || true
     wait 2> /dev/null || true
     cpu="$(tr -d '\r' < "$work/cpu.txt" | grep '^"[0-9]' | cut -d, -f2 | tr -d '"' |
       awk 'NF { s += $1; c++ } END { if (c) printf "%.0f", s / c; else print "-" }')"
@@ -75,6 +84,7 @@ median() { sort -n | awk '{ v[NR] = $1 } END { print v[int((NR + 1) / 2)] }'; }
 echo "| connections | threads | chunk | cipher | verify | MiB/s (median of $repeat) | CPU % |"
 echo "|---|---|---|---|---|---|---|"
 bench() {
+  if [ -n "${ROWS:-}" ] && ! echo "$*" | grep -Eq "$ROWS"; then return; fi
   local runs
   runs="$(for _ in $(seq "$repeat"); do run_once "$@"; done)"
   local rate cpu
