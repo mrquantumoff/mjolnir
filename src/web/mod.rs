@@ -99,7 +99,7 @@ pub fn serve(cfg: ServeConfig) -> Result<()> {
         );
     }
     let url = server.url();
-    println!("mjolnir web UI: {url}");
+    println!("Mjolnir web UI: {url}");
     if open_browser && let Err(e) = open_in_browser(&url) {
         eprintln!("could not open a browser ({e}); open the URL above yourself");
     }

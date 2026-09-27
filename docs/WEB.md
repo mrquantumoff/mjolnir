@@ -12,7 +12,7 @@ mjolnir serve [--listen 127.0.0.1:7878] [--key PATH] [--no-open]
 It prints a URL like
 
 ```
-mjolnir web UI: http://127.0.0.1:7878/#token=3f9c0d6e1a2b4c5d6e7f8091a2b3c4d5
+Mjolnir web UI: http://127.0.0.1:7878/#token=3f9c0d6e1a2b4c5d6e7f8091a2b3c4d5
 ```
 
 and opens it in the default browser unless `--no-open` is given. Without
