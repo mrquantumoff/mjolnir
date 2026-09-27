@@ -51,6 +51,9 @@ enum Cmd {
         /// Overwrite existing files.
         #[arg(long)]
         force: bool,
+        /// Skip reading every chunk back to check its digest.
+        #[arg(long)]
+        no_verify: bool,
     },
     /// Send files or directories to a receiver.
     Send {
@@ -109,6 +112,7 @@ fn run(cmd: Cmd) -> Result<()> {
             listen,
             out,
             force,
+            no_verify,
         } => {
             if let Some(path) = authorized {
                 allow.extend(load_authorized_keys(&path)?);
@@ -122,6 +126,7 @@ fn run(cmd: Cmd) -> Result<()> {
                 authorized: allow,
                 out_dir: out,
                 force,
+                verify: !no_verify,
             })?;
             eprintln!("public key {}", receiver.public_key());
             eprintln!("listening on {}", receiver.local_addr());
@@ -132,8 +137,18 @@ fn run(cmd: Cmd) -> Result<()> {
                 report.bytes_received,
                 report.elapsed,
                 &format!(
-                    "{} files, {} chunks, {} rounds, from {}",
-                    report.files, report.chunks_received, report.rounds, report.peer
+                    "{} files, {} chunks, {} duplicates, {} repaired, {}, {} rounds, from {}",
+                    report.files,
+                    report.chunks_received,
+                    report.duplicate_chunks,
+                    report.repaired_chunks,
+                    if report.verified {
+                        "verified"
+                    } else {
+                        "not verified"
+                    },
+                    report.rounds,
+                    report.peer
                 ),
             );
         }
@@ -163,8 +178,16 @@ fn run(cmd: Cmd) -> Result<()> {
                 report.bytes_sent,
                 report.elapsed,
                 &format!(
-                    "{} files, {} chunks, {} rounds",
-                    report.files, report.chunks_sent, report.rounds
+                    "{} files, {} chunks, {} resent, {} rounds, receiver {}",
+                    report.files,
+                    report.chunks_sent,
+                    report.chunks_resent,
+                    report.rounds,
+                    if report.verified {
+                        "verified"
+                    } else {
+                        "did not verify"
+                    }
                 ),
             );
         }
@@ -207,7 +230,10 @@ fn with_progress<T: Send>(
                 continue;
             }
             let p = progress.snapshot();
-            if matches!(p.phase, Phase::Transferring | Phase::Finishing) {
+            if matches!(
+                p.phase,
+                Phase::Transferring | Phase::Verifying | Phase::Finishing
+            ) {
                 let rate = (p.bytes_done - last.1.min(p.bytes_done)) as f64
                     / MIB
                     / (now - last.0).as_secs_f64();

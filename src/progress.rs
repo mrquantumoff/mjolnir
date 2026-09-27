@@ -14,15 +14,18 @@ pub enum Phase {
     Connecting,
     Handshaking,
     Transferring,
+    /// The receiver is reading chunks back to check their digests.
+    Verifying,
     Finishing,
     Done,
     Failed,
 }
 
-const PHASES: [Phase; 6] = [
+const PHASES: [Phase; 7] = [
     Phase::Connecting,
     Phase::Handshaking,
     Phase::Transferring,
+    Phase::Verifying,
     Phase::Finishing,
     Phase::Done,
     Phase::Failed,

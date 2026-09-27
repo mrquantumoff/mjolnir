@@ -47,7 +47,11 @@ pub struct SendReport {
     /// Plaintext bytes of the chunks sent this session.
     pub bytes_sent: u64,
     pub chunks_sent: u64,
+    /// Chunks sent again in a later round of this session.
+    pub chunks_resent: u64,
     pub rounds: u32,
+    /// Whether the receiver read every chunk back and matched its digest.
+    pub verified: bool,
     pub elapsed: Duration,
 }
 
@@ -78,6 +82,9 @@ struct Ctx<'a> {
     progress: &'a Progress,
     chunks_sent: AtomicU64,
     bytes_sent: AtomicU64,
+    chunks_resent: AtomicU64,
+    /// Per file, the chunks sent at least once this session.
+    sent: Vec<AtomicBitset>,
     /// A local read failure; fatal for the transfer, unlike network errors.
     fatal: Mutex<Option<anyhow::Error>>,
 }
@@ -120,23 +127,31 @@ fn run(cfg: &SendConfig, progress: &Progress) -> Result<SendReport> {
         progress,
         chunks_sent: AtomicU64::new(0),
         bytes_sent: AtomicU64::new(0),
+        chunks_resent: AtomicU64::new(0),
+        sent: (0..manifest.files.len() as u32)
+            .map(|j| AtomicBitset::new(manifest.chunk_count(j)))
+            .collect(),
         fatal: Mutex::new(None),
     };
     let result = transfer(&ctx, cfg.connections, &mut tx, &mut rx);
     if let Err(e) = &result {
         tell_peer_about(e, progress, Some(&mut tx));
     }
+    let (rounds, verified) = result?;
     Ok(SendReport {
         files: manifest.files.len(),
         bytes_sent: ctx.bytes_sent.load(Relaxed),
         chunks_sent: ctx.chunks_sent.load(Relaxed),
-        rounds: result?,
+        chunks_resent: ctx.chunks_resent.load(Relaxed),
+        rounds,
+        verified,
         elapsed: start.elapsed(),
     })
 }
 
-/// Runs rounds until the receiver reports `Finished`. Returns the round count.
-fn transfer(ctx: &Ctx, connections: usize, tx: &mut Tx, rx: &mut Rx) -> Result<u32> {
+/// Runs rounds until the receiver reports `Finished`. Returns the round
+/// count and whether the receiver verified the files.
+fn transfer(ctx: &Ctx, connections: usize, tx: &mut Tx, rx: &mut Rx) -> Result<(u32, bool)> {
     let m = ctx.manifest;
     tx.send(&Msg::Offer {
         chunk_size: m.chunk_size.get(),
@@ -172,12 +187,16 @@ fn transfer(ctx: &Ctx, connections: usize, tx: &mut Tx, rx: &mut Rx) -> Result<u
         // Read even if the send failed: the peer may have said why it left.
         let reply = rx.recv().map_err(|e| sent.err().unwrap_or(e))?;
         match reply {
-            Msg::Finished => return Ok(round + 1),
+            Msg::Finished { verified } => return Ok((round + 1, verified)),
             Msg::Have { bitmaps } => have = parse_have(m, &bitmaps)?,
             other => return Err(unexpected(other, "Have or Finished")),
         }
         ctx.progress.set_phase(Phase::Transferring);
-        if missing_count(&have) >= queue.len() as u64 {
+        // Progress means some chunk this round carried is now held. Chunks
+        // the receiver's verification sent back to missing do not count
+        // against the round.
+        let landed = queue.iter().any(|c| have[c.file as usize].get(c.index));
+        if !queue.is_empty() && !landed {
             failed_rounds += 1;
             if failed_rounds == MAX_FAILED_ROUNDS {
                 bail!("{MAX_FAILED_ROUNDS} rounds in a row made no progress");
@@ -255,6 +274,9 @@ fn data_connection(
         seal_frame(&mut cipher, sid, chunk_header(chunk, len), frame)?;
         stream.write_all(frame)?;
         ctx.chunks_sent.fetch_add(1, Relaxed);
+        if !ctx.sent[chunk.file as usize].set(chunk.index) {
+            ctx.chunks_resent.fetch_add(1, Relaxed);
+        }
         ctx.bytes_sent.fetch_add(u64::from(len), Relaxed);
         ctx.progress.add_chunk(u64::from(len));
     }
@@ -316,10 +338,6 @@ fn missing(have: &[AtomicBitset]) -> Vec<ChunkId> {
         }
     }
     queue
-}
-
-fn missing_count(have: &[AtomicBitset]) -> u64 {
-    have.iter().map(|b| b.len() - b.count_ones()).sum()
 }
 
 /// Walks the inputs. A file is named by its file name; a directory's files

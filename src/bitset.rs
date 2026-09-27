@@ -8,7 +8,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
-/// Bit `k` is chunk `k`. Bits are only ever set, never cleared.
+/// Bit `k` is chunk `k`.
 pub struct AtomicBitset {
     words: Vec<AtomicU64>,
     len: u64,
@@ -44,6 +44,12 @@ impl AtomicBitset {
     pub fn set(&self, k: u64) -> bool {
         let mask = 1u64 << (k % 64);
         self.words[(k / 64) as usize].fetch_or(mask, Ordering::AcqRel) & mask == 0
+    }
+
+    /// Clears bit `k`; returns whether it was set.
+    pub fn clear(&self, k: u64) -> bool {
+        let mask = 1u64 << (k % 64);
+        self.words[(k / 64) as usize].fetch_and(!mask, Ordering::AcqRel) & mask != 0
     }
 
     pub fn get(&self, k: u64) -> bool {
@@ -119,6 +125,10 @@ mod tests {
         assert!(b.set(129));
         assert!(b.get(129) && b.get(64) && !b.get(1));
         assert_eq!(b.count_ones(), 3);
+        assert!(b.clear(64));
+        assert!(!b.clear(64));
+        assert!(!b.get(64));
+        assert!(b.set(64));
         assert!(!b.is_full());
         for k in 0..130 {
             b.set(k);

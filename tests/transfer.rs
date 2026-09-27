@@ -50,6 +50,7 @@ fn start_receiver(key: PrivateKey, authorized: Vec<PublicKey>, out: &Path) -> Ru
         authorized,
         out_dir: out.to_owned(),
         force: false,
+        verify: true,
     })
     .unwrap();
     let progress = Arc::new(Progress::default());
@@ -233,17 +234,21 @@ fn resume_sends_only_missing_chunks_and_rewrites_absent_bytes() {
     let out = TempDir::new().unwrap();
 
     let mut part = content.clone();
+    let mut sums = vec![0u8; chunks as usize * 16];
     let have = AtomicBitset::new(chunks);
     for k in 0..chunks {
         let span = (k * CHUNK as u64) as usize
             ..((k + 1) * CHUNK as u64).min(content.len() as u64) as usize;
         if k % 2 == 0 {
             have.set(k);
+            let digest = blake3::hash(&content[span]);
+            sums[k as usize * 16..][..16].copy_from_slice(&digest.as_bytes()[..16]);
         } else {
             part[span].fill(0xAA);
         }
     }
     fs::write(out.path().join("big.bin.gorynych-part"), &part).unwrap();
+    fs::write(out.path().join("big.bin.gorynych-sums"), &sums).unwrap();
     PartState {
         size: content.len() as u64,
         mtime: mtime_of(&fs::metadata(&file).unwrap()),

@@ -57,7 +57,9 @@ pub enum Msg {
         round: u32,
         connections: u32,
     },
-    Finished,
+    Finished {
+        verified: bool,
+    },
     Error {
         message: String,
     },
@@ -356,7 +358,7 @@ mod tests {
         let tag = |m: &Msg| postcard::to_allocvec(m).unwrap()[0];
         assert_eq!(tag(&Msg::Have { bitmaps: vec![] }), 1);
         assert_eq!(tag(&Msg::RoundStart { round: 0 }), 2);
-        assert_eq!(tag(&Msg::Finished), 4);
+        assert_eq!(tag(&Msg::Finished { verified: true }), 4);
         assert_eq!(tag(&Msg::Cancel), 6);
     }
 }

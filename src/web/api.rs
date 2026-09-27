@@ -306,6 +306,7 @@ fn start_receive(app: &App, req: ReceiveRequest) -> Result<Reply, ApiError> {
         authorized: authorized.clone(),
         out_dir: out_dir.clone(),
         force: req.force,
+        verify: true,
     })
     .map_err(|e| ApiError::field("listen", format!("{e:#}")))?;
     let bound_addr = receiver.local_addr();
@@ -389,6 +390,7 @@ fn phase_name(p: Phase) -> &'static str {
         Phase::Connecting => "connecting",
         Phase::Handshaking => "handshaking",
         Phase::Transferring => "transferring",
+        Phase::Verifying => "verifying",
         Phase::Finishing => "finishing",
         Phase::Done => "done",
         Phase::Failed => "failed",
