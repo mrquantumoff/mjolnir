@@ -24,7 +24,7 @@ use crate::manifest::{ChunkId, ChunkSize, FileEntry, Manifest, chunk_count, chun
 use crate::net::{self, Io, tell_peer_about, unexpected};
 use crate::pool::{Buffers, InFlight, Pool, buffer_count, resolve_threads};
 use crate::posio::read_exact_at;
-use crate::progress::{ActiveConnection, Cancelled, Phase, Progress};
+use crate::progress::{ActiveConnection, Cancelled, Phase, PhaseTimes, Progress};
 use crate::wire::{
     self, ADMITTED, CHALLENGE_LEN, ConnKind, ControlRx, ControlTx, DIGESTS_PER_MSG, FrameHeader,
     HEADER_LEN, Msg, Role, chunk_header, encode_hello, seal_frame,
@@ -73,6 +73,7 @@ pub struct SendReport {
     pub warnings: Vec<String>,
     /// Symbolic links and special files that were not sent.
     pub skipped: Vec<String>,
+    pub phase_times: PhaseTimes,
     pub elapsed: Duration,
 }
 
@@ -274,6 +275,7 @@ fn run(cfg: &SendConfig, progress: &Progress) -> Result<SendReport> {
         file_hashes: done.file_hashes,
         warnings,
         skipped,
+        phase_times: progress.phase_summary(),
         elapsed: start.elapsed(),
     })
 }

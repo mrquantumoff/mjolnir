@@ -27,7 +27,7 @@ use crate::manifest::{ChunkSize, FileEntry, Manifest, chunk_count, chunk_span};
 use crate::net::{self, Io, tell_peer_about, unexpected};
 use crate::pool::{Buffers, InFlight, Pool, buffer_count, resolve_threads};
 use crate::posio::{read_exact_at, write_all_at};
-use crate::progress::{ActiveConnection, Cancelled, Phase, Progress, Stop};
+use crate::progress::{ActiveConnection, Cancelled, Phase, PhaseTimes, Progress, Stop};
 use crate::wire::{
     self, ADMITTED, CHALLENGE_LEN, ConnKind, ControlRx, ControlTx, FrameHeader, HEADER_LEN,
     HELLO_LEN, Msg, REJECTED, Role, check_hello, open_frame,
@@ -75,6 +75,8 @@ pub struct RecvReport {
     /// Always empty on the receiver; the sender lists what it skipped.
     pub skipped: Vec<String>,
     pub rounds: u32,
+    /// For this session; `connect` is its handshake.
+    pub phase_times: PhaseTimes,
     pub elapsed: Duration,
 }
 
@@ -199,6 +201,7 @@ impl Receiver {
     fn session(&self, h: Handshaken, progress: &Progress) -> Result<RecvReport> {
         let start = Instant::now();
         progress.reset_counts();
+        progress.reset_phase_times();
         progress.set_phase(Phase::Handshaking);
         let cancelled = || progress.is_cancelled();
         let control = Io::new(h.stream, &cancelled);
@@ -224,6 +227,7 @@ impl Receiver {
             warnings: o.finish.warnings,
             skipped: Vec::new(),
             rounds: o.finish.rounds,
+            phase_times: progress.phase_summary(),
             elapsed: start.elapsed(),
         })
     }
@@ -646,6 +650,7 @@ impl Session<'_> {
                 match &finalized {
                     None => {
                         tx.send(&Msg::Delivered)?;
+                        self.progress.set_phase(Phase::Finishing);
                         finalized = Some(self.await_finalize(rx)?);
                     }
                     Some(done) => self.check_repairs(done)?,

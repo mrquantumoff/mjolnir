@@ -26,6 +26,6 @@ pub use keys::{
     PrivateKey, PublicKey, default_key_path, load_authorized_keys, parse_authorized_keys,
 };
 pub use manifest::parse_size;
-pub use progress::{Cancelled, Phase, Progress, ProgressSnapshot};
+pub use progress::{Cancelled, Phase, PhaseTimes, Progress, ProgressSnapshot};
 pub use recv::{Receiver, RecvConfig, RecvReport, recv};
 pub use send::{SendConfig, SendReport, send};

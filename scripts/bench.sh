@@ -45,9 +45,11 @@ spub="$("$bin" keygen --out "$work/s.key" 2>/dev/null)"
 rpub="$("$bin" keygen --out "$work/r.key" 2>/dev/null)"
 
 cores() { sed -n 's/^cpu .* s, \([0-9.]*\) cores busy.*/\1/p' "$1"; }
+transfer_rate() { sed -n 's/^transfer [0-9.]* s (\([0-9]*\) MiB\/s).*/\1/p' "$1"; }
 
-# One transfer; prints "<MiB/s> <sender cores> <receiver cores> <machine CPU %>"
-# and leaves the receiver's phase line in $work/phases.
+# One transfer; prints "<MiB/s> <receiver transfer-phase MiB/s> <sender cores>
+# <receiver cores> <machine CPU %>" and leaves both sides' phase lines in
+# $work/phases.
 run_once() {
   local n="$1" threads="$2" chunk="$3" cipher="$4" verify="$5" hash="$6" mode="$7"
   local out="$work/out" recv_flags=() send_flags=() recv_env="" send_env=""
@@ -96,15 +98,16 @@ run_once() {
       fi
       ;;
   esac
-  grep '^phases:' "$work/recv.log" > "$work/phases" || true
+  { sed -n 's/^transfer/receiver: transfer/p' "$work/recv.log"
+    sed -n 's/^transfer/sender:   transfer/p' "$work/send.log"; } > "$work/phases"
   echo "$(sed -n 's/^sent .* s, \([0-9.]*\) MiB\/s.*/\1/p' "$work/send.log") \
-$(cores "$work/send.log") $(cores "$work/recv.log") $cpu"
+$(transfer_rate "$work/recv.log") $(cores "$work/send.log") $(cores "$work/recv.log") $cpu"
 }
 
 median() { sort -n | awk '{ v[NR] = $1 } END { print v[int((NR + 1) / 2)] }'; }
 
-echo "| connections | threads | chunk | cipher | verify | hash | mode | MiB/s | sender cores | receiver cores | machine CPU % |"
-echo "|---|---|---|---|---|---|---|---|---|---|---|"
+echo "| connections | threads | chunk | cipher | verify | hash | mode | MiB/s | transfer phase MiB/s | sender cores | receiver cores | machine CPU % |"
+echo "|---|---|---|---|---|---|---|---|---|---|---|---|"
 : > "$work/phase-table"
 bench() {
   if [ -n "${ROWS:-}" ] && ! echo "$*" | grep -Eq "$ROWS"; then return; fi
@@ -113,8 +116,8 @@ bench() {
   col() { echo "$runs" | cut -d' ' -f"$1" | median; }
   local threads="$2"
   [ "$threads" = 0 ] && threads=auto
-  echo "| $1 | $threads | $3 | $4 | $5 | $6 | $7 | $(col 1) | $(col 2) | $(col 3) | $(col 4) |"
-  echo "$* -> $(cat "$work/phases")" >> "$work/phase-table"
+  echo "| $1 | $threads | $3 | $4 | $5 | $6 | $7 | $(col 1) | $(col 2) | $(col 3) | $(col 4) | $(col 5) |"
+  { echo "$*"; sed 's/^/  /' "$work/phases"; } >> "$work/phase-table"
 }
 for n in 1 4 8 16; do bench "$n" 0 1MiB aes256gcm on off disk; done
 for chunk in 4K 16K 256K 4MiB; do bench 8 0 "$chunk" aes256gcm on off disk; done
@@ -129,6 +132,6 @@ for cipher in aes256gcm chacha20poly1305; do
 done
 rm -rf "$work/out"
 echo
-echo "Receiver time per phase (last run of each row):"
+echo "Time per phase (last run of each row):"
 sed 's/^/    /' "$work/phase-table"
 echo "all disk-writing outputs matched SHA-256 $want" >&2

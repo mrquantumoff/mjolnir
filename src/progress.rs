@@ -76,6 +76,22 @@ impl Default for Progress {
     }
 }
 
+/// Time a transfer spent in each stage. On the sender, `finalize` also
+/// covers waiting for the receiver to verify, and `verify` stays zero.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
+pub struct PhaseTimes {
+    /// Connecting and the handshake (on the sender, also walking the inputs).
+    pub connect: Duration,
+    /// Data rounds.
+    pub transfer: Duration,
+    /// The receiver's read-back.
+    pub verify: Duration,
+    /// The `--hash` re-read and comparison.
+    pub hash: Duration,
+    /// From the last round's end to `Finished`.
+    pub finalize: Duration,
+}
+
 /// A plain copy of [`Progress`] at one instant.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 pub struct ProgressSnapshot {
@@ -131,6 +147,30 @@ impl Progress {
     pub(crate) fn set_totals(&self, chunks: u64, bytes: u64) {
         self.chunks_total.store(chunks, Relaxed);
         self.bytes_total.store(bytes, Relaxed);
+    }
+
+    /// Starts phase accounting over, for a new receiver session.
+    pub(crate) fn reset_phase_times(&self) {
+        for ns in &self.phase_ns {
+            ns.store(0, Relaxed);
+        }
+        self.phase_began.store(self.now_ns(), Relaxed);
+    }
+
+    /// The phase times grouped the way the reports show them.
+    pub fn phase_summary(&self) -> PhaseTimes {
+        let mut t = PhaseTimes::default();
+        for (phase, d) in self.phase_times() {
+            match phase {
+                Phase::Connecting | Phase::Handshaking => t.connect += d,
+                Phase::Transferring => t.transfer += d,
+                Phase::Verifying => t.verify += d,
+                Phase::Hashing => t.hash += d,
+                Phase::Finishing => t.finalize += d,
+                Phase::Done | Phase::Failed => {}
+            }
+        }
+        t
     }
 
     pub(crate) fn reset_counts(&self) {

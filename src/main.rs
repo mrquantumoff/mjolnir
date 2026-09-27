@@ -9,7 +9,7 @@ use clap::{Parser, Subcommand};
 
 use mjolnir::filemap::{ApplyPolicy, Preserve};
 use mjolnir::{
-    Cipher, Phase, PrivateKey, Progress, PublicKey, Receiver, RecvConfig, SendConfig,
+    Cipher, Phase, PhaseTimes, PrivateKey, Progress, PublicKey, Receiver, RecvConfig, SendConfig,
     load_authorized_keys, parse_size, web,
 };
 
@@ -164,6 +164,7 @@ fn run(cmd: Cmd) -> Result<()> {
                 "received",
                 report.bytes_received,
                 report.elapsed,
+                report.phase_times,
                 &format!(
                     "{} files, {} chunks, {} duplicates, {} repaired, {}, {} rounds, from {}",
                     report.files,
@@ -211,6 +212,7 @@ fn run(cmd: Cmd) -> Result<()> {
                 "sent",
                 report.bytes_sent,
                 report.elapsed,
+                report.phase_times,
                 &format!(
                     "{} files, {} chunks, {} resent, {} rounds, receiver {}",
                     report.files,
@@ -281,21 +283,7 @@ fn with_progress<T: Send>(
             }
             last = (now, p.bytes_done);
         }
-        let result = worker.join().expect("transfer thread panicked");
-        let phases: Vec<String> = progress
-            .phase_times()
-            .into_iter()
-            .filter(|(p, _)| !matches!(p, Phase::Done | Phase::Failed))
-            .map(|(p, d)| {
-                format!(
-                    "{} {:.2} s",
-                    format!("{p:?}").to_lowercase(),
-                    d.as_secs_f64()
-                )
-            })
-            .collect();
-        eprintln!("phases: {}", phases.join(", "));
-        result
+        worker.join().expect("transfer thread panicked")
     })
 }
 
@@ -345,7 +333,7 @@ fn report_files(hashed: bool, file_hashes: &[(String, String)], warnings: &[Stri
     }
 }
 
-fn summary(verb: &str, bytes: u64, elapsed: Duration, detail: &str) {
+fn summary(verb: &str, bytes: u64, elapsed: Duration, phases: PhaseTimes, detail: &str) {
     let secs = elapsed.as_secs_f64();
     if let Some(cpu) = process_cpu() {
         eprintln!(
@@ -358,5 +346,13 @@ fn summary(verb: &str, bytes: u64, elapsed: Duration, detail: &str) {
         "{verb} {bytes} bytes ({:.1} MiB) in {secs:.2} s, {:.1} MiB/s ({detail})",
         bytes as f64 / MIB,
         bytes as f64 / MIB / secs.max(1e-9)
+    );
+    let t = phases.transfer.as_secs_f64();
+    eprintln!(
+        "transfer {t:.2} s ({:.0} MiB/s), verify {:.2} s, hash {:.2} s, finalize {:.2} s",
+        bytes as f64 / MIB / t.max(1e-9),
+        phases.verify.as_secs_f64(),
+        phases.hash.as_secs_f64(),
+        phases.finalize.as_secs_f64()
     );
 }
