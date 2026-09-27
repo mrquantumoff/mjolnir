@@ -9,7 +9,7 @@ use std::time::{Instant, SystemTime};
 use serde::Serialize;
 
 use super::api::JobSpec;
-use crate::Progress;
+use crate::{Cancelled, Progress};
 
 pub type JobId = u64;
 
@@ -91,10 +91,9 @@ impl Jobs {
         );
         let jobs = Arc::clone(self);
         std::thread::spawn(move || {
-            let result = work(progress.clone());
-            let outcome = match result {
+            let outcome = match work(progress) {
                 Ok(report) => Outcome::Done(report),
-                Err(_) if progress.cancel.load(Ordering::Relaxed) => Outcome::Cancelled,
+                Err(e) if e.downcast_ref() == Some(&Cancelled::Local) => Outcome::Cancelled,
                 Err(e) => Outcome::Failed(format!("{e:#}")),
             };
             if let Some(job) = jobs.lock().get_mut(&id) {

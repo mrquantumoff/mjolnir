@@ -26,6 +26,7 @@ pub struct App {
 
 impl App {
     pub fn new(key: PrivateKey, key_path: PathBuf) -> Self {
+        let key_path = std::path::absolute(&key_path).unwrap_or(key_path);
         App {
             key,
             key_path,

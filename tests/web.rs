@@ -157,7 +157,7 @@ fn identity_returns_the_public_key() {
     let r = get(&ui, "/api/identity");
     assert_eq!(r.status, 200);
     assert_eq!(r.body["public_key"], ui.public_key);
-    assert_eq!(r.body["key_path"], "test-key");
+    assert!(r.body["key_path"].as_str().unwrap().ends_with("test-key"));
 }
 
 #[test]
@@ -418,7 +418,7 @@ fn cancel_a_running_send() {
     let c = post(&ui, &format!("/api/transfers/{recv_id}/cancel"), json!({}));
     assert_eq!(c.status, 200);
     let receiver = wait_until_ended(&ui, recv_id);
-    assert_ne!(receiver["state"], "done", "{receiver}");
+    assert_eq!(receiver["state"], "cancelled", "{receiver}");
 
     let del = raw(&ui, "DELETE", &format!("/api/transfers/{id}"), &[], b"");
     assert_eq!(del.status, 204);
