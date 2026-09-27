@@ -123,13 +123,16 @@ starting at 0):
 | `Have { bitmaps }`                   | R to S    | per file, the chunks the receiver already holds           |
 | `RoundStart { round }`               | S to R    | sender is about to open data connections for `round`      |
 | `RoundEnd { round, connections }`    | S to R    | sender's data connections for `round` are closed; `connections` is how many the receiver admitted |
-| `Finished { verified }`              | R to S    | every chunk is present, synced, verified unless `verified` is false, and renamed into place |
+| `Delivered`                          | R to S    | every chunk is present and verified; ready for `Finalize` |
+| `Digests { file, first, digests }`   | S to R    | optional hash check: the sender's freshly re-read 16-byte digests for chunks `first..` of `file` |
+| `Finalize { hash, map }`             | S to R    | end of data; `hash` says whether `Digests` were sent; `map` is the file map |
+| `Finished { verified, hashed, warnings }` | R to S | files renamed into place, file map applied; `warnings` lists metadata that could not be applied |
 | `Error { message }`                  | both      | ends the session; the sender exits, the receiver checkpoints and waits again |
 | `Cancel`                             | both      | the user cancelled; handled like `Error`, reported as a cancel |
 
 Field encodings: `chunk_size` is a `u32`; `cipher` is an enum
 (`Aes256Gcm` = 0, `ChaCha20Poly1305` = 1); each file is
-`{ path: string, size: u64, mtime: u64 }` with `mtime` in nanoseconds since
+`{ path: [bytes], size: u64, mtime: u64 }` with `mtime` in nanoseconds since
 the Unix epoch (0 if unknown); `round` and `connections` are `u32`. `bitmaps`
 holds one byte string per file, in offer order, of exactly
 `ceil(chunk_count / 8)` bytes: chunk `k` is bit `k % 8` (least significant
@@ -137,18 +140,16 @@ first) of byte `k / 8`. The sender rejects a `Have` whose shape does not
 match the offer, and refuses up front to offer more chunks than a `Have`
 could carry in one 64 MiB message.
 
-`path` uses `/` separators and is relative. The receiver rejects absolute
-paths, drive or UNC prefixes, `\`, empty components, `.` and `..` components,
-components containing `:` or NUL, components ending in `.` or a space,
-Windows device names (`CON`, `PRN`, `AUX`, `NUL`, `COM1` to `COM9`, `LPT1`
-to `LPT9`, with or without an extension), paths ending in `.mjolnir-part`,
-`.mjolnir-state`, `.mjolnir-state.tmp`, or `.mjolnir-sums`, and paths
-that are equal after lowercasing. Every rule applies on every OS, so the
-same offer is valid or invalid everywhere. On Windows `a:b` names an NTFS
-stream, `C:x` joined onto a directory replaces it, `a.` and `a ` both open
-`a`, and `nul` opens a device; case-insensitive file systems (Windows,
-macOS) treat `README` and `readme` as one file. Such files therefore cannot
-be sent. `file_id` is the index into `files`.
+`path` is a list of components, each a byte string: the file's raw name,
+not necessarily UTF-8 (see "File names"). The receiver rejects empty paths,
+empty components, `.` and `..` components, components containing NUL or
+`/`, paths deeper than 256 components or longer than 4096 bytes, paths
+ending in `.mjolnir-part`, `.mjolnir-state`, `.mjolnir-state.tmp`, or
+`.mjolnir-sums`, and paths whose local names (after the mapping in "File
+names") are equal after lowercasing. Case-insensitive file systems (Windows,
+macOS) treat `README` and `readme` as one file, so the rule applies on
+every OS and the same offer is valid or invalid everywhere. `file_id` is
+the index into `files`.
 
 `chunk_size` is between 4 KiB and 64 MiB. File `j` has
 `ceil(size / chunk_size)` chunks. Chunk `k` covers bytes
@@ -173,11 +174,27 @@ loop round = 0, 1, ...:
         R syncs, reads every chunk back and checks its digest
         (see "Verification"); mismatches become missing again
     if every chunk is still present:
-        R renames files into place
-        R -> S : Finished { verified }   (done)
+        if the data is already finalized (a hash repair round just ended):
+            go to APPLY
+        R -> S : Delivered
+        if the sender's hash check is on (see "Hash check"):
+            S re-reads every file and computes chunk digests
+            S -> R : Digests { file, first, digests }   (repeated)
+        S -> R : Finalize { hash, map }
+        if hash: R compares, and mismatched chunks become missing
+        if anything became missing:
+            R -> S : Have     (repair round; loop continues)
+        APPLY:
+        R renames files into place and applies the file map
+        R -> S : Finished { verified, hashed, warnings }   (done)
     else:
         R -> S : Have         (sender sends what is still missing)
 ```
+
+After sending `Finalize`, the sender answers every `Have` with another
+round, as before, until `Finished` arrives. `Delivered` comes only once per
+session. When a hash repair round completes, the receiver applies the file
+map it already holds without asking again.
 
 Either side may send `Error` or `Cancel` at any point after the handshake
 and then close every connection.
@@ -197,6 +214,134 @@ differs from the `Offer`, the source changed underneath the transfer: the
 sender sends `Error` and fails instead of finishing with mixed old and new
 bytes. The receiver's saved state then no longer matches the file, so the
 next run starts that file over.
+
+## File names
+
+Names travel as raw bytes, so every name that exists on the sender's disk
+can be sent: names containing `:`, `*`, `?`, `\`, or control characters,
+names ending in `.` or a space, names like `CON` or `aux.txt`, and names
+that are not valid UTF-8. Each side maps between the wire bytes and what
+its file system can store, using one reversible escape. **Byte `b` is
+escaped as the code point U+F000 + b**, from the Unicode Private Use Area.
+This is the same convention Cygwin and WSL use for these characters on
+Windows, so their tools display such names the same way.
+
+Sender, reading names:
+
+- Unix: the component's raw `OsStr` bytes.
+- Windows: the UTF-16 name encoded as WTF-8, so unpaired surrogates survive.
+  Every code point in U+F001 to U+F0FF is then turned back into its byte.
+  A name escaped by an earlier mjolnir, Cygwin, or WSL receiver therefore
+  goes back out as the original name.
+
+Receiver, creating names:
+
+- Linux and other Unix except macOS: the bytes as they are.
+- macOS: APFS stores names as UTF-8 and rejects invalid sequences, so each
+  byte of an invalid UTF-8 sequence is escaped. Valid UTF-8 is unchanged.
+- Windows: valid UTF-8 is decoded, and each byte of an invalid sequence is
+  escaped. Then these characters are escaped: `\ : * ? " < > |`, U+0001 to
+  U+001F, a trailing `.` or space, and the first character of a Windows
+  device name (`CON`, `PRN`, `AUX`, `NUL`, `COM1` to `COM9`, `LPT1` to
+  `LPT9`, with or without an extension, in any case). The result never
+  contains a separator, a drive, or a stream, and never opens a device. All
+  file operations use `\\?\` verbatim paths, so paths longer than 260
+  characters work.
+
+Round trips are exact. A name sent from Linux to Windows and back arrives
+with the same bytes it started with. The one ambiguity: a genuine file on
+Windows whose name contains a character in U+F001 to U+F0FF is read as the
+escaped byte when sent. Cygwin and WSL have the same limitation.
+
+Terminal output, logs, and the web UI show names lossily (invalid bytes as
+U+FFFD). Only the display changes; the file itself gets the exact name.
+
+Symbolic links and other special files are not transferred. The sender
+skips them, lists them in a warning, and does not follow links into
+directories.
+
+## File map
+
+Data comes first and metadata last. Once every chunk is delivered, the
+sender sends a file map in `Finalize`. The receiver applies it after renaming
+every file into place, because writing into a directory changes its mtime,
+and a read-only directory would block the writes.
+
+```
+FileMap { entries: [Entry] }
+Entry {
+    path:  [bytes],               same encoding as Offer paths
+    kind:  File { file_id } | Dir,
+    mode:  Option<u32>,           permission bits (st_mode & 0o7777)
+    mtime: Option<i64>,           ns since the Unix epoch
+    atime: Option<i64>,
+    owner: Option<(u32, u32)>,    uid, gid
+}
+```
+
+The map lists every sent file and every directory under the sent roots,
+including empty directories. **Empty directories are always recreated,
+whatever the preserve options.** The receiver validates each entry's path
+exactly like an `Offer` path. A `File` entry's path must match its
+`file_id` in the offer.
+
+What the sender fills in is chosen with `send --preserve`, a comma-separated
+list:
+
+| Item    | Default | Filled field | Source on Windows senders |
+|---------|---------|--------------|---------------------------|
+| `perms` | on      | `mode`       | `0o644` files, `0o755` dirs, without the write bits when the read-only attribute is set |
+| `times` | off     | `mtime`, `atime` | file times |
+| `owner` | off     | `owner`      | not available, left empty |
+
+`--preserve none` sends only the directory structure.
+
+The receiver applies the map in this order. First it creates every
+directory. Then it applies each file's metadata. Last it applies each
+directory's metadata, deepest first. Its policy guards against a hostile or
+careless sender:
+
+- **Mode.** On Unix it sets `mode & 0o777`. The setuid, setgid, and sticky
+  bits are dropped unless `recv --allow-special-bits` is given. On Windows,
+  a mode without the owner-write bit (`0o200`) sets the read-only attribute.
+  Windows ACLs are not transferred.
+- **Times.** It sets mtime and atime where the platform supports them.
+- **Owner.** It chowns only with `recv --allow-owner`, only when running as
+  root, and only on Unix. Otherwise it ignores the field and adds one
+  warning.
+
+A metadata failure never fails the transfer. The data is already in place,
+so each failure becomes a line in `Finished.warnings`, printed on both
+sides. Applying the map is idempotent. If a crash happens between the
+renames and the map, the files are complete and only their metadata is
+missing.
+
+## Hash check
+
+The per-chunk AEAD tags and the receiver's read-back verification prove
+that the receiver holds exactly what the sender read during the transfer.
+`send --hash` adds an end-to-end check that also catches the sender's own
+read going wrong, or a source that changed without its size or mtime
+changing.
+
+Once the receiver reports `Delivered`, the sender reads every file again and
+computes each chunk's 16-byte digest, `BLAKE3(chunk plaintext)`, in its worker
+pool, all chunks in parallel. It streams the digests in `Digests` messages of
+at most 1,048,576 digests each. The receiver compares them with its
+`.mjolnir-sums` entries. Those entries were already confirmed against the
+disk by the verification pass, so the receiver does not read the files a
+third time.
+
+A mismatched chunk becomes missing, and a repair round resends only those
+chunks, never whole files. After that round the receiver compares the new
+digests with the sender's digests from `Digests`. A chunk that still
+differs ends the session with `Error { "<path> changed during transfer" }`.
+
+For each file, the reports show `file_hash = BLAKE3(chunk_size u32 | all
+chunk digests)` in hex. Both sides print the same value on success. This is
+a hash of the chunk digests, so it does not match `b3sum` of the file.
+
+`Phase::Hashing` covers the sender's re-read and the receiver's comparison.
 
 ## Chunks, frames, and the MTU
 
