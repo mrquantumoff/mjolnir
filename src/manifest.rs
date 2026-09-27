@@ -78,6 +78,8 @@ pub fn mtime_of(meta: &Metadata) -> u64 {
 
 /// `file_id` value reserved for the end-of-stream frame.
 pub const END_FILE_ID: u32 = u32::MAX;
+/// Most files one transfer may hold; far below `END_FILE_ID`.
+pub const MAX_FILES: usize = 10_000_000;
 
 /// A validated manifest: paths unique after case and Unicode folding,
 /// fewer than `END_FILE_ID` files.
@@ -89,8 +91,17 @@ pub struct Manifest {
 
 impl Manifest {
     pub fn new(chunk_size: ChunkSize, files: Vec<FileEntry>) -> Result<Self> {
-        if files.len() >= END_FILE_ID as usize {
-            bail!("too many files ({})", files.len());
+        if files.len() > MAX_FILES {
+            bail!("too many files ({}, at most {MAX_FILES})", files.len());
+        }
+        // The receiver's `Have` carries one bitmap per file plus a length
+        // prefix of up to 10 bytes, and must fit in one control message.
+        // Sizes come from the network, so the sum must not wrap.
+        let have_bytes = files.iter().try_fold(0u64, |sum, f| {
+            sum.checked_add(chunk_count(f.size, chunk_size).div_ceil(8) + 10)
+        });
+        if have_bytes.is_none_or(|b| b + 1024 > crate::wire::MAX_CONTROL_LEN as u64) {
+            bail!("too many chunks for one transfer; use a larger chunk size");
         }
         let mut seen = HashSet::new();
         for f in &files {
@@ -101,15 +112,6 @@ impl Manifest {
                     f.path.display()
                 );
             }
-        }
-        // The receiver's `Have` carries one bitmap per file plus a length
-        // prefix of up to 10 bytes, and must fit in one control message.
-        let have_bytes: u64 = files
-            .iter()
-            .map(|f| chunk_count(f.size, chunk_size).div_ceil(8) + 10)
-            .sum();
-        if have_bytes + 1024 > crate::wire::MAX_CONTROL_LEN as u64 {
-            bail!("too many chunks for one transfer; use a larger chunk size");
         }
         Ok(Manifest { chunk_size, files })
     }
@@ -271,6 +273,19 @@ mod tests {
         let err = Manifest::new(cs(4096), vec![huge.clone()]).unwrap_err();
         assert!(err.to_string().contains("too many chunks"), "{err}");
         assert!(Manifest::new(cs(MAX_CHUNK_SIZE), vec![huge]).is_ok());
+    }
+
+    #[test]
+    fn huge_sizes_are_rejected_without_overflow() {
+        let files = (0..40_000)
+            .map(|j| FileEntry {
+                path: wire(&format!("f{j}")),
+                size: u64::MAX,
+                mtime: 0,
+            })
+            .collect();
+        let err = Manifest::new(cs(4096), files).unwrap_err();
+        assert!(err.to_string().contains("too many chunks"), "{err}");
     }
 
     #[test]
