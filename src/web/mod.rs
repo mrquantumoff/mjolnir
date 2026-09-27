@@ -57,15 +57,8 @@ impl WebServer {
         &self.token
     }
 
-    /// The URL to open, with the access token in the fragment so it never
-    /// reaches the server's request line or a Referer header.
     pub fn url(&self) -> String {
-        let host = match self.addr {
-            SocketAddr::V4(a) if a.ip().is_unspecified() => format!("127.0.0.1:{}", a.port()),
-            SocketAddr::V6(a) if a.ip().is_unspecified() => format!("[::1]:{}", a.port()),
-            a => a.to_string(),
-        };
-        format!("http://{host}/#token={}", self.token)
+        browser_url(self.addr, &self.token)
     }
 
     /// Serves requests on a few worker threads until the process exits.
@@ -112,15 +105,108 @@ fn new_token() -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
-fn open_in_browser(url: &str) -> std::io::Result<()> {
-    let mut cmd = if cfg!(windows) {
-        let mut c = std::process::Command::new("cmd");
-        c.args(["/C", "start", ""]);
-        c
-    } else if cfg!(target_os = "macos") {
-        std::process::Command::new("open")
-    } else {
-        std::process::Command::new("xdg-open")
+/// The URL to open, with the access token in the fragment so it never
+/// reaches the server's request line or a Referer header. An unspecified bind
+/// address is opened through loopback.
+fn browser_url(addr: SocketAddr, token: &str) -> String {
+    let host = match addr {
+        SocketAddr::V4(a) if a.ip().is_unspecified() => format!("127.0.0.1:{}", a.port()),
+        SocketAddr::V6(a) if a.ip().is_unspecified() => format!("[::1]:{}", a.port()),
+        a => a.to_string(),
     };
-    cmd.arg(url).spawn().map(drop)
+    format!("http://{host}/#token={token}")
+}
+
+/// NUL-terminated UTF-16, as Win32 wide-string parameters expect.
+#[cfg(any(windows, test))]
+fn wide(text: &str) -> Vec<u16> {
+    text.encode_utf16().chain(std::iter::once(0)).collect()
+}
+
+/// Hands the URL to the shell's default handler directly, so no command
+/// interpreter ever parses it.
+#[cfg(windows)]
+fn open_in_browser(url: &str) -> std::io::Result<()> {
+    use windows_sys::Win32::UI::Shell::ShellExecuteW;
+    use windows_sys::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
+    let (verb, file) = (wide("open"), wide(url));
+    // SAFETY: both strings are NUL-terminated and outlive the call; the null
+    // window, parameters, and directory pointers are documented as optional.
+    let code = unsafe {
+        ShellExecuteW(
+            std::ptr::null_mut(),
+            verb.as_ptr(),
+            file.as_ptr(),
+            std::ptr::null(),
+            std::ptr::null(),
+            SW_SHOWNORMAL,
+        )
+    };
+    // Values of 32 or less are error codes, per the ShellExecute docs.
+    if code as usize > 32 {
+        Ok(())
+    } else {
+        Err(std::io::Error::other(format!(
+            "ShellExecuteW failed with code {}",
+            code as usize
+        )))
+    }
+}
+
+#[cfg(not(windows))]
+fn open_in_browser(url: &str) -> std::io::Result<()> {
+    let opener = if cfg!(target_os = "macos") {
+        "open"
+    } else {
+        "xdg-open"
+    };
+    std::process::Command::new(opener)
+        .arg(url)
+        .spawn()
+        .map(drop)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const TOKEN: &str = "0123456789abcdef0123456789abcdef";
+
+    #[test]
+    fn url_keeps_the_token_in_the_fragment() {
+        let url = browser_url("127.0.0.1:7878".parse().unwrap(), TOKEN);
+        assert_eq!(url, format!("http://127.0.0.1:7878/#token={TOKEN}"));
+        let (_, fragment) = url.split_once('#').unwrap();
+        assert_eq!(fragment, format!("token={TOKEN}"));
+    }
+
+    #[test]
+    fn unspecified_binds_open_through_loopback() {
+        for (bound, expected) in [
+            ("0.0.0.0:7878", "http://127.0.0.1:7878/"),
+            ("[::]:7878", "http://[::1]:7878/"),
+            ("[::1]:9000", "http://[::1]:9000/"),
+            ("192.168.1.20:7878", "http://192.168.1.20:7878/"),
+        ] {
+            let url = browser_url(bound.parse().unwrap(), TOKEN);
+            assert_eq!(url, format!("{expected}#token={TOKEN}"), "{bound}");
+        }
+    }
+
+    #[test]
+    fn wide_string_round_trips_the_url_exactly() {
+        let url = browser_url("127.0.0.1:7878".parse().unwrap(), TOKEN);
+        let encoded = wide(&url);
+        assert_eq!(encoded.last(), Some(&0));
+        let decoded = String::from_utf16(&encoded[..encoded.len() - 1]).unwrap();
+        assert_eq!(decoded, url);
+    }
+
+    #[test]
+    fn new_tokens_are_128_bit_hex() {
+        let token = new_token();
+        assert_eq!(token.len(), 32);
+        assert!(token.bytes().all(|b| b.is_ascii_hexdigit()));
+        assert_ne!(token, new_token());
+    }
 }
