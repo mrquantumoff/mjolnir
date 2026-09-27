@@ -195,9 +195,11 @@ have the shape `{ "error": "message", "field": "name" | null }`, where
   Counts that do not apply to a side are 0. The receiver always lists file
   hashes; the sender lists them only when `hash` was on. `skipped` is filled
   on the sender, `warnings` mostly on the receiver. `phase_times` is the
-  time spent per stage in milliseconds. On the sender `verify_ms` is always
-  0, and `finalize_ms` includes waiting for the receiver's verify. On a
-  receiver `connect_ms` covers only the last session's handshake.
+  time spent per stage in milliseconds. The sender follows the receiver: its
+  `transfer_ms` lasts until the receiver has absorbed each round, its
+  `verify_ms` is the receiver's read-back, and its `finalize_ms` covers only
+  the digests, file map, and `Finished`. On a receiver `connect_ms` covers
+  only the last session's handshake.
 - `bound_addr` is the receiver's actual listening address, `null` for sends.
 - `progress.phase` is `connecting`, `handshaking`, `transferring`,
   `verifying`, `hashing`, `finishing`, `done`, or `failed`. `bytes_total` is 0

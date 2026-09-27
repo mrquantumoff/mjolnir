@@ -325,13 +325,14 @@ fn transfer(ctx: &Ctx, cfg: &SendConfig, map: &FileMap, tx: &mut Tx, rx: &mut Rx
             return Err(e);
         }
         check_unchanged(ctx)?;
-        ctx.progress.set_phase(Phase::Finishing);
         let sent = tx.send(&Msg::RoundEnd {
             round,
             connections: admitted,
         });
-        // Read even if the send failed: the peer may have said why it left.
-        let mut reply = rx.recv().map_err(|e| sent.err().unwrap_or(e))?;
+        // The round, and so the transfer phase, lasts until the receiver has
+        // absorbed the data and answers. Read even if the send failed: the
+        // peer may have said why it left.
+        let mut reply = reply(ctx, rx).map_err(|e| sent.err().unwrap_or(e))?;
         if matches!(reply, Msg::Delivered) && !finalized {
             finalized = true;
             if cfg.hash {
@@ -342,7 +343,7 @@ fn transfer(ctx: &Ctx, cfg: &SendConfig, map: &FileMap, tx: &mut Tx, rx: &mut Rx
                 hash: cfg.hash,
                 map: map.clone(),
             })?;
-            reply = rx.recv()?;
+            reply = self::reply(ctx, rx)?;
             if let Msg::Have { bitmaps } = &reply {
                 hash_repaired = missing_count(&parse_have(m, bitmaps)?);
             }
@@ -380,6 +381,21 @@ fn transfer(ctx: &Ctx, cfg: &SendConfig, map: &FileMap, tx: &mut Tx, rx: &mut Rx
         }
     }
     unreachable!("u32 rounds exhausted")
+}
+
+/// The receiver's next answer, following its `Verifying` notices so the
+/// phase shows what the receiver is doing.
+fn reply(ctx: &Ctx, rx: &mut Rx) -> Result<Msg> {
+    loop {
+        match rx.recv()? {
+            Msg::Verifying => ctx.progress.set_phase(Phase::Verifying),
+            Msg::Delivered => {
+                ctx.progress.set_phase(Phase::Finishing);
+                return Ok(Msg::Delivered);
+            }
+            other => return Ok(other),
+        }
+    }
 }
 
 /// Opens up to `connections` data connections that drain `queue` together.

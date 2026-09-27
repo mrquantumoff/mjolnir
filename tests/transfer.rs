@@ -712,6 +712,19 @@ fn many_chunks_over_two_connections_arrive_once() {
     assert_eq!(recv.duplicate_chunks, 0);
     let p = progress.snapshot();
     assert_eq!((p.bytes_done, p.chunks_done), (96 << 20, chunks));
+    // The sender's transfer phase lasts until the receiver has absorbed the
+    // round, so it is never much shorter than the receiver's.
+    let slack = Duration::from_millis(50);
+    assert!(
+        report.phase_times.transfer + slack >= recv.phase_times.transfer,
+        "sender {:?} vs receiver {:?}",
+        report.phase_times,
+        recv.phase_times
+    );
+    assert!(
+        !report.phase_times.verify.is_zero(),
+        "the sender sees the verify phase"
+    );
     assert_file_eq(&file, &out.path().join("big.bin"));
 }
 

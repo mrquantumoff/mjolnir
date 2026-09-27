@@ -129,6 +129,7 @@ starting at 0):
 | `Finished { verified, hashed, warnings }` | R to S | files renamed into place, file map applied; `warnings` lists metadata that could not be applied |
 | `Error { message }`                  | both      | ends the session; the sender exits, the receiver checkpoints and waits again |
 | `Cancel`                             | both      | the user cancelled; handled like `Error`, reported as a cancel |
+| `Verifying`                          | R to S    | the receiver starts reading chunks back; for progress display only |
 
 Field encodings: `chunk_size` is a `u32`; `cipher` is an enum
 (`Aes256Gcm` = 0, `ChaCha20Poly1305` = 1); each file is

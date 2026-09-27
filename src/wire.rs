@@ -79,6 +79,8 @@ pub enum Msg {
         message: String,
     },
     Cancel,
+    /// The receiver is reading chunks back; progress reporting only.
+    Verifying,
 }
 
 pub const MAX_CONTROL_LEN: usize = 64 << 20;
@@ -392,5 +394,6 @@ mod tests {
             7
         );
         assert_eq!(tag(&Msg::Cancel), 9);
+        assert_eq!(tag(&Msg::Verifying), 10);
     }
 }

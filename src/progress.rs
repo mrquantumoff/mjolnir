@@ -76,8 +76,9 @@ impl Default for Progress {
     }
 }
 
-/// Time a transfer spent in each stage. On the sender, `finalize` also
-/// covers waiting for the receiver to verify, and `verify` stays zero.
+/// Time a transfer spent in each stage. The sender follows the receiver:
+/// its transfer lasts until the receiver has absorbed each round, and its
+/// verify is the receiver's read-back, which the receiver announces.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
 pub struct PhaseTimes {
     /// Connecting and the handshake (on the sender, also walking the inputs).

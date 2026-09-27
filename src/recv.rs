@@ -644,6 +644,7 @@ impl Session<'_> {
             self.checkpoint()?;
             if self.all_present() && self.verify {
                 self.progress.set_phase(Phase::Verifying);
+                tx.send(&Msg::Verifying)?;
                 self.verify_all()?;
             }
             if self.all_present() {
