@@ -704,8 +704,10 @@ function sampleRate(transfer) {
 function progressText(transfer) {
   const p = transfer.progress;
   if (p.bytes_total > 0) {
-    const pct = Math.floor((p.bytes_done / p.bytes_total) * 100);
-    return formatBytes(p.bytes_done) + ' of ' + formatBytes(p.bytes_total) + ' (' + pct + '%)';
+    // Resent chunks count again in bytes_done, so it can overshoot the total.
+    const done = Math.min(p.bytes_done, p.bytes_total);
+    const pct = Math.floor((done / p.bytes_total) * 100);
+    return formatBytes(done) + ' of ' + formatBytes(p.bytes_total) + ' (' + pct + '%)';
   }
   if (transfer.state !== 'running') return formatBytes(p.bytes_done);
   return transfer.kind === 'receive' ? 'Waiting for sender\u2026' : statusInfo(transfer).label + '\u2026';
