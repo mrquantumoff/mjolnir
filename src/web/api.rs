@@ -213,7 +213,7 @@ struct ReceiveRequest {
 fn parse_key(field: &'static str, text: &str) -> Result<PublicKey, ApiError> {
     text.trim()
         .parse()
-        .map_err(|e| ApiError::field(field, format!("{e:#}")))
+        .map_err(|e| ApiError::field(field, format!("not a valid public key ({e:#})")))
 }
 
 fn start_send(app: &App, req: SendRequest) -> Result<Reply, ApiError> {

@@ -169,6 +169,7 @@ function formatChunkSize(n) {
 }
 
 function formatDuration(ms) {
+  if (ms < 10000) return (Math.max(0, ms) / 1000).toFixed(1) + 's';
   const total = Math.max(0, Math.round(ms / 1000));
   const hours = Math.floor(total / 3600);
   const minutes = Math.floor((total % 3600) / 60);
@@ -587,6 +588,7 @@ function buildSendDetails(spec) {
 }
 
 function buildReceiveDetails(spec, refs) {
+  refs.boundLabel = h('span', { class: 'muted small' }, 'Listening on');
   refs.boundAddr = h('code', { class: 'mono bound-addr' }, spec.listen);
   refs.boundHint = h('p', { class: 'muted tiny' }, 'Senders connect to this machine\u2019s IP address on that port.');
   const copy = h('button', {
@@ -595,7 +597,7 @@ function buildReceiveDetails(spec, refs) {
     onclick: (event) => copyText(refs.boundAddr.textContent, event.currentTarget, refs.boundAddr),
   }, 'Copy');
   return [
-    h('div', { class: 'bound' }, h('span', { class: 'muted small' }, 'Listening on'), refs.boundAddr, copy),
+    h('div', { class: 'bound' }, refs.boundLabel, refs.boundAddr, copy),
     refs.boundHint,
     h('div', { class: 'card-meta' },
       plural(spec.authorized.length, 'authorized key'),
@@ -708,6 +710,7 @@ function updateCard(refs, transfer) {
   if (refs.boundAddr) {
     const addr = transfer.bound_addr || transfer.spec.listen;
     refs.boundAddr.textContent = addr;
+    refs.boundLabel.textContent = running ? 'Listening on' : 'Listened on';
     refs.boundHint.hidden = !running || !isUnspecifiedHost(addr);
   }
   refs.cancel.hidden = !running;
