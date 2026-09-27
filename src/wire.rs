@@ -84,6 +84,8 @@ pub enum Msg {
 }
 
 pub const MAX_CONTROL_LEN: usize = 64 << 20;
+/// A control message body is read at most this much at a time.
+const READ_STEP: usize = 1 << 20;
 /// Most digests one `Digests` message carries.
 pub const DIGESTS_PER_MSG: usize = 1 << 20;
 
@@ -167,8 +169,16 @@ impl<R: Read> ControlRx<R> {
             (TAG_LEN..=MAX_CONTROL_LEN).contains(&len),
             "bad control message length {len}"
         );
-        let mut buf = vec![0u8; len];
-        self.reader.read_exact(&mut buf)?;
+        // Grow the buffer as bytes arrive, so a peer that announces 64 MiB
+        // and sends nothing commits no memory for it.
+        let mut buf = Vec::new();
+        while buf.len() < len {
+            let filled = buf.len();
+            buf.resize(len.min(filled + READ_STEP), 0);
+            self.reader
+                .read_exact(&mut buf[filled..])
+                .context("control connection closed mid-message")?;
+        }
         self.cipher
             .open(b"", &mut buf)
             .context("control message failed to authenticate")?;
@@ -382,6 +392,49 @@ mod tests {
         assert_eq!(read_preamble(&mut &buf[..]).unwrap(), ConnKind::Data);
         assert!(read_preamble(&mut &b"MJLN\x02\x00"[..]).is_err());
         assert!(read_preamble(&mut &b"HTTP/1"[..]).is_err());
+    }
+
+    /// Feeds a fixed prefix, then reports how much the reader was asked for.
+    struct Truncated {
+        data: Vec<u8>,
+        largest_read: usize,
+    }
+
+    impl Read for Truncated {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            self.largest_read = self.largest_read.max(buf.len());
+            let n = buf.len().min(self.data.len());
+            buf[..n].copy_from_slice(&self.data[..n]);
+            self.data.drain(..n);
+            Ok(n)
+        }
+    }
+
+    #[test]
+    fn a_huge_announced_control_message_is_read_in_steps() {
+        let keys = SessionKeys::derive(&[1u8; 32], &[2u8; 32]);
+        let mut data = (MAX_CONTROL_LEN as u32).to_be_bytes().to_vec();
+        data.extend_from_slice(&[0u8; 100]);
+        let reader = Truncated {
+            data,
+            largest_read: 0,
+        };
+        let (_, mut rx) = control_channel(reader, Vec::new(), &keys, Role::Receiver);
+        let err = rx.recv().unwrap_err();
+        assert!(format!("{err:#}").contains("mid-message"), "{err:#}");
+        assert!(rx.into_inner().largest_read <= READ_STEP + 16);
+    }
+
+    #[test]
+    fn control_messages_round_trip_across_read_steps() {
+        let keys = SessionKeys::derive(&[1u8; 32], &[2u8; 32]);
+        let big = Msg::Have {
+            bitmaps: vec![vec![0xA5; 3 * READ_STEP + 5]],
+        };
+        let (mut tx, _) = control_channel(&[][..], Vec::new(), &keys, Role::Sender);
+        tx.send(&big).unwrap();
+        let (_, mut rx) = control_channel(&tx.writer[..], Vec::new(), &keys, Role::Receiver);
+        assert_eq!(rx.recv().unwrap(), big);
     }
 
     #[test]
