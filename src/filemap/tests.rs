@@ -427,3 +427,91 @@ mod windows {
         set_readonly(&local, false);
     }
 }
+
+fn link_file(target: &Path, link: &Path) -> io::Result<()> {
+    #[cfg(unix)]
+    return std::os::unix::fs::symlink(target, link);
+    #[cfg(windows)]
+    return std::os::windows::fs::symlink_file(target, link);
+}
+
+fn link_dir(target: &Path, link: &Path) -> io::Result<()> {
+    #[cfg(unix)]
+    return std::os::unix::fs::symlink(target, link);
+    #[cfg(windows)]
+    return std::os::windows::fs::symlink_dir(target, link);
+}
+
+/// Mode (Unix) or read-only flag (Windows), and mtime.
+fn fingerprint(path: &Path) -> (String, SystemTime) {
+    let meta = fs::metadata(path).unwrap();
+    #[cfg(unix)]
+    let perms = {
+        use std::os::unix::fs::PermissionsExt;
+        format!("{:o}", meta.permissions().mode())
+    };
+    #[cfg(windows)]
+    let perms = format!("readonly={}", meta.permissions().readonly());
+    (perms, meta.modified().unwrap())
+}
+
+fn hostile_entry(path: WirePath, kind: EntryKind) -> Entry {
+    Entry {
+        path,
+        kind,
+        mode: Some(0o400),
+        mtime: Some(0),
+        atime: Some(0),
+        owner: None,
+    }
+}
+
+/// A link swapped in for a file after it was written must not redirect the
+/// file's metadata to where the link points.
+#[test]
+fn apply_does_not_follow_a_link_in_place_of_a_file() {
+    let out = tempfile::tempdir().unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    let victim = outside.path().join("victim");
+    fs::write(&victim, b"not yours").unwrap();
+    let before = fingerprint(&victim);
+    if let Err(e) = link_file(&victim, &out.path().join("f")) {
+        eprintln!("skipping: cannot create a symlink here: {e}");
+        return;
+    }
+    let map = FileMap {
+        entries: vec![hostile_entry(wp(&["f"]), EntryKind::File { file_id: 0 })],
+    };
+    let warnings = apply(&map, out.path(), ApplyPolicy::default());
+    assert_eq!(fingerprint(&victim), before, "the outside file was touched");
+    assert!(
+        warnings.len() == 1 && warnings[0].contains("symbolic link"),
+        "{warnings:?}"
+    );
+}
+
+/// The same for a link swapped in for a parent directory.
+#[test]
+fn apply_does_not_follow_a_link_in_place_of_a_parent() {
+    let out = tempfile::tempdir().unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    let victim = outside.path().join("g");
+    fs::write(&victim, b"not yours").unwrap();
+    let before = fingerprint(&victim);
+    if let Err(e) = link_dir(outside.path(), &out.path().join("d")) {
+        eprintln!("skipping: cannot create a symlink here: {e}");
+        return;
+    }
+    let map = FileMap {
+        entries: vec![hostile_entry(
+            wp(&["d", "g"]),
+            EntryKind::File { file_id: 0 },
+        )],
+    };
+    let warnings = apply(&map, out.path(), ApplyPolicy::default());
+    assert_eq!(fingerprint(&victim), before, "the outside file was touched");
+    assert!(
+        warnings.len() == 1 && warnings[0].contains("symbolic link"),
+        "{warnings:?}"
+    );
+}

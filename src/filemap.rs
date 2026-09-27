@@ -309,20 +309,96 @@ pub fn apply(map: &FileMap, out_dir: &Path, policy: ApplyPolicy) -> Vec<String> 
     }
     dirs.sort_by_key(|e| Reverse(e.path.components().len()));
     for entry in files.into_iter().chain(dirs) {
-        let local = entry.path.to_local_path(out_dir);
-        if let Err(e) = apply_entry(entry, &local, policy, chown) {
-            warnings.push(format!("{}: {e}", entry.path.display()));
+        let applied = open_entry(out_dir, &entry.path)
+            .map_err(anyhow::Error::from)
+            .and_then(|file| apply_entry(entry, &file, policy, chown));
+        if let Err(e) = applied {
+            warnings.push(format!("{}: {e:#}", entry.path.display()));
         }
     }
     warnings
 }
 
-/// Owner goes first because chown clears setuid and setgid.
-fn apply_entry(entry: &Entry, local: &Path, policy: ApplyPolicy, chown: bool) -> Result<()> {
-    let meta = fs::symlink_metadata(local)?;
-    if meta.file_type().is_symlink() {
-        bail!("is a symbolic link on the receiver; metadata not applied");
+/// Why metadata is not applied through a link.
+fn link_refused() -> io::Error {
+    io::Error::other("is a symbolic link on the receiver; metadata not applied")
+}
+
+/// Opens an entry under `out_dir` for its metadata calls, following no
+/// symbolic link on the way: each parent is opened with `O_NOFOLLOW`
+/// relative to the one before, so a link swapped in after the check
+/// cannot redirect a chmod, chown, or utime to a file outside `out_dir`.
+#[cfg(unix)]
+fn open_entry(out_dir: &Path, path: &WirePath) -> io::Result<fs::File> {
+    use std::ffi::CString;
+    use std::os::fd::{AsRawFd, FromRawFd};
+    use std::os::unix::ffi::OsStrExt;
+    let relative = path.to_local_path(Path::new(""));
+    let names = relative
+        .components()
+        .map(|c| CString::new(c.as_os_str().as_bytes()).map_err(io::Error::other))
+        .collect::<io::Result<Vec<_>>>()?;
+    let mut current = fs::File::open(out_dir)?;
+    for (i, name) in names.iter().enumerate() {
+        let dir_only = if i + 1 < names.len() {
+            libc::O_DIRECTORY
+        } else {
+            0
+        };
+        let flags =
+            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK | dir_only;
+        let fd = unsafe { libc::openat(current.as_raw_fd(), name.as_ptr(), flags) };
+        if fd < 0 {
+            let e = io::Error::last_os_error();
+            return Err(match e.raw_os_error() {
+                Some(libc::ELOOP) | Some(libc::ENOTDIR) => link_refused(),
+                _ => e,
+            });
+        }
+        current = unsafe { fs::File::from_raw_fd(fd) };
     }
+    Ok(current)
+}
+
+/// Opens an entry under `out_dir` for its metadata calls without following
+/// a reparse point (symbolic link or junction), checking every parent the
+/// same way. Unlike the Unix walk, a parent could still be swapped between
+/// its check and the final open.
+#[cfg(windows)]
+fn open_entry(out_dir: &Path, path: &WirePath) -> io::Result<fs::File> {
+    let parts = path.components();
+    for depth in 1..parts.len() {
+        let parent = WirePath::parse(parts[..depth].iter().map(|c| c.as_bytes().to_vec()))
+            .map_err(io::Error::other)?;
+        open_no_reparse(&parent.to_local_path(out_dir), false)?;
+    }
+    open_no_reparse(&path.to_local_path(out_dir), true)
+}
+
+#[cfg(windows)]
+fn open_no_reparse(local: &Path, write: bool) -> io::Result<fs::File> {
+    use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
+    const FILE_READ_ATTRIBUTES: u32 = 0x80;
+    const FILE_WRITE_ATTRIBUTES: u32 = 0x100;
+    const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+    const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+    let access = FILE_READ_ATTRIBUTES | if write { FILE_WRITE_ATTRIBUTES } else { 0 };
+    let file = fs::OpenOptions::new()
+        .access_mode(access)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(local)?;
+    if file.metadata()?.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+        return Err(link_refused());
+    }
+    Ok(file)
+}
+
+/// Owner goes first because chown clears setuid and setgid. Every call
+/// goes through `file`, the handle `open_entry` opened without following
+/// links, never through the path again.
+fn apply_entry(entry: &Entry, file: &fs::File, policy: ApplyPolicy, chown: bool) -> Result<()> {
+    let meta = file.metadata()?;
     if meta.is_dir() != (entry.kind == EntryKind::Dir) {
         bail!(
             "is not a {}; metadata not applied",
@@ -330,18 +406,18 @@ fn apply_entry(entry: &Entry, local: &Path, policy: ApplyPolicy, chown: bool) ->
         );
     }
     if chown && let Some((uid, gid)) = entry.owner {
-        set_owner(local, uid, gid).context("cannot set owner")?;
+        set_owner(file, uid, gid).context("cannot set owner")?;
     }
     if entry.mtime.is_some() || entry.atime.is_some() {
-        set_times(
-            local,
+        filetime::set_file_handle_times(
+            file,
             entry.atime.map(file_time),
             entry.mtime.map(file_time),
         )
         .context("cannot set times")?;
     }
     if let Some(mode) = entry.mode {
-        set_mode(local, mode, policy).context("cannot set permissions")?;
+        set_mode(file, &meta, mode, policy).context("cannot set permissions")?;
     }
     Ok(())
 }
@@ -363,55 +439,32 @@ fn owner_refusal(_: ApplyPolicy) -> Option<&'static str> {
 }
 
 #[cfg(unix)]
-fn set_owner(path: &Path, uid: u32, gid: u32) -> io::Result<()> {
-    std::os::unix::fs::chown(path, Some(uid), Some(gid))
+fn set_owner(file: &fs::File, uid: u32, gid: u32) -> io::Result<()> {
+    std::os::unix::fs::fchown(file, Some(uid), Some(gid))
 }
 
 #[cfg(windows)]
-fn set_owner(_: &Path, _: u32, _: u32) -> io::Result<()> {
+fn set_owner(_: &fs::File, _: u32, _: u32) -> io::Result<()> {
     Ok(())
 }
 
 #[cfg(unix)]
-fn set_times(path: &Path, atime: Option<FileTime>, mtime: Option<FileTime>) -> io::Result<()> {
-    match (atime, mtime) {
-        (Some(a), Some(m)) => filetime::set_file_times(path, a, m),
-        (None, Some(m)) => filetime::set_file_mtime(path, m),
-        (Some(a), None) => filetime::set_file_atime(path, a),
-        (None, None) => Ok(()),
-    }
-}
-
-/// Opens with only `FILE_WRITE_ATTRIBUTES`, which a read-only file allows,
-/// so applying the map a second time still works.
-#[cfg(windows)]
-fn set_times(path: &Path, atime: Option<FileTime>, mtime: Option<FileTime>) -> io::Result<()> {
-    use std::os::windows::fs::OpenOptionsExt;
-    const FILE_WRITE_ATTRIBUTES: u32 = 0x100;
-    const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
-    let file = fs::OpenOptions::new()
-        .access_mode(FILE_WRITE_ATTRIBUTES)
-        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
-        .open(path)?;
-    filetime::set_file_handle_times(&file, atime, mtime)
-}
-
-#[cfg(unix)]
-fn set_mode(path: &Path, mode: u32, policy: ApplyPolicy) -> io::Result<()> {
+fn set_mode(file: &fs::File, _: &Metadata, mode: u32, policy: ApplyPolicy) -> io::Result<()> {
     use std::os::unix::fs::PermissionsExt;
     let keep = if policy.allow_special_bits {
         0o7777
     } else {
         0o777
     };
-    fs::set_permissions(path, fs::Permissions::from_mode(mode & keep))
+    file.set_permissions(fs::Permissions::from_mode(mode & keep))
 }
 
+/// Only the read-only attribute, set through the handle.
 #[cfg(windows)]
-fn set_mode(path: &Path, mode: u32, _: ApplyPolicy) -> io::Result<()> {
-    let mut perms = fs::metadata(path)?.permissions();
+fn set_mode(file: &fs::File, meta: &Metadata, mode: u32, _: ApplyPolicy) -> io::Result<()> {
+    let mut perms = meta.permissions();
     perms.set_readonly(mode & 0o200 == 0);
-    fs::set_permissions(path, perms)
+    file.set_permissions(perms)
 }
 
 #[cfg(test)]
