@@ -9,6 +9,7 @@ pub mod bitset;
 pub mod crypto;
 pub mod keys;
 pub mod manifest;
+pub mod names;
 mod net;
 pub mod posio;
 mod pool;

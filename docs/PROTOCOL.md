@@ -143,13 +143,18 @@ could carry in one 64 MiB message.
 `path` is a list of components, each a byte string: the file's raw name,
 not necessarily UTF-8 (see "File names"). The receiver rejects empty paths,
 empty components, `.` and `..` components, components containing NUL or
-`/`, paths deeper than 256 components or longer than 4096 bytes, paths
-ending in `.mjolnir-part`, `.mjolnir-state`, `.mjolnir-state.tmp`, or
-`.mjolnir-sums`, and paths whose local names (after the mapping in "File
-names") are equal after lowercasing. Case-insensitive file systems (Windows,
-macOS) treat `README` and `readme` as one file, so the rule applies on
-every OS and the same offer is valid or invalid everywhere. `file_id` is
-the index into `files`.
+`/`, paths deeper than 256 components or longer than 4096 bytes (the
+components joined with `/`), components ending in `.mjolnir-part`,
+`.mjolnir-state`, `.mjolnir-state.tmp`, or `.mjolnir-sums` in any ASCII
+case, and paths that are equal after lowercasing their macOS names (see
+"File names"). The suffix rule covers directories too, because a directory
+`a.mjolnir-part` would collide with the part file of a sibling `a`, and it
+ignores case because on a case-insensitive file system `a.MJOLNIR-PART` is
+that part file. Case-insensitive file systems (Windows, macOS) treat
+`README` and `readme` as one file. The collision rule uses one key on every
+OS, the lowercased macOS name, so the same offer is valid or invalid
+everywhere, and any two names that collide on Windows also collide under
+it. `file_id` is the index into `files`.
 
 `chunk_size` is between 4 KiB and 64 MiB. File `j` has
 `ceil(size / chunk_size)` chunks. Chunk `k` covers bytes
@@ -228,29 +233,47 @@ Windows, so their tools display such names the same way.
 
 Sender, reading names:
 
-- Unix: the component's raw `OsStr` bytes.
+- Linux and other Unix except macOS: the component's raw `OsStr` bytes.
+- macOS: the UTF-8 name, with every code point in U+F001 to U+F0FF turned
+  back into its byte. Invalid bytes, possible only on non-APFS volumes, go
+  out as they are.
 - Windows: the UTF-16 name encoded as WTF-8, so unpaired surrogates survive.
   Every code point in U+F001 to U+F0FF is then turned back into its byte.
   A name escaped by an earlier mjolnir, Cygwin, or WSL receiver therefore
   goes back out as the original name.
 
+A local name that reads back as something no wire path may hold (U+F02F
+reads as `/`, and a name of U+F02E U+F02E reads as `..`) cannot be sent.
+
 Receiver, creating names:
 
 - Linux and other Unix except macOS: the bytes as they are.
 - macOS: APFS stores names as UTF-8 and rejects invalid sequences, so each
-  byte of an invalid UTF-8 sequence is escaped. Valid UTF-8 is unchanged.
-- Windows: valid UTF-8 is decoded, and each byte of an invalid sequence is
-  escaped. Then these characters are escaped: `\ : * ? " < > |`, U+0001 to
-  U+001F, a trailing `.` or space, and the first character of a Windows
-  device name (`CON`, `PRN`, `AUX`, `NUL`, `COM1` to `COM9`, `LPT1` to
-  `LPT9`, with or without an extension, in any case). The result never
-  contains a separator, a drive, or a stream, and never opens a device. All
-  file operations use `\\?\` verbatim paths, so paths longer than 260
-  characters work.
+  byte of an invalid UTF-8 sequence is escaped. A literal code point in
+  U+F001 to U+F0FF has each of its three UTF-8 bytes escaped, so that it
+  does not read back as the byte it stands for. Other valid UTF-8 is
+  unchanged.
+- Windows: the bytes are decoded as WTF-8. Valid UTF-8 becomes UTF-16, and
+  the three-byte form of a surrogate becomes that surrogate, unless it is a
+  lead directly followed by a trail: those two would pair up into a
+  different code point, so the lead's bytes are escaped instead. Each byte
+  of any other invalid sequence is escaped, and so is each UTF-8 byte of a
+  literal U+F001 to U+F0FF. Then these characters are escaped:
+  `\ : * ? " < > |`, U+0001 to U+001F, the first character of a Windows
+  device name, and a trailing `.` or space. A device name is one whose
+  stem (the text before the first `.`, trailing spaces dropped) is `CON`,
+  `PRN`, `AUX`, `NUL`, `CONIN$`, `CONOUT$`, `COM1` to `COM9`, `LPT1` to
+  `LPT9`, or `COM` or `LPT` followed by a superscript `¹`, `²`, or `³`, in
+  any case. The result
+  never contains a separator, a drive, or a stream, and never opens a
+  device. All file operations use `\\?\` verbatim paths, so paths longer
+  than 260 characters work.
 
-Round trips are exact. A name sent from Linux to Windows and back arrives
-with the same bytes it started with. The one ambiguity: a genuine file on
-Windows whose name contains a character in U+F001 to U+F0FF is read as the
+Round trips are exact, and distinct wire names always get distinct local
+names. A name sent from any OS to any other and back arrives with the same
+bytes it started with, and a Windows name with an unpaired surrogate comes
+back to Windows unchanged. The one ambiguity: a genuine file on Windows or
+macOS whose name contains a character in U+F001 to U+F0FF is read as the
 escaped byte when sent. Cygwin and WSL have the same limitation.
 
 Terminal output, logs, and the web UI show names lossily (invalid bytes as
