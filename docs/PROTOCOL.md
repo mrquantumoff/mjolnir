@@ -116,7 +116,7 @@ starting at 0):
 | `Have { bitmaps }`                   | R to S    | per file, the chunks the receiver already holds           |
 | `RoundStart { round }`               | S to R    | sender is about to open data connections for `round`      |
 | `RoundEnd { round, connections }`    | S to R    | sender's data connections for `round` are closed; `connections` is how many the receiver admitted |
-| `Finished`                           | R to S    | every chunk is present, synced, and renamed into place    |
+| `Finished { verified }`              | R to S    | every chunk is present, synced, verified unless `verified` is false, and renamed into place |
 | `Error { message }`                  | both      | ends the session; the sender exits, the receiver checkpoints and waits again |
 | `Cancel`                             | both      | the user cancelled; handled like `Error`, reported as a cancel |
 
@@ -155,10 +155,14 @@ loop round = 0, 1, ...:
     S -> R : RoundStart { round }
     S opens up to N data connections, sends every chunk missing from Have
     S -> R : RoundEnd { round, connections }
-    R waits until `connections` data connections of this round have closed
+    R waits until `connections` data connections of this round have closed,
+      then shuts down any of the round's connections still open
     if every chunk is present:
-        R syncs files, renames them into place
-        R -> S : Finished     (done)
+        R syncs, reads every chunk back and checks its digest
+        (see "Verification"); mismatches become missing again
+    if every chunk is still present:
+        R renames files into place
+        R -> S : Finished { verified }   (done)
     else:
         R -> S : Have         (sender sends what is still missing)
 ```
@@ -167,8 +171,9 @@ Either side may send `Error` or `Cancel` at any point after the handshake
 and then close every connection.
 
 A round that makes no progress counts as a failure. After 3 consecutive
-failed rounds the sender sends `Error` and gives up. Resending a chunk is
-harmless because it rewrites identical bytes at the same offset.
+failed rounds the sender sends `Error` and gives up. A chunk that arrives
+more than once is written only the first time (see "Ordering, duplicates,
+and late data").
 
 The sender hands chunks to its connections from one shared queue. Each
 connection claims the next unsent chunk when it is ready for one. A slow
@@ -240,24 +245,104 @@ The last frame is the end marker: `file_id = 0xFFFFFFFF`, `chunk_index = 0`,
 and an empty plaintext (`ct_len = 16`). The sender then closes. A connection
 that ends without the marker still counts as closed for the round.
 
+## Ordering, duplicates, and late data
+
+Chunks arrive in any order across connections, and that is by design.
+Arrival order never decides where bytes go. Each chunk's `file_id` and
+`chunk_index` are authenticated in its AAD, and the receiver writes the
+plaintext at `chunk_index * chunk_size` with a positional write. A file
+assembled from chunks that arrived in any order is byte-identical to the
+source.
+
+Within one connection the order is strict. TCP delivers the bytes in order,
+and the AEAD nonce is the frame counter, so a frame that is dropped,
+reordered, or replayed on a connection fails authentication, and the
+connection closes. A connection is either exactly in order or dead.
+
+**No duplicate writes.** The receiver keeps two bitsets per file:
+
+- `claimed` is in memory only. A chunk is claimed with an atomic
+  test-and-set right after its frame authenticates and before any write.
+- `present` is checkpointed to disk. A chunk is set present only after its
+  bytes and its digest (see "Verification") have been written.
+
+If the claim finds the bit already set, the frame is a duplicate: it is
+dropped without touching the file and counted in `duplicate_chunks`. If
+the write fails, the claim is released, so the chunk stays missing and a
+later round sends it again. The sender never sends the same chunk twice in
+one round, because each connection claims chunks from a shared atomic cursor.
+In later rounds it sends only what the receiver's `Have` reports missing.
+An honest transfer therefore reports `duplicate_chunks = 0`, and the tests
+assert that.
+
+**Late data.** A data connection can outlive its round, for example when it
+stalls, or when the receiver stops waiting for it after the round's
+timeout. When a round closes, the receiver shuts down any of that round's
+connections that are still open, and discards frames still buffered in them.
+A late connection that tries to join a closed round is rejected at
+admission, because its `round` no longer matches. If a late frame does get
+through before the shutdown, the claim bitset handles it:
+
+- Late frame for a chunk that is already present: dropped as a duplicate.
+- Late frame for a missing chunk: it is authentic data, so it is written,
+  and the copy the next round sends is dropped instead.
+
+Either way each chunk's bytes are written once per session. The sender
+learns what arrived only from `Have`, never from what it sent.
+
+## Verification
+
+Authenticated transport proves every chunk left the sender intact. It does
+not prove that the bytes on the receiver's disk are still right at the end,
+for example after a crash-and-resume, a disk or memory fault, or a bug in
+the write path. So before finishing, the receiver checks its own disk.
+
+- On receipt, after a chunk authenticates, the receiver computes
+  `digest = BLAKE3(plaintext)` truncated to 16 bytes. It writes the digest
+  at offset `chunk_index * 16` of `out/<path>.gorynych-sums`, after writing
+  the chunk and before setting its `present` bit. Digests live on disk, not
+  in memory, so the cost scales to any file size.
+- When every chunk is present, the receiver syncs the part and sums files.
+  It then reads every chunk back from the part file, using a pool of up to
+  16 threads, recomputes each digest, and compares it with the stored one.
+  Chunks carried over from an earlier session are checked the same way;
+  that is the main point.
+- A mismatch clears that chunk's `present` and `claimed` bits. The receiver
+  then sends `Have` instead of `Finished`, and the next round resends only
+  the bad chunks, never the whole file. These count in `repaired_chunks`.
+  Verification repairs count as progress for the 3-failed-rounds rule. A
+  chunk that fails verification 3 times in one session ends the session
+  with `Error { "chunk <k> of <path> keeps failing verification" }`,
+  because that points at hardware, not the network.
+
+Verification is on by default. `recv --no-verify` skips the read-back (the
+digests are still written, so a later resume can still check them), and
+`Finished { verified }` tells the sender which way it went.
+
+The read-back can be served from the OS page cache. It catches software
+bugs, stale resume data, and corruption in memory or on the write path. It
+is not proof that the media holds the bytes; that is the filesystem's job.
+
 ## Receiver storage and resume
 
-For a target `out/<path>` the receiver writes `out/<path>.gorynych-part` and
-keeps state in `out/<path>.gorynych-state`. The state holds
+For a target `out/<path>` the receiver writes `out/<path>.gorynych-part`,
+keeps chunk digests in `out/<path>.gorynych-sums`, and keeps state in
+`out/<path>.gorynych-state`. The state holds
 `{ size, mtime, chunk_size, bitmap }`.
 
 Every 2 seconds, at the end of each round, and when a session ends early,
-the receiver checkpoints each file in this order: snapshot the bitmap, `sync_data` the part file, then
-atomically replace the state file with the snapshot. A crash therefore loses
+the receiver checkpoints each file in this order: snapshot the `present`
+bitmap, `sync_data` the part file and the sums file, then atomically replace
+the state file with the snapshot. A crash therefore loses
 at most the chunks received since the last checkpoint, and never marks a chunk
 present whose bytes are not on disk.
 
-On a new session, if both the part and state files exist and the state's
-`size`, `mtime`, and `chunk_size` match the offer, the receiver reports that
-bitmap in `Have`. Otherwise it starts the file from scratch.
+On a new session, if the part, sums, and state files all exist and the
+state's `size`, `mtime`, and `chunk_size` match the offer, the receiver
+reports that bitmap in `Have`. Otherwise it starts the file from scratch.
 
-After the final round the receiver syncs every file, renames each part file
-to its target, and deletes the state files. An existing target is an error
+After the final round and verification, the receiver renames each part file
+to its target and deletes the sums and state files. An existing target is an error
 unless the receiver was started with `--force`.
 
 ## What the protocol guarantees
@@ -266,9 +351,10 @@ Mutual authentication: the sender talks only to the holder of the pinned
 receiver key, and the receiver accepts files only from authorized sender
 keys. Confidentiality and integrity of every chunk, the manifest, and all
 control messages against a network attacker. Forward secrecy, because
-`master` travels under ephemeral Diffie-Hellman keys. Completeness: the
-receiver finishes only when every chunk of every file has been
-authenticated and written.
+`master` travels under ephemeral Diffie-Hellman keys. Completeness and
+order: the receiver finishes only when every chunk of every file has been
+authenticated, written once at its own offset, and (by default) read back
+and matched against its digest.
 
 Not covered: NAT traversal or relays, hiding file sizes or timing, key
 revocation beyond editing the authorized keys file, and protection against
