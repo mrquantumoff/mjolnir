@@ -12,8 +12,17 @@ All integers on the wire are big-endian.
 
 The **receiver** listens on a TCP port. The **sender** connects, both sides
 authenticate with their static key pairs, the sender offers a manifest, and
-then it opens data connections. One receiver process serves one transfer,
-then exits.
+then it opens data connections.
+
+A receiver serves one transfer at a time and stops after one transfer
+completes. Until then it keeps listening. A failed handshake (unknown key,
+garbage, a port scanner) drops only that connection. It is logged, and the
+receiver keeps waiting, so nobody who merely reaches the port can shut a
+receiver down. While a session is active, further control connections are
+closed right after the preamble. If an admitted session fails midway (the
+sender disconnects, a control message fails to decrypt, the sender sends
+`Error`), the receiver checkpoints every file and goes back to waiting. The
+sender can simply run again and resume.
 
 ## Identities
 
@@ -54,8 +63,8 @@ R -> S : u16 len | Noise msg 2   (<- e, ee, se)      payload = master (32 random
 
 After message 1 the receiver knows the sender's static key. If that key is
 not authorized, the receiver closes the connection without replying and
-exits. If the sender pinned the wrong receiver key, the receiver cannot
-decrypt message 1 and also closes. The sender reports both cases as "the
+keeps listening. If the sender pinned the wrong receiver key, the receiver
+cannot decrypt message 1 and also closes. The sender reports both cases as "the
 receiver rejected the handshake".
 
 The receiver's reply carries `master`, a fresh random 32-byte secret. The
@@ -107,7 +116,7 @@ Messages (a postcard-encoded enum):
 | `RoundStart { round }`               | S to R    | sender is about to open data connections for `round`      |
 | `RoundEnd { round, connections }`    | S to R    | sender's data connections for `round` are closed; `connections` is how many the receiver admitted |
 | `Finished`                           | R to S    | every chunk is present, synced, and renamed into place    |
-| `Error { message }`                  | both      | fatal; the peer prints it and exits                       |
+| `Error { message }`                  | both      | ends the session; the sender exits, the receiver checkpoints and waits again |
 
 `path` uses `/` separators and is relative. The receiver rejects absolute
 paths, drive or UNC prefixes, `\`, empty components, `.` and `..` components,
@@ -141,6 +150,17 @@ loop round = 0, 1, ...:
 A round that makes no progress counts as a failure. After 3 consecutive
 failed rounds the sender sends `Error` and gives up. Resending a chunk is
 harmless because it rewrites identical bytes at the same offset.
+
+The sender hands chunks to its connections from one shared queue. Each
+connection claims the next unsent chunk when it is ready for one. A slow
+connection therefore takes fewer chunks instead of holding up the round, and
+the disk is read in nearly sequential order.
+
+Before each `RoundEnd`, the sender re-stats every file. If any size or mtime
+differs from the `Offer`, the source changed underneath the transfer: the
+sender sends `Error` and fails instead of finishing with mixed old and new
+bytes. The receiver's saved state then no longer matches the file, so the
+next run starts that file over.
 
 ## Data connections
 
