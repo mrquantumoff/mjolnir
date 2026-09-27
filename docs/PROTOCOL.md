@@ -321,8 +321,12 @@ list:
 
 The receiver applies the map in this order. First it creates every
 directory. Then it applies each file's metadata. Last it applies each
-directory's metadata, deepest first. Its policy guards against a hostile or
-careless sender:
+directory's metadata, deepest first. Within an entry it sets the owner
+first, because chown clears the setuid and setgid bits, then the times, then
+the mode. It leaves an entry alone, with a warning, if its path is a
+symbolic link on the receiver or is a file where the map says directory (or
+the reverse), so a link already in the output directory cannot redirect a
+chmod. Its policy guards against a hostile or careless sender:
 
 - **Mode.** On Unix it sets `mode & 0o777`. The setuid, setgid, and sticky
   bits are dropped unless `recv --allow-special-bits` is given. On Windows,

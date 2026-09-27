@@ -7,6 +7,7 @@
 
 pub mod bitset;
 pub mod crypto;
+pub mod filemap;
 pub mod keys;
 pub mod manifest;
 pub mod names;
