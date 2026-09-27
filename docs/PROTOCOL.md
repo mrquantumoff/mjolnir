@@ -107,7 +107,8 @@ u32 len | ChaCha20-Poly1305(key, nonce = 0u32 | counter u64, aad = "", postcard(
 Each direction has its own key and its own counter starting at 0. `len`
 counts ciphertext plus tag and is capped at 64 MiB.
 
-Messages (a postcard-encoded enum):
+Messages (a postcard-encoded enum; the variant tag is the row index below,
+starting at 0):
 
 | Message                              | Direction | Meaning                                                   |
 |--------------------------------------|-----------|-----------------------------------------------------------|
@@ -117,10 +118,25 @@ Messages (a postcard-encoded enum):
 | `RoundEnd { round, connections }`    | S to R    | sender's data connections for `round` are closed; `connections` is how many the receiver admitted |
 | `Finished`                           | R to S    | every chunk is present, synced, and renamed into place    |
 | `Error { message }`                  | both      | ends the session; the sender exits, the receiver checkpoints and waits again |
+| `Cancel`                             | both      | the user cancelled; handled like `Error`, reported as a cancel |
+
+Field encodings: `chunk_size` is a `u32`; `cipher` is an enum
+(`Aes256Gcm` = 0, `ChaCha20Poly1305` = 1); each file is
+`{ path: string, size: u64, mtime: u64 }` with `mtime` in nanoseconds since
+the Unix epoch (0 if unknown); `round` and `connections` are `u32`. `bitmaps`
+holds one byte string per file, in offer order, of exactly
+`ceil(chunk_count / 8)` bytes: chunk `k` is bit `k % 8` (least significant
+first) of byte `k / 8`. The sender rejects a `Have` whose shape does not
+match the offer, and refuses up front to offer more chunks than a `Have`
+could carry in one 64 MiB message.
 
 `path` uses `/` separators and is relative. The receiver rejects absolute
 paths, drive or UNC prefixes, `\`, empty components, `.` and `..` components,
-and duplicate paths. `file_id` is the index into `files`.
+components containing `:` or NUL, and duplicate paths. Rejecting every `:`
+rather than only a leading `C:` keeps the check the same on every OS: on
+Windows a component like `a:b` names an NTFS stream, and `C:x` joined onto a
+directory replaces it. A file name with `:` therefore cannot be sent.
+`file_id` is the index into `files`.
 
 `chunk_size` is between 4 KiB and 64 MiB. File `j` has
 `ceil(size / chunk_size)` chunks. Chunk `k` covers bytes
@@ -146,6 +162,9 @@ loop round = 0, 1, ...:
     else:
         R -> S : Have         (sender sends what is still missing)
 ```
+
+Either side may send `Error` or `Cancel` at any point after the handshake
+and then close every connection.
 
 A round that makes no progress counts as a failure. After 3 consecutive
 failed rounds the sender sends `Error` and gives up. Resending a chunk is
@@ -174,6 +193,13 @@ R -> S : 0x01 admitted, or 0x00 rejected (then close)
 The receiver admits a connection only if the MAC is valid, `round` is the
 current round, and `(round, conn)` has not been admitted before. The fresh
 challenge stops a captured hello from being replayed.
+
+`RoundStart` and the round's data connections travel on different TCP
+connections, so a data connection can reach the receiver before the
+receiver has read `RoundStart`. A connection whose MAC is valid and whose
+`round` is the next one expected therefore waits (up to 10 seconds) for that
+`RoundStart` instead of being rejected. Once `RoundEnd` has been handled the
+round is closed, and late connections for it are rejected.
 
 Then the sender streams frames:
 
@@ -204,8 +230,8 @@ For a target `out/<path>` the receiver writes `out/<path>.gorynych-part` and
 keeps state in `out/<path>.gorynych-state`. The state holds
 `{ size, mtime, chunk_size, bitmap }`.
 
-Every 2 seconds, and at the end of each round, the receiver checkpoints each
-file in this order: snapshot the bitmap, `sync_data` the part file, then
+Every 2 seconds, at the end of each round, and when a session ends early,
+the receiver checkpoints each file in this order: snapshot the bitmap, `sync_data` the part file, then
 atomically replace the state file with the snapshot. A crash therefore loses
 at most the chunks received since the last checkpoint, and never marks a chunk
 present whose bytes are not on disk.

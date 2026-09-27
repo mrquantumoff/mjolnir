@@ -1,3 +1,234 @@
+use std::net::SocketAddr;
+use std::path::PathBuf;
+use std::sync::Arc;
+use std::thread;
+use std::time::{Duration, Instant};
+
+use anyhow::{Result, bail};
+use clap::{Parser, Subcommand};
+
+use gorynych::{
+    Cipher, Phase, PrivateKey, Progress, PublicKey, Receiver, RecvConfig, SendConfig,
+    load_authorized_keys, parse_size, web,
+};
+
+#[derive(Parser)]
+#[command(
+    version,
+    about = "Fast authenticated file transfer over parallel TCP connections"
+)]
+struct Cli {
+    #[command(subcommand)]
+    cmd: Cmd,
+}
+
+#[derive(Subcommand)]
+enum Cmd {
+    /// Create a private key file and print its public key.
+    Keygen {
+        #[arg(long, default_value = "gorynych.key")]
+        out: PathBuf,
+    },
+    /// Print the public key of an existing private key file.
+    Pubkey {
+        #[arg(long)]
+        key: PathBuf,
+    },
+    /// Receive one transfer from an authorized sender.
+    Recv {
+        #[arg(long)]
+        key: PathBuf,
+        /// File of authorized sender keys, one `<base64> [comment]` per line.
+        #[arg(long)]
+        authorized: Option<PathBuf>,
+        /// Authorize a sender public key (repeatable).
+        #[arg(long)]
+        allow: Vec<PublicKey>,
+        #[arg(long, default_value = "0.0.0.0:7777")]
+        listen: SocketAddr,
+        #[arg(long, default_value = ".")]
+        out: PathBuf,
+        /// Overwrite existing files.
+        #[arg(long)]
+        force: bool,
+    },
+    /// Send files or directories to a receiver.
+    Send {
+        /// Receiver address, HOST:PORT.
+        addr: String,
+        #[arg(long)]
+        key: PathBuf,
+        /// The receiver's public key.
+        #[arg(long)]
+        peer: PublicKey,
+        /// Parallel data connections.
+        #[arg(short = 'n', long, default_value_t = 8)]
+        connections: usize,
+        /// Chunk size, e.g. 256K, 1MiB, 4M (4 KiB to 64 MiB).
+        #[arg(short = 'c', long, default_value = "1MiB", value_parser = parse_size)]
+        chunk_size: u32,
+        #[arg(long, value_enum, default_value_t = Cipher::Aes256Gcm)]
+        cipher: Cipher,
+        #[arg(required = true)]
+        paths: Vec<PathBuf>,
+    },
+    /// Serve the local web UI.
+    Serve {
+        #[arg(long, default_value = "127.0.0.1:7878")]
+        listen: SocketAddr,
+        /// Private key file; defaults to the per-user config directory and is
+        /// created there if missing.
+        #[arg(long)]
+        key: Option<PathBuf>,
+        /// Do not open a browser.
+        #[arg(long)]
+        no_open: bool,
+    },
+}
+
 fn main() {
-    println!("Hello, world!");
+    if let Err(e) = run(Cli::parse().cmd) {
+        eprintln!("gorynych: error: {e:#}");
+        std::process::exit(1);
+    }
+}
+
+fn run(cmd: Cmd) -> Result<()> {
+    match cmd {
+        Cmd::Keygen { out } => {
+            let key = PrivateKey::generate();
+            key.save(&out)?;
+            eprintln!("wrote private key to {}", out.display());
+            println!("{}", key.public_key());
+        }
+        Cmd::Pubkey { key } => println!("{}", PrivateKey::load(&key)?.public_key()),
+        Cmd::Recv {
+            key,
+            authorized,
+            mut allow,
+            listen,
+            out,
+            force,
+        } => {
+            if let Some(path) = authorized {
+                allow.extend(load_authorized_keys(&path)?);
+            }
+            if allow.is_empty() {
+                bail!("no authorized sender keys: pass --authorized FILE or --allow KEY");
+            }
+            let receiver = Receiver::bind(RecvConfig {
+                listen,
+                key: PrivateKey::load(&key)?,
+                authorized: allow,
+                out_dir: out,
+                force,
+            })?;
+            eprintln!("public key {}", receiver.public_key());
+            eprintln!("listening on {}", receiver.local_addr());
+            let progress = Arc::new(Progress::default());
+            let report = with_progress("received", &progress, || receiver.run(progress.clone()))?;
+            summary(
+                "received",
+                report.bytes_received,
+                report.elapsed,
+                &format!(
+                    "{} files, {} chunks, {} rounds, from {}",
+                    report.files, report.chunks_received, report.rounds, report.peer
+                ),
+            );
+        }
+        Cmd::Send {
+            addr,
+            key,
+            peer,
+            connections,
+            chunk_size,
+            cipher,
+            paths,
+        } => {
+            let cfg = SendConfig {
+                addr,
+                key: PrivateKey::load(&key)?,
+                peer,
+                connections,
+                chunk_size,
+                cipher,
+                paths,
+            };
+            let progress = Arc::new(Progress::default());
+            let report =
+                with_progress("sent", &progress, || gorynych::send(cfg, progress.clone()))?;
+            summary(
+                "sent",
+                report.bytes_sent,
+                report.elapsed,
+                &format!(
+                    "{} files, {} chunks, {} rounds",
+                    report.files, report.chunks_sent, report.rounds
+                ),
+            );
+        }
+        Cmd::Serve {
+            listen,
+            key,
+            no_open,
+        } => {
+            let (key, key_path) = match key {
+                Some(path) => (PrivateKey::load(&path)?, path),
+                None => PrivateKey::load_or_create_default()?,
+            };
+            eprintln!("key {} (public {})", key_path.display(), key.public_key());
+            web::serve(web::ServeConfig {
+                listen,
+                key,
+                key_path,
+                open_browser: !no_open,
+            })?;
+        }
+    }
+    Ok(())
+}
+
+const MIB: f64 = (1 << 20) as f64;
+
+/// Runs `work` on a thread and prints progress to stderr about once a second.
+fn with_progress<T: Send>(
+    verb: &str,
+    progress: &Progress,
+    work: impl FnOnce() -> Result<T> + Send,
+) -> Result<T> {
+    thread::scope(|s| {
+        let worker = s.spawn(work);
+        let mut last = (Instant::now(), 0u64);
+        while !worker.is_finished() {
+            thread::sleep(Duration::from_millis(50));
+            let now = Instant::now();
+            if now - last.0 < Duration::from_secs(1) {
+                continue;
+            }
+            let p = progress.snapshot();
+            if matches!(p.phase, Phase::Transferring | Phase::Finishing) {
+                let rate = (p.bytes_done - last.1.min(p.bytes_done)) as f64
+                    / MIB
+                    / (now - last.0).as_secs_f64();
+                eprintln!(
+                    "{verb} {:.1} / {:.1} MiB, {rate:.1} MiB/s, {} connections",
+                    p.bytes_done as f64 / MIB,
+                    p.bytes_total as f64 / MIB,
+                    p.active_connections
+                );
+            }
+            last = (now, p.bytes_done);
+        }
+        worker.join().expect("transfer thread panicked")
+    })
+}
+
+fn summary(verb: &str, bytes: u64, elapsed: Duration, detail: &str) {
+    let secs = elapsed.as_secs_f64();
+    eprintln!(
+        "{verb} {bytes} bytes ({:.1} MiB) in {secs:.2} s, {:.1} MiB/s ({detail})",
+        bytes as f64 / MIB,
+        bytes as f64 / MIB / secs.max(1e-9)
+    );
 }
