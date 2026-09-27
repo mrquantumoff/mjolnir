@@ -219,12 +219,13 @@ override the defaults.
 
 [`.github/workflows/ci.yml`](.github/workflows/ci.yml) builds release
 binaries for `x86_64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu`,
-`x86_64-pc-windows-msvc`, and `aarch64-pc-windows-msvc` on every push to
-`master` and every pull request, and runs the tests on the two x86_64
-targets. The aarch64 targets cross-compile on x86_64 runners, so their tests
-do not run. Each build is kept as a workflow artifact.
+`x86_64-pc-windows-msvc`, and `aarch64-pc-windows-msvc`, and runs the tests
+on the two x86_64 targets. The aarch64 targets cross-compile on x86_64
+runners, so their tests do not run. It runs only for tags that start with
+`v`, or when started by hand from the Actions tab, which builds without
+publishing anything.
 
-Pushing a tag that starts with `v` publishes a release from that tag:
+Pushing a `v` tag builds and publishes a release from that tag:
 
 ```sh
 git tag v0.1.0
