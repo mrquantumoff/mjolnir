@@ -7,7 +7,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufReader, ErrorKind, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering::Relaxed};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering::Relaxed};
 use std::sync::mpsc::{self, RecvTimeoutError};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, Scope};
@@ -25,7 +25,7 @@ use crate::filemap::{self, ApplyPolicy, FileMap};
 use crate::keys::{PrivateKey, PublicKey, require_nonempty};
 use crate::manifest::{ChunkSize, FileEntry, Manifest, chunk_count, chunk_span};
 use crate::net::{self, Io, tell_peer_about, unexpected};
-use crate::pool::{Buffers, InFlight, Pool, buffer_count, resolve_threads};
+use crate::pool::{Buffers, InFlight, Permit, Permits, Pool, buffer_count, resolve_threads};
 use crate::posio::{read_exact_at, write_all_at};
 use crate::progress::{ActiveConnection, Cancelled, Phase, PhaseTimes, Progress, Stop};
 use crate::wire::{
@@ -97,7 +97,9 @@ const HANDSHAKE_DEADLINE: Duration = Duration::from_secs(10);
 /// After the handshake, the sender's Offer must arrive within this.
 const OFFER_DEADLINE: Duration = Duration::from_secs(10);
 /// Handshakes in progress at once; more connections are dropped at accept.
-const MAX_PENDING_HANDSHAKES: usize = 32;
+const MAX_PENDING_HANDSHAKES: usize = 256;
+/// Stack for a handshake thread; the handshake keeps its buffers on the heap.
+const HANDSHAKE_STACK: usize = 256 << 10;
 /// Data connections not yet admitted at once; more are dropped at accept.
 const MAX_PENDING_DATA: usize = 64;
 const DATA_IDLE: Duration = Duration::from_secs(60);
@@ -151,7 +153,7 @@ impl Receiver {
     /// cancel returns.
     fn run_inner(&self, progress: &Arc<Progress>) -> Result<RecvReport> {
         let (done_tx, done_rx) = mpsc::channel::<Handshaken>();
-        let pending = Arc::new(AtomicUsize::new(0));
+        let permits = Permits::new(MAX_PENDING_HANDSHAKES);
         let authorized = Arc::new(self.cfg.authorized.clone());
         loop {
             if progress.is_cancelled() {
@@ -159,24 +161,33 @@ impl Receiver {
             }
             match self.listener.accept() {
                 Ok((stream, from)) => {
-                    if pending.load(Relaxed) >= MAX_PENDING_HANDSHAKES {
+                    // Over the limit, the socket is closed right here.
+                    let Some(permit) = permits.try_acquire() else {
+                        drop(stream);
                         continue;
-                    }
-                    pending.fetch_add(1, Relaxed);
+                    };
                     let (key, authorized, progress) =
                         (self.cfg.key.clone(), authorized.clone(), progress.clone());
-                    let (done_tx, pending) = (done_tx.clone(), pending.clone());
-                    thread::spawn(move || {
-                        match handshake(stream, &key, &authorized, &progress) {
-                            Ok(Some(h)) => {
-                                let _ = done_tx.send(h);
+                    let done_tx = done_tx.clone();
+                    let spawned = thread::Builder::new()
+                        .name("mjolnir-handshake".into())
+                        .stack_size(HANDSHAKE_STACK)
+                        .spawn(move || {
+                            let _permit = permit;
+                            match handshake(stream, &key, &authorized, &progress) {
+                                Ok(Some(h)) => {
+                                    let _ = done_tx.send(h);
+                                }
+                                Ok(None) => {}
+                                Err(e) if progress.is_cancelled() => drop(e),
+                                Err(e) => {
+                                    eprintln!("mjolnir: handshake with {from} failed: {e:#}")
+                                }
                             }
-                            Ok(None) => {}
-                            Err(e) if progress.is_cancelled() => drop(e),
-                            Err(e) => eprintln!("mjolnir: handshake with {from} failed: {e:#}"),
-                        }
-                        pending.fetch_sub(1, Relaxed);
-                    });
+                        });
+                    if let Err(e) = spawned {
+                        eprintln!("mjolnir: cannot start a handshake thread: {e}");
+                    }
                 }
                 Err(e) if e.kind() == ErrorKind::WouldBlock => {}
                 Err(e) => eprintln!("mjolnir: accept failed: {e}"),
@@ -292,7 +303,7 @@ impl Receiver {
             stats: Stats::default(),
             fatal: Mutex::new(None),
             checkpoint_lock: Mutex::new(()),
-            pending_data: AtomicUsize::new(0),
+            pending_data: Permits::new(MAX_PENDING_DATA),
             verify_failures: Mutex::new(HashMap::new()),
             pool: &pool,
             buffers: &buffers,
@@ -593,7 +604,7 @@ struct Session<'a> {
     /// Serializes checkpoints so only one thread writes state files.
     checkpoint_lock: Mutex<()>,
     /// Data connections accepted but not yet admitted or rejected.
-    pending_data: AtomicUsize,
+    pending_data: Arc<Permits>,
     /// Verification failures per `(file, chunk)` this session.
     verify_failures: Mutex<HashMap<(u32, u64), u8>>,
     pool: &'a Pool<RecvJob>,
@@ -967,12 +978,13 @@ fn accept_data<'s, 'e>(s: &'s Scope<'s, 'e>, listener: &'e TcpListener, session:
     while !session.sync.is_shut() && !session.progress.is_cancelled() {
         match listener.accept() {
             Ok((stream, from)) => {
-                if session.pending_data.load(Relaxed) >= MAX_PENDING_DATA {
+                // Over the limit, the socket is closed right here.
+                let Some(permit) = session.pending_data.try_acquire() else {
+                    drop(stream);
                     continue;
-                }
-                session.pending_data.fetch_add(1, Relaxed);
+                };
                 s.spawn(move || {
-                    if let Err(e) = serve_data(session, stream)
+                    if let Err(e) = serve_data(session, stream, permit)
                         && !session.sync.is_shut()
                         && !session.progress.is_cancelled()
                     {
@@ -989,17 +1001,9 @@ fn accept_data<'s, 'e>(s: &'s Scope<'s, 'e>, listener: &'e TcpListener, session:
     }
 }
 
-/// Decrements `pending_data` when dropped.
-struct PendingGuard<'a>(&'a AtomicUsize);
-
-impl Drop for PendingGuard<'_> {
-    fn drop(&mut self) {
-        self.0.fetch_sub(1, Relaxed);
-    }
-}
-
-fn serve_data(session: &Session, stream: TcpStream) -> Result<()> {
-    let pending = PendingGuard(&session.pending_data);
+/// `pending` is this connection's slot among the unadmitted ones; it is
+/// released once the connection is admitted.
+fn serve_data(session: &Session, stream: TcpStream, pending: Permit) -> Result<()> {
     net::prepare(&stream)?;
     let ended = || session.sync.is_shut() || session.progress.is_cancelled();
     let mut hello_io = Io::new(stream, &ended).deadline(HANDSHAKE_DEADLINE);

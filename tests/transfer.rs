@@ -1033,3 +1033,44 @@ fn a_replayed_handshake_holds_the_receiver_only_until_the_offer_deadline() {
     );
     assert_file_eq(&file, &second.path().join("f.bin"));
 }
+
+#[test]
+fn idle_connections_neither_block_a_sender_nor_pile_up() {
+    use std::io::Read;
+    let src = TempDir::new().unwrap();
+    let file = src.path().join("f.bin");
+    write(&file, &noise(30_000, 22));
+    let out = TempDir::new().unwrap();
+    let (rk, _) = keypair();
+    let (sk, spub) = keypair();
+    let rx = start_receiver(rk.clone(), vec![spub], out.path());
+    let idle: Vec<_> = (0..200)
+        .map(|_| std::net::TcpStream::connect(rx.addr).unwrap())
+        .collect();
+    thread::sleep(Duration::from_millis(200));
+    Send::to(sk, rx.public).run(rx.addr, &[&file]).unwrap();
+    rx.join().unwrap();
+    assert_file_eq(&file, &out.path().join("f.bin"));
+    drop(idle);
+
+    let spare = TempDir::new().unwrap();
+    let rx = start_receiver(rk, vec![spub], spare.path());
+    let flood: Vec<_> = (0..300)
+        .map(|_| std::net::TcpStream::connect(rx.addr).unwrap())
+        .collect();
+    thread::sleep(Duration::from_millis(500));
+    let closed = flood
+        .into_iter()
+        .filter(|s| {
+            s.set_read_timeout(Some(Duration::from_millis(20))).unwrap();
+            matches!((&*s).read(&mut [0u8; 1]), Ok(0))
+                || matches!((&*s).read(&mut [0u8; 1]), Err(e) if e.kind() != std::io::ErrorKind::WouldBlock && e.kind() != std::io::ErrorKind::TimedOut)
+        })
+        .count();
+    assert!(
+        closed >= 300 - 256,
+        "only {closed} over-limit connections were closed"
+    );
+    rx.progress.cancel();
+    assert!(rx.join().unwrap_err().is::<Cancelled>());
+}

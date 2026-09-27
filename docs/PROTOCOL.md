@@ -19,8 +19,8 @@ authenticate with their static key pairs, the sender offers a manifest, and
 then it opens data connections.
 
 A receiver serves one transfer at a time and stops after one transfer
-completes. It runs each incoming handshake on its own thread (at most 32 at
-once) and requires the preamble and Noise message 1 to arrive within 10
+completes. It runs each incoming handshake on its own thread (at most 256 at
+once; connections beyond that are closed at once) and requires the preamble and Noise message 1 to arrive within 10
 seconds, so a peer that trickles bytes cannot hold up a real sender.
 Message 1 must be exactly 96 bytes, its size in IK with an empty payload. Message 1 can be
 replayed, and the receiver answers a replay like the original, so the

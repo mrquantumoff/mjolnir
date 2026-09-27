@@ -3,7 +3,8 @@
 //! many threads as the machine has cores.
 
 use std::collections::VecDeque;
-use std::sync::{Condvar, Mutex};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::Duration;
 
@@ -126,6 +127,44 @@ impl Buffers {
     }
 }
 
+/// A counting semaphore that never blocks: `try_acquire` hands out at most
+/// `max` permits at once, and a permit returns itself when dropped.
+pub(crate) struct Permits {
+    used: AtomicUsize,
+    max: usize,
+}
+
+pub(crate) struct Permit(Arc<Permits>);
+
+impl Permits {
+    pub(crate) fn new(max: usize) -> Arc<Self> {
+        Arc::new(Permits {
+            used: AtomicUsize::new(0),
+            max,
+        })
+    }
+
+    pub(crate) fn try_acquire(self: &Arc<Self>) -> Option<Permit> {
+        self.used
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
+                (n < self.max).then_some(n + 1)
+            })
+            .ok()
+            .map(|_| Permit(self.clone()))
+    }
+
+    #[cfg(test)]
+    fn in_use(&self) -> usize {
+        self.used.load(Ordering::Acquire)
+    }
+}
+
+impl Drop for Permit {
+    fn drop(&mut self) {
+        self.0.used.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
 /// Counts jobs submitted but not finished, so a round can wait for its
 /// frames to land before it reports what is present.
 #[derive(Default)]
@@ -178,6 +217,21 @@ mod tests {
             pool.close();
         });
         assert_eq!(sum.into_inner(), 500_500);
+    }
+
+    #[test]
+    fn permits_never_exceed_the_limit() {
+        let permits = Permits::new(3);
+        let held: Vec<_> = (0..5).filter_map(|_| permits.try_acquire()).collect();
+        assert_eq!(held.len(), 3);
+        assert!(permits.try_acquire().is_none());
+        drop(held);
+        assert_eq!(permits.in_use(), 0);
+        let racers: Vec<_> = thread::scope(|s| {
+            let handles: Vec<_> = (0..64).map(|_| s.spawn(|| permits.try_acquire())).collect();
+            handles.into_iter().map(|h| h.join().unwrap()).collect()
+        });
+        assert_eq!(racers.iter().flatten().count(), 3);
     }
 
     #[test]
