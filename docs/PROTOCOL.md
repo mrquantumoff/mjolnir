@@ -245,6 +245,45 @@ The last frame is the end marker: `file_id = 0xFFFFFFFF`, `chunk_index = 0`,
 and an empty plaintext (`ct_len = 16`). The sender then closes. A connection
 that ends without the marker still counts as closed for the round.
 
+## Parallelism
+
+Network parallelism and CPU parallelism are separate knobs. `--connections`
+sets how many TCP streams carry data. `--threads` (default: the number of
+CPU cores) sets how many workers seal and open chunks. A transfer over 2
+connections can still use every core for crypto, and a 32-connection
+transfer on a 4-core machine does not oversubscribe the CPU.
+
+The per-connection nonce counter does not force serial crypto. The nonce for
+a connection's k-th frame is `0u32 | k`, known before the frame is sealed or
+opened, so frames can be processed out of order and the result is still
+exact:
+
+- **Receiver.** Each connection has a reader thread that only does I/O. It
+  reads a frame's header and body into a pooled buffer and numbers it `k` in
+  arrival order. It then hands `(conn key, k, header, buffer)` to a shared
+  pool of `--threads` workers. A worker opens the frame, claims the chunk,
+  does the positional write, writes the digest, sets `present`, and returns
+  the buffer to the pool. Writes go to each chunk's own offset, so workers
+  never wait on each other.
+- **Sender.** Each connection has a writer thread with a small FIFO of
+  pending slots (depth 4). The writer claims the next chunk from the shared
+  cursor and assigns it the connection's next counter value `k`. It submits
+  "read and seal chunk as frame `k`" to the shared worker pool and pushes
+  the pending result onto its FIFO. It writes results to the socket strictly
+  in FIFO order, which is counter order. Up to 4 frames per connection are
+  sealed in parallel while earlier ones are on the wire.
+
+**Backpressure.** Buffers come from a bounded pool of
+`2 * threads + connections` buffers of `chunk_size + 32` bytes. When the
+pool is empty, readers stop reading, and TCP flow control slows the sender.
+Memory therefore stays at about that many chunks, no matter how fast
+either side is. If that would exceed 1 GiB (large chunks with many
+threads), the pool shrinks to fit. It never goes below `threads`.
+
+A frame that fails to open ends its connection, as before. Frames from that
+connection that other workers already opened are valid on their own, since
+each one authenticated under its own nonce, and they are kept.
+
 ## Ordering, duplicates, and late data
 
 Chunks arrive in any order across connections, and that is by design.
