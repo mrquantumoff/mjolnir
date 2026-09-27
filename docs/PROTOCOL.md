@@ -22,7 +22,11 @@ A receiver serves one transfer at a time and stops after one transfer
 completes. It runs each incoming handshake on its own thread (at most 32 at
 once) and requires the preamble and Noise message 1 to arrive within 10
 seconds, so a peer that trickles bytes cannot hold up a real sender.
-Message 1 must be exactly 96 bytes, its size in IK with an empty payload. Until then it keeps listening. A failed handshake (unknown key,
+Message 1 must be exactly 96 bytes, its size in IK with an empty payload. Message 1 can be
+replayed, and the receiver answers a replay like the original, so the
+sender has not proven it is live until its `Offer` decrypts. The receiver
+therefore drops a session whose `Offer` does not arrive within 10 seconds
+of the handshake and goes back to waiting. Until then it keeps listening. A failed handshake (unknown key,
 garbage, a port scanner) drops only that connection. It is logged, and the
 receiver keeps waiting, so nobody who merely reaches the port can shut a
 receiver down. While a session is active, further control connections are

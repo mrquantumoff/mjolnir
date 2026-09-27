@@ -94,6 +94,8 @@ const CHECKPOINT_EVERY: Duration = Duration::from_secs(2);
 /// Preamble plus Noise message 1 must arrive within this, however slowly
 /// the bytes trickle in.
 const HANDSHAKE_DEADLINE: Duration = Duration::from_secs(10);
+/// After the handshake, the sender's Offer must arrive within this.
+const OFFER_DEADLINE: Duration = Duration::from_secs(10);
 /// Handshakes in progress at once; more connections are dropped at accept.
 const MAX_PENDING_HANDSHAKES: usize = 32;
 /// Data connections not yet admitted at once; more are dropped at accept.
@@ -240,7 +242,14 @@ impl Receiver {
         tx: &mut Tx,
         progress: &Progress,
     ) -> Result<Outcome> {
-        let (manifest, cipher) = match rx.recv()? {
+        // A replayed Noise message 1 gets this far too, so the peer has not
+        // proven it is live until its Offer decrypts. Bound the wait, or one
+        // silent peer would hold the single session slot forever.
+        rx.get_mut()
+            .set_deadline(Some(Instant::now() + OFFER_DEADLINE));
+        let offer = rx.recv().context("waiting for the Offer");
+        rx.get_mut().set_deadline(None);
+        let (manifest, cipher) = match offer? {
             Msg::Offer {
                 chunk_size,
                 cipher,

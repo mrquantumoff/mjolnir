@@ -948,3 +948,88 @@ fn perms_times_and_non_utf8_names_arrive_on_unix() {
         .mode();
     assert_eq!(dmode & 0o7777, 0o750);
 }
+
+/// A TCP proxy to `target` that also keeps the first `keep` bytes the first
+/// client sends.
+fn recording_proxy(
+    target: SocketAddr,
+    keep: usize,
+) -> (SocketAddr, Arc<std::sync::Mutex<Vec<u8>>>) {
+    use std::io::{Read, Write};
+    use std::net::{Shutdown, TcpListener, TcpStream};
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let recorded = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let rec = recorded.clone();
+    thread::spawn(move || {
+        for (i, client) in listener.incoming().enumerate() {
+            let Ok(client) = client else { return };
+            let Ok(server) = TcpStream::connect(target) else {
+                return;
+            };
+            let pipe = |mut from: TcpStream,
+                        mut to: TcpStream,
+                        record: Option<Arc<std::sync::Mutex<Vec<u8>>>>| {
+                thread::spawn(move || {
+                    let mut buf = [0u8; 64 << 10];
+                    while let Ok(n) = from.read(&mut buf) {
+                        if n == 0 || to.write_all(&buf[..n]).is_err() {
+                            break;
+                        }
+                        if let Some(r) = &record {
+                            let mut r = r.lock().unwrap();
+                            let room = keep.saturating_sub(r.len()).min(n);
+                            r.extend_from_slice(&buf[..room]);
+                        }
+                    }
+                    let _ = to.shutdown(Shutdown::Write);
+                });
+            };
+            pipe(
+                client.try_clone().unwrap(),
+                server.try_clone().unwrap(),
+                (i == 0).then(|| rec.clone()),
+            );
+            pipe(server, client, None);
+        }
+    });
+    (addr, recorded)
+}
+
+#[test]
+fn a_replayed_handshake_holds_the_receiver_only_until_the_offer_deadline() {
+    use std::io::Write;
+    let src = TempDir::new().unwrap();
+    let file = src.path().join("f.bin");
+    write(&file, &noise(20_000, 21));
+    let (rk, rpub) = keypair();
+    let (sk, spub) = keypair();
+
+    let first = TempDir::new().unwrap();
+    let rx = start(recv_config(rk.clone(), vec![spub], first.path()));
+    let (proxy, recorded) = recording_proxy(rx.addr, 6 + 2 + 96);
+    Send::to(sk.clone(), rpub).run(proxy, &[&file]).unwrap();
+    rx.join().unwrap();
+    let preamble_and_msg1 = recorded.lock().unwrap().clone();
+    assert_eq!(preamble_and_msg1.len(), 104);
+
+    let second = TempDir::new().unwrap();
+    let rx = start(recv_config(rk, vec![spub], second.path()));
+    let mut replay = std::net::TcpStream::connect(rx.addr).unwrap();
+    replay.write_all(&preamble_and_msg1).unwrap();
+    thread::spawn(move || {
+        thread::sleep(Duration::from_secs(25));
+        drop(replay);
+    });
+    thread::sleep(Duration::from_millis(300));
+
+    let started = Instant::now();
+    Send::to(sk, rpub).run(rx.addr, &[&file]).unwrap();
+    rx.join().unwrap();
+    let waited = started.elapsed();
+    assert!(
+        waited < Duration::from_secs(15),
+        "real sender waited {waited:?}"
+    );
+    assert_file_eq(&file, &second.path().join("f.bin"));
+}

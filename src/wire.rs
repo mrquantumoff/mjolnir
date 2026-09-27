@@ -152,6 +152,11 @@ impl<R: Read> ControlRx<R> {
         self.reader.into_inner()
     }
 
+    /// The underlying reader, to adjust it between messages.
+    pub fn get_mut(&mut self) -> &mut R {
+        self.reader.get_mut()
+    }
+
     pub fn recv(&mut self) -> Result<Msg> {
         let mut len = [0u8; 4];
         self.reader
