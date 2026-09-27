@@ -587,6 +587,7 @@ dependencies = [
  "tempfile",
  "tiny_http",
  "walkdir",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

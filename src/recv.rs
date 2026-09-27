@@ -1046,6 +1046,9 @@ impl RoundSync {
         }
         *state = RoundState::Between { next: round + 1 };
         self.closed_below.store(round + 1, Relaxed);
+        if progress.is_cancelled() {
+            return Err(Cancelled::Local.into());
+        }
         Ok(())
     }
 

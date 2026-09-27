@@ -37,6 +37,9 @@ tempfile = "3.27.0"
 [target."cfg(unix)".dependencies]
 libc = "0.2.189"
 
+[target."cfg(windows)".dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Networking_WinSock"] }
+
 # Tests move tens of MiB through AES and ChaCha; unoptimized ciphers are slow.
 [profile.dev.package."*"]
 opt-level = 3

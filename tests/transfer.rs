@@ -706,3 +706,72 @@ fn many_chunks_over_two_connections_arrive_once() {
     assert_eq!((p.bytes_done, p.chunks_done), (96 << 20, chunks));
     assert_file_eq(&file, &out.path().join("big.bin"));
 }
+
+/// A receiver that admits one data connection and then never reads from
+/// it, so the sender's writes block.
+fn stalled_receiver(key: PrivateKey, sender: PublicKey) -> (SocketAddr, JoinHandle<()>) {
+    use mjolnir::crypto::handshake_responder;
+    use mjolnir::wire::{self, ADMITTED, Msg, Role};
+    use std::io::{Read, Write};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let handle = thread::spawn(move || {
+        let (mut control, _) = listener.accept().unwrap();
+        wire::read_preamble(&mut control).unwrap();
+        let (keys, _) = handshake_responder(&mut control, &key, &[sender]).unwrap();
+        let (mut tx, mut rx) = wire::control_channel(
+            control.try_clone().unwrap(),
+            control.try_clone().unwrap(),
+            &keys,
+            Role::Receiver,
+        );
+        let Msg::Offer {
+            files, chunk_size, ..
+        } = rx.recv().unwrap()
+        else {
+            panic!("expected Offer")
+        };
+        let bitmaps = files
+            .iter()
+            .map(|f| vec![0u8; f.size.div_ceil(u64::from(chunk_size)).div_ceil(8) as usize])
+            .collect();
+        tx.send(&Msg::Have { bitmaps }).unwrap();
+        let (mut data, _) = listener.accept().unwrap();
+        wire::read_preamble(&mut data).unwrap();
+        data.write_all(&[9u8; 32]).unwrap();
+        let mut hello = [0u8; 40];
+        data.read_exact(&mut hello).unwrap();
+        data.write_all(&[ADMITTED]).unwrap();
+        thread::sleep(Duration::from_secs(5));
+        drop((data, control));
+    });
+    (addr, handle)
+}
+
+#[test]
+fn cancel_is_prompt_while_the_receiver_stops_reading() {
+    let src = TempDir::new().unwrap();
+    let file = big_source(&src, 64);
+    let (rk, rpub) = keypair();
+    let (sk, spub) = keypair();
+    let (addr, fake) = stalled_receiver(rk, spub);
+    let mut send = Send::to(sk, rpub);
+    send.connections = 1;
+    let progress = Arc::new(Progress::default());
+    let canceller = {
+        let progress = progress.clone();
+        thread::spawn(move || {
+            while progress.bytes_done.load(Relaxed) == 0 {
+                thread::sleep(Duration::from_millis(1));
+            }
+            thread::sleep(Duration::from_millis(500));
+            progress.cancel();
+            Instant::now()
+        })
+    };
+    let err = mjolnir::send(send.config(addr, &[&file]), progress).unwrap_err();
+    let latency = canceller.join().unwrap().elapsed();
+    assert_eq!(err.downcast_ref::<Cancelled>(), Some(&Cancelled::Local));
+    assert!(latency < Duration::from_secs(1), "cancel took {latency:?}");
+    fake.join().unwrap();
+}

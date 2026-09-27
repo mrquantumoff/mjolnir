@@ -11,29 +11,57 @@ use socket2::{SockRef, TcpKeepalive};
 use crate::progress::{Cancelled, Progress};
 use crate::wire::{ControlTx, Msg};
 
-/// OS-level read timeout. Blocked reads wake this often to check whether
-/// they should stop; nothing else depends on its value.
+/// How long a blocked read or write sleeps in `poll` before it checks
+/// whether it should stop; nothing else depends on its value.
 pub(crate) const POLL: Duration = Duration::from_millis(100);
-/// OS-level write timeout, after which the connection is given up. A write
-/// that times out is never retried: on Windows a send that hits
-/// `SO_SNDTIMEO` may already have queued part of its buffer while reporting
-/// failure, so a retry would put duplicate bytes on the stream.
+/// A write that moves no byte for this long fails the connection, whatever
+/// its idle limit.
 pub(crate) const WRITE_TIMEOUT: Duration = Duration::from_secs(60);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// Configures an accepted or connected socket: blocking with a `POLL` read
-/// timeout and a `WRITE_TIMEOUT` write timeout, no Nagle delay, and TCP
-/// keepalive so a vanished peer is noticed even on an idle control
-/// connection.
+/// Configures an accepted or connected socket: non-blocking (see [`Io`]),
+/// no Nagle delay, and TCP keepalive so a vanished peer is noticed even on
+/// an idle control connection.
 pub(crate) fn prepare(stream: &TcpStream) -> io::Result<()> {
-    stream.set_nonblocking(false)?;
+    stream.set_nonblocking(true)?;
     stream.set_nodelay(true)?;
-    stream.set_read_timeout(Some(POLL))?;
-    stream.set_write_timeout(Some(WRITE_TIMEOUT))?;
     let keepalive = TcpKeepalive::new()
         .with_time(Duration::from_secs(15))
         .with_interval(Duration::from_secs(5));
     SockRef::from(stream).set_tcp_keepalive(&keepalive)
+}
+
+/// Waits up to `timeout` for `stream` to become readable (or writable).
+/// Errors and hang-ups count as ready; the next read or write reports them.
+#[cfg(unix)]
+fn wait_ready(stream: &TcpStream, write: bool, timeout: Duration) -> io::Result<()> {
+    use std::os::fd::AsRawFd;
+    let mut fd = libc::pollfd {
+        fd: stream.as_raw_fd(),
+        events: if write { libc::POLLOUT } else { libc::POLLIN },
+        revents: 0,
+    };
+    match unsafe { libc::poll(&mut fd, 1, timeout.as_millis() as libc::c_int) } {
+        -1 => Err(io::Error::last_os_error()),
+        _ => Ok(()),
+    }
+}
+
+#[cfg(windows)]
+fn wait_ready(stream: &TcpStream, write: bool, timeout: Duration) -> io::Result<()> {
+    use std::os::windows::io::AsRawSocket;
+    use windows_sys::Win32::Networking::WinSock::{
+        POLLRDNORM, POLLWRNORM, SOCKET, SOCKET_ERROR, WSAPOLLFD, WSAPoll,
+    };
+    let mut fd = WSAPOLLFD {
+        fd: stream.as_raw_socket() as SOCKET,
+        events: if write { POLLWRNORM } else { POLLRDNORM },
+        revents: 0,
+    };
+    match unsafe { WSAPoll(&mut fd, 1, timeout.as_millis() as i32) } {
+        SOCKET_ERROR => Err(io::Error::last_os_error()),
+        _ => Ok(()),
+    }
 }
 
 /// Why an [`Io`] gave up early.
@@ -48,14 +76,14 @@ impl std::fmt::Display for Stopped {
 
 impl std::error::Error for Stopped {}
 
-/// Blocking reads and writes on a `prepare`d socket. A read retries across
-/// the `POLL` timeouts, so no partial progress is lost, until it finishes,
-/// `stop` returns true, the deadline passes, or no byte moves for `idle`.
-/// The checks run only on timeouts, which keeps the hot path clean, and
-/// they work on Windows, where `shutdown` from another thread does not wake
-/// a blocked `recv`. A write blocks until the peer takes the bytes or
-/// `WRITE_TIMEOUT` passes, which fails the connection; callers check `stop`
-/// between writes.
+/// Blocking-style reads and writes on a `prepare`d, non-blocking socket.
+/// Each call waits in `poll` for `POLL` at a time until it moves bytes,
+/// `stop` returns true, the deadline passes, or no byte moves for `idle`
+/// (`WRITE_TIMEOUT` at most for a write). A non-blocking send reports
+/// exactly how much it queued, so nothing is lost or duplicated. Blocking
+/// sockets would not do: on Windows `shutdown` from another thread wakes
+/// neither a blocked `recv` nor a blocked `send`, and a send that hits
+/// `SO_SNDTIMEO` may have queued part of its buffer while reporting failure.
 pub(crate) struct Io<'a> {
     stream: TcpStream,
     stop: &'a (dyn Fn() -> bool + Sync),
@@ -96,11 +124,20 @@ impl<'a> Io<'a> {
         self.stream
     }
 
-    fn read_retrying(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+    fn wait<T>(
+        &mut self,
+        write: bool,
+        mut op: impl FnMut(&mut TcpStream) -> io::Result<T>,
+    ) -> io::Result<T> {
         let started = Instant::now();
+        let idle = match (self.idle, write) {
+            (Some(limit), true) => Some(limit.min(WRITE_TIMEOUT)),
+            (None, true) => Some(WRITE_TIMEOUT),
+            (limit, false) => limit,
+        };
         loop {
-            match self.stream.read(buf) {
-                Err(e) if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {}
+            match op(&mut self.stream) {
+                Err(e) if e.kind() == ErrorKind::WouldBlock => {}
                 Err(e) if e.kind() == ErrorKind::Interrupted => continue,
                 other => return other,
             }
@@ -111,33 +148,23 @@ impl<'a> Io<'a> {
             if self.deadline.is_some_and(|d| now >= d) {
                 return Err(io::Error::new(ErrorKind::TimedOut, "deadline passed"));
             }
-            if self.idle.is_some_and(|limit| now - started >= limit) {
+            if idle.is_some_and(|limit| now - started >= limit) {
                 return Err(io::Error::new(ErrorKind::TimedOut, "peer went silent"));
             }
+            wait_ready(&self.stream, write, POLL)?;
         }
     }
 }
 
 impl Read for Io<'_> {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        self.read_retrying(buf)
+        self.wait(false, |s| s.read(buf))
     }
 }
 
 impl Write for Io<'_> {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        loop {
-            match self.stream.write(buf) {
-                Err(e) if e.kind() == ErrorKind::Interrupted => {}
-                Err(e) if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {
-                    return Err(io::Error::new(
-                        ErrorKind::TimedOut,
-                        "peer stopped reading; giving up the connection",
-                    ));
-                }
-                other => return other,
-            }
-        }
+        self.wait(true, |s| s.write(buf))
     }
 
     fn flush(&mut self) -> io::Result<()> {
@@ -173,21 +200,29 @@ pub(crate) fn connect(addrs: &[SocketAddr], progress: &Progress) -> Result<TcpSt
 
 /// Closes a control connection after a goodbye without resetting it. Our
 /// half is shut, then whatever the peer still sends (say, a `RoundEnd` in
-/// flight) is read and dropped for up to a second. Closing a socket with
+/// flight, or a whole round that raced our goodbye) is read and dropped
+/// for up to five seconds. Closing a socket with
 /// unread bytes sends a reset, and on Windows a reset makes the peer
-/// discard our goodbye before it reads it.
+/// discard our goodbye before it reads it. Runs on its own thread, so the
+/// caller returns at once.
 pub(crate) fn linger(mut stream: TcpStream) {
     let _ = stream.shutdown(std::net::Shutdown::Write);
-    let deadline = Instant::now() + Duration::from_secs(1);
-    let mut scratch = [0u8; 4096];
-    while Instant::now() < deadline {
-        match stream.read(&mut scratch) {
-            Ok(0) => return,
-            Ok(_) => {}
-            Err(e) if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {}
-            Err(_) => return,
+    std::thread::spawn(move || {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut scratch = [0u8; 4096];
+        while Instant::now() < deadline {
+            match stream.read(&mut scratch) {
+                Ok(0) => return,
+                Ok(_) => {}
+                Err(e) if e.kind() == ErrorKind::WouldBlock => {
+                    if wait_ready(&stream, false, POLL).is_err() {
+                        return;
+                    }
+                }
+                Err(_) => return,
+            }
         }
-    }
+    });
 }
 
 /// Best effort: tell the peer why this side is leaving, `Cancel` for a local
