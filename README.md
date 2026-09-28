@@ -208,48 +208,30 @@ write to.
 
 ## Benchmark
 
-> These numbers come from an earlier build, before the shared crypto
-> worker pool and the later fixes. A fresh run on the current code will
-> replace them.
+Full tables and method: [docs/BENCHMARKS.md](docs/BENCHMARKS.md). Loopback on
+one machine (Ryzen 9 9950X), 2 GiB of random data, medians of 3 runs, commit
+b8f5e18. Every output matched the source's SHA-256.
 
-Measured with [`scripts/bench.sh`](scripts/bench.sh): a release build,
-`recv` and `send` as two processes on 127.0.0.1, one 2 GiB file of random
-data, three runs per row, median shown. Every run's output matched the
-source's SHA-256. The rate is the sender's summary line, which covers
-connecting, the handshake, all rounds, and the receiver's final sync and
-rename. The source file was in the page cache, and the receiver wrote to the
-same drive the source lives on.
+| Setup | Windows | Linux (WSL2, ext4) |
+|---|---|---|
+| Raw disk write + fsync, 1 writer | 2007 MiB/s | 1802 MiB/s |
+| 1 connection, 1 MiB chunks | 670 MiB/s | 1950 MiB/s |
+| 8 connections, 1 MiB chunks | 1155 MiB/s | 1167 MiB/s |
+| 8 connections, receiver discards data (no disk) | 4530 MiB/s | 4978 MiB/s |
+| No disk, 2 connections, 16 workers (transfer phase) | 3312 MiB/s | 5948 MiB/s |
 
-Machine: AMD Ryzen 9 9950X (16 cores, 32 threads), 64 GB RAM, Windows 11 Pro
-(build 26200), Rust 1.98.1.
+Crypto scales with `--threads` until the connections' network threads are
+the limit, at about 1.4-2 GiB/s per connection with 1 worker and up to 3.5
+GiB/s with 4 or more. With a disk in the loop, the limit is mjolnir's receive
+write path. Linux writes at raw disk speed on 1 connection but slows down as
+more connections write into the same file. Windows plateaus at about 70% of
+raw disk speed. Capping concurrent writers per file is the next performance
+fix. 4 KiB chunks cost 4-5x throughput. Chunk size is independent of the
+network MTU; see [Chunks, frames, and the
+MTU](docs/PROTOCOL.md#chunks-frames-and-the-mtu).
 
-| connections | chunk size | cipher | MiB/s |
-|---|---|---|---|
-| 1 | 1 MiB | AES-256-GCM | 514 |
-| 4 | 1 MiB | AES-256-GCM | 1614 |
-| 8 | 1 MiB | AES-256-GCM | 1604 |
-| 16 | 1 MiB | AES-256-GCM | 1437 |
-| 8 | 4 KiB | AES-256-GCM | 469 |
-| 8 | 16 KiB | AES-256-GCM | 833 |
-| 8 | 256 KiB | AES-256-GCM | 1617 |
-| 8 | 4 MiB | AES-256-GCM | 1479 |
-| 8 | 1 MiB | ChaCha20-Poly1305 | 1647 |
-
-An earlier full sweep on the same machine differed from this one by up to
-20% per row, in both directions (615 MiB/s at 1 connection, 1715 at 4, 1595
-at 256 KiB chunks), so treat differences under about 20% as noise. Throughput peaks around 1600 MiB/s
-with 4 to 8 connections and chunks of 256 KiB to 1 MiB. At 8 connections the
-two ciphers land within 5% of each other, so past one connection the cipher
-is not what limits this setup. These numbers were not broken down further,
-so which of disk writes, loopback TCP, or scheduling sets the ceiling is not
-established. Small chunks cost real throughput: 4 KiB chunks run at under a
-third of the 1 MiB rate. Chunk size is independent of the network MTU;
-[Chunks, frames, and the MTU](docs/PROTOCOL.md#chunks-frames-and-the-mtu)
-explains why. Loopback numbers say nothing about a real network; rerun the
-script on your own hosts.
-
-Rerun with `scripts/bench.sh [WORKDIR]`; `SIZE_MIB`, `REPEAT`, and `PORT`
-override the defaults.
+Rerun with `scripts/bench.sh [WORKDIR]` (`SIZE_MIB`, `REPEAT`, `PORT`,
+`ROWS`), and measure the raw drive with `python scripts/rawdisk.py FILE`.
 
 ## CI and releases
 
