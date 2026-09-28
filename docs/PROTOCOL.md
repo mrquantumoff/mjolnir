@@ -355,9 +355,16 @@ symbolic link on the receiver or is a file where the map says directory (or
 the reverse), so a link already in the output directory cannot redirect a
 chmod. It checks this on the handle it then changes, not on the path: on
 Unix it opens each component relative to its parent with `O_NOFOLLOW` and
-uses `fchown`, `futimens`, and `fchmod`; on Windows it opens the entry and
-each parent with `FILE_FLAG_OPEN_REPARSE_POINT`, refuses reparse points,
-and sets times and attributes through the handle. Its policy guards against a hostile or careless sender:
+uses `fchown`, `futimens`, and `fchmod`, so no component can be swapped
+for a link between the check and the change. On Windows it opens the
+entry and each parent by path with `FILE_FLAG_OPEN_REPARSE_POINT`,
+refuses reparse points, and sets times and attributes through the final
+handle; Win32 has no handle-relative open, so a parent replaced by a
+junction between its check and the final open is not detected there. The
+Windows guard therefore covers links that exist when the map is applied,
+not ones raced in by a local writer, which is one more reason not to
+receive into a directory other users can write to. Its policy guards
+against a hostile or careless sender:
 
 - **Mode.** On Unix it sets `mode & 0o777`. The setuid, setgid, and sticky
   bits are dropped unless `recv --allow-special-bits` is given. On Windows,

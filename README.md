@@ -168,11 +168,15 @@ listening, so a stranger who reaches the port cannot stop it. An authorized
 sender is trusted with the output directory: it chooses file names and
 sizes. Names are validated so they cannot climb out of `--out`. Metadata
 from the file map is applied through handles opened without following
-links, so a link placed under `--out`, even one swapped in during the
-transfer, cannot redirect a chmod, chown, or time change to a file outside
-it. File data and new directories, however, follow symlinks that already
-exist under `--out`; do not receive into a directory that other users can
-write to.
+links. On Unix every path component is opened relative to its parent, so
+a link placed under `--out`, even one swapped in during the transfer,
+cannot redirect a chmod, chown, or time change to a file outside it. On
+Windows the parents are checked by path and only the final handle is
+opened without following reparse points, so a junction swapped into a
+parent between that check and the open is not caught; the guarantee there
+covers links present when the check runs. File data and new directories
+follow symlinks that already exist under `--out` on every platform. Do
+not receive into a directory that other users can write to.
 
 ## Caveats
 
