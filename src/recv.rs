@@ -487,19 +487,16 @@ impl Target {
         if !self.claimed.set(index) {
             return Ok(Landed::Duplicate);
         }
+        // Hash outside the gate, so only the writes serialize per file.
+        let digest = chunk_digest(plaintext);
         let slot = self.writers.enter();
         let data = if crate::benchmode::get().discard {
             Ok(())
         } else {
             write_all_at(&self.part, plaintext, self.span(index).0)
         };
-        let written = data.and_then(|()| {
-            write_all_at(
-                &self.sums,
-                &chunk_digest(plaintext),
-                index * DIGEST_LEN as u64,
-            )
-        });
+        let written =
+            data.and_then(|()| write_all_at(&self.sums, &digest, index * DIGEST_LEN as u64));
         drop(slot);
         if let Err(e) = written {
             self.claimed.clear(index);
