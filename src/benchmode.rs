@@ -7,6 +7,9 @@
 //!   `--no-verify` and do not check the result.
 //! - `memory-source`: the sender reads every file into memory before it
 //!   connects and serves chunks from there instead of from disk.
+//!
+//! `MJOLNIR_WRITERS_PER_FILE=N` caps how many pool workers may be inside
+//! one file's chunk write at once; unset means no cap.
 
 use std::sync::OnceLock;
 
@@ -14,6 +17,7 @@ use std::sync::OnceLock;
 pub(crate) struct BenchMode {
     pub(crate) discard: bool,
     pub(crate) memory_source: bool,
+    pub(crate) writers_per_file: Option<usize>,
 }
 
 pub(crate) fn get() -> &'static BenchMode {
@@ -30,7 +34,11 @@ pub(crate) fn get() -> &'static BenchMode {
                 _ => {}
             }
         }
-        if mode.discard || mode.memory_source {
+        mode.writers_per_file = std::env::var("MJOLNIR_WRITERS_PER_FILE")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .filter(|&n| n > 0);
+        if mode.discard || mode.memory_source || mode.writers_per_file.is_some() {
             eprintln!("mjolnir: benchmark mode {mode:?}");
         }
         mode

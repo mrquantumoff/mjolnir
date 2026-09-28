@@ -165,6 +165,40 @@ impl Drop for Permit {
     }
 }
 
+/// A blocking counting semaphore: `enter` waits for one of `max` slots and
+/// the guard gives it back.
+pub(crate) struct Gate {
+    free: Mutex<usize>,
+    cv: Condvar,
+}
+
+pub(crate) struct GateGuard<'a>(&'a Gate);
+
+impl Gate {
+    pub(crate) fn new(max: usize) -> Self {
+        Gate {
+            free: Mutex::new(max),
+            cv: Condvar::new(),
+        }
+    }
+
+    pub(crate) fn enter(&self) -> GateGuard<'_> {
+        let mut free = self.free.lock().unwrap();
+        while *free == 0 {
+            free = self.cv.wait(free).unwrap();
+        }
+        *free -= 1;
+        GateGuard(self)
+    }
+}
+
+impl Drop for GateGuard<'_> {
+    fn drop(&mut self) {
+        *self.0.free.lock().unwrap() += 1;
+        self.0.cv.notify_one();
+    }
+}
+
 /// Counts jobs submitted but not finished, so a round can wait for its
 /// frames to land before it reports what is present.
 #[derive(Default)]

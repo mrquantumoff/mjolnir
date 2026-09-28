@@ -9,12 +9,15 @@
 # records both processes' CPU time (in cores busy on average) and the
 # receiver's time per phase; on Windows, typeperf adds machine-wide CPU.
 #
+# Two rows send a directory of many files instead (16 x 128 MiB and
+# 64 x 32 MiB), to show whether files move in parallel.
+#
 # usage: scripts/bench.sh [WORKDIR]
 #   SIZE_MIB  file size in MiB (default 2048)
 #   REPEAT    runs per configuration; rates show median and range (default 3)
 #   PORT      listen port (default 7799)
 #   ROWS      only run rows whose "connections threads chunk cipher verify
-#             hash mode" matches this extended regex, e.g. ROWS='^8 0 1MiB'
+#             hash mode files" matches this extended regex, e.g. ROWS='^8 0 1MiB'
 set -euo pipefail
 # Git Bash on Windows rewrites arguments that start with '/' into Windows
 # paths, and a base64 key can start with '/'.
@@ -43,6 +46,19 @@ if [ ! -f "$src" ] || [ "$(wc -c < "$src")" -ne $((size_mib << 20)) ]; then
 fi
 want="$(sha256sum "$src" | cut -d' ' -f1)"
 
+# A directory of COUNT random files of MIB MiB each, with a checksum list
+# relative to $work.
+multi_dir() {
+  local count="$1" mib="$2" dir="$work/files-${1}x${2}MiB"
+  if [ ! -f "$dir.sha" ]; then
+    echo "writing $count files of $mib MiB to $dir" >&2
+    rm -rf "$dir" && mkdir -p "$dir"
+    for i in $(seq -w "$count"); do head -c $((mib << 20)) /dev/urandom > "$dir/f$i.bin"; done
+    (cd "$work" && sha256sum "$(basename "$dir")"/*.bin > "$dir.sha")
+  fi
+  echo "$dir"
+}
+
 rm -f "$work/s.key" "$work/r.key"
 spub="$("$bin" keygen --out "$work/s.key" 2>/dev/null)"
 rpub="$("$bin" keygen --out "$work/r.key" 2>/dev/null)"
@@ -54,8 +70,12 @@ transfer_rate() { sed -n 's/^transfer [0-9.]* s (\([0-9]*\) MiB\/s).*/\1/p' "$1"
 # <receiver cores> <machine CPU %>" and leaves both sides' phase lines in
 # $work/phases.
 run_once() {
-  local n="$1" threads="$2" chunk="$3" cipher="$4" verify="$5" hash="$6" mode="$7"
-  local out="$work/out" recv_flags=() send_flags=() recv_env="" send_env=""
+  local n="$1" threads="$2" chunk="$3" cipher="$4" verify="$5" hash="$6" mode="$7" files="$8"
+  local out="$work/out" recv_flags=() send_flags=() recv_env="" send_env="" input="$src"
+  if [ "$files" != 1 ]; then
+    local mib="${files#*x}"
+    input="$(multi_dir "${files%x*}" "${mib%MiB}")"
+  fi
   [ "$verify" = off ] && recv_flags+=(--no-verify)
   [ "$hash" = on ] && send_flags+=(--hash)
   case "$mode" in
@@ -77,7 +97,7 @@ run_once() {
   fi
   if ! MJOLNIR_BENCH="$send_env" "$bin" send "127.0.0.1:$port" --key "$work/s.key" \
     --peer "$rpub" -n "$n" --threads "$threads" -c "$chunk" --cipher "$cipher" \
-    "${send_flags[@]}" "$src" 2> "$work/send.log"; then
+    "${send_flags[@]}" "$input" 2> "$work/send.log"; then
     kill "$rpid" 2> /dev/null || true
     cat "$work/send.log" >&2
     exit 1
@@ -93,11 +113,18 @@ run_once() {
   case "$mode" in
     *discard) ;;
     *)
-      local got
-      got="$(sha256sum "$out/$(basename "$src")" | cut -d' ' -f1)"
-      if [ "$got" != "$want" ]; then
-        echo "SHA-256 mismatch for $*" >&2
-        exit 1
+      if [ "$files" != 1 ]; then
+        if ! (cd "$out" && sha256sum -c --quiet "$input.sha"); then
+          echo "SHA-256 mismatch for $*" >&2
+          exit 1
+        fi
+      else
+        local got
+        got="$(sha256sum "$out/$(basename "$src")" | cut -d' ' -f1)"
+        if [ "$got" != "$want" ]; then
+          echo "SHA-256 mismatch for $*" >&2
+          exit 1
+        fi
       fi
       ;;
   esac
@@ -109,13 +136,15 @@ $(transfer_rate "$work/recv.log") $(cores "$work/send.log") $(cores "$work/recv.
 
 median() { sort -n | awk '{ v[NR] = $1 } END { print v[int((NR + 1) / 2)] }'; }
 
-echo "| connections | threads | chunk | cipher | verify | hash | mode | MiB/s, median (min-max) | transfer phase MiB/s, median (min-max) | sender cores | receiver cores | machine CPU % |"
-echo "|---|---|---|---|---|---|---|---|---|---|---|---|"
+echo "| connections | threads | chunk | cipher | verify | hash | mode | files | MiB/s, median (min-max) | transfer phase MiB/s, median (min-max) | sender cores | receiver cores | machine CPU % |"
+echo "|---|---|---|---|---|---|---|---|---|---|---|---|---|"
 : > "$work/phase-table"
 bench() {
-  if [ -n "${ROWS:-}" ] && ! echo "$*" | grep -Eq "$ROWS"; then return; fi
+  local files="${8:-1}"
+  local row="$1 $2 $3 $4 $5 $6 $7 $files"
+  if [ -n "${ROWS:-}" ] && ! echo "$row" | grep -Eq "$ROWS"; then return; fi
   local runs
-  runs="$(for _ in $(seq "$repeat"); do run_once "$@"; done)"
+  runs="$(for _ in $(seq "$repeat"); do run_once "$1" "$2" "$3" "$4" "$5" "$6" "$7" "$files"; done)"
   col() { echo "$runs" | cut -d' ' -f"$1" | median; }
   # "median (min-max)" for the rate columns.
   spread() {
@@ -124,10 +153,11 @@ bench() {
   }
   local threads="$2"
   [ "$threads" = 0 ] && threads=auto
-  echo "| $1 | $threads | $3 | $4 | $5 | $6 | $7 | $(spread 1) | $(spread 2) | $(col 3) | $(col 4) | $(col 5) |"
-  { echo "$*"; sed 's/^/  /' "$work/phases"; } >> "$work/phase-table"
+  echo "| $1 | $threads | $3 | $4 | $5 | $6 | $7 | $files | $(spread 1) | $(spread 2) | $(col 3) | $(col 4) | $(col 5) |"
+  { echo "$row"; sed 's/^/  /' "$work/phases"; } >> "$work/phase-table"
 }
 for n in 1 4 8 16; do bench "$n" 0 1MiB aes256gcm on off disk; done
+for files in 16x128MiB 64x32MiB; do bench 8 0 1MiB aes256gcm on off disk "$files"; done
 for chunk in 4K 16K 256K 4MiB; do bench 8 0 "$chunk" aes256gcm on off disk; done
 bench 8 0 1MiB chacha20poly1305 on off disk
 bench 8 0 1MiB aes256gcm off off disk

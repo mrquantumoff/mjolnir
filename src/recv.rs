@@ -25,7 +25,7 @@ use crate::filemap::{self, ApplyPolicy, FileMap};
 use crate::keys::{PrivateKey, PublicKey, require_nonempty};
 use crate::manifest::{ChunkSize, FileEntry, Manifest, chunk_count, chunk_span};
 use crate::net::{self, Io, tell_peer_about, unexpected};
-use crate::pool::{Buffers, InFlight, Permit, Permits, Pool, buffer_count, resolve_threads};
+use crate::pool::{Buffers, Gate, InFlight, Permit, Permits, Pool, buffer_count, resolve_threads};
 use crate::posio::{read_exact_at, write_all_at};
 use crate::progress::{ActiveConnection, Cancelled, Phase, PhaseTimes, Progress, Stop};
 use crate::wire::{
@@ -322,10 +322,12 @@ impl Receiver {
         let checkpoints = Stop::default();
         let rounds = thread::scope(|s| {
             for _ in 0..pool.threads() {
-                s.spawn(|| pool.work(|job| session.run(job)));
+                spawn_named(s, "mjolnir-worker", || pool.work(|job| session.run(job)));
             }
-            s.spawn(|| accept_data(s, &self.listener, &session));
-            s.spawn(|| {
+            spawn_named(s, "mjolnir-accept", || {
+                accept_data(s, &self.listener, &session)
+            });
+            spawn_named(s, "mjolnir-ckpt", || {
                 while !checkpoints.wait(CHECKPOINT_EVERY) {
                     if let Err(e) = session.checkpoint() {
                         eprintln!("mjolnir: checkpoint failed: {e:#}");
@@ -358,6 +360,17 @@ impl Receiver {
 
 type Tx<'a> = ControlTx<Io<'a>>;
 type Rx<'a> = ControlRx<Io<'a>>;
+
+/// A scoped thread with a name, so profilers can tell the roles apart.
+fn spawn_named<'s, F>(s: &'s Scope<'s, '_>, name: &str, f: F)
+where
+    F: FnOnce() + Send + 's,
+{
+    thread::Builder::new()
+        .name(name.into())
+        .spawn_scoped(s, f)
+        .expect("spawning a session thread");
+}
 
 /// Counters for one session's report.
 #[derive(Default)]
@@ -446,6 +459,8 @@ struct Target {
     claimed: AtomicBitset,
     /// Set after a chunk lands; cleared by the checkpoint that covers it.
     dirty: AtomicBool,
+    /// Bounds the workers writing this file at once (`MJOLNIR_WRITERS_PER_FILE`).
+    writers: Option<Gate>,
 }
 
 /// What became of one authenticated chunk.
@@ -466,6 +481,7 @@ impl Target {
         if !self.claimed.set(index) {
             return Ok(Landed::Duplicate);
         }
+        let slot = self.writers.as_ref().map(Gate::enter);
         let data = if crate::benchmode::get().discard {
             Ok(())
         } else {
@@ -478,6 +494,7 @@ impl Target {
                 index * DIGEST_LEN as u64,
             )
         });
+        drop(slot);
         if let Err(e) = written {
             self.claimed.clear(index);
             return Err(e);
@@ -575,6 +592,7 @@ fn prepare_targets(out: &Path, m: &Manifest, force: bool) -> Result<Vec<Target>>
             present,
             claimed,
             dirty: AtomicBool::new(false),
+            writers: crate::benchmode::get().writers_per_file.map(Gate::new),
         });
     }
     Ok(targets)
@@ -1001,7 +1019,7 @@ fn accept_data<'s, 'e>(s: &'s Scope<'s, 'e>, listener: &'e TcpListener, session:
                     drop(stream);
                     continue;
                 };
-                s.spawn(move || {
+                spawn_named(s, "mjolnir-data", move || {
                     if let Err(e) = serve_data(session, stream, permit)
                         && !session.sync.is_shut()
                         && !session.progress.is_cancelled()
