@@ -197,7 +197,9 @@ loop round = 0, 1, ...:
     S opens up to N data connections, sends every chunk missing from Have
     S -> R : RoundEnd { round, connections }
     R waits until `connections` data connections of this round have closed
-      (at most 30 s), then shuts down any of the round's connections still open
+      (at most 30 s), then shuts down any of the round's connections still
+      open and waits for their reader threads to exit, so nothing of this
+      round can land after this point
     if every chunk is present:
         R syncs, reads every chunk back and checks its digest
         (see "Verification"); mismatches become missing again
@@ -425,8 +427,13 @@ R -> S : 0x01 admitted, or 0x00 rejected (then close)
 ```
 
 The receiver admits a connection only if the MAC is valid, `round` is the
-current round, and `(round, conn)` has not been admitted before. The fresh
-challenge stops a captured hello from being replayed.
+current round, `(round, conn)` has not been admitted before, fewer than 256
+connections have been admitted in this round, and fewer than 256 admitted
+connections are open. Each admitted connection holds a thread and a
+256 KiB read buffer until it closes, so those two caps bound what an
+authorized sender can make the receiver hold; `send --connections` stops
+at the same 256. The fresh challenge stops a captured hello from being
+replayed.
 
 `RoundStart` and the round's data connections travel on different TCP
 connections, so a data connection can reach the receiver before the
@@ -548,7 +555,12 @@ assert that.
 **Late data.** A data connection can outlive its round, for example when it
 stalls, or when the receiver stops waiting for it after the round's
 timeout. When a round closes, the receiver shuts down any of that round's
-connections that are still open, and discards frames still buffered in them.
+connections that are still open, waits for their reader threads to exit,
+and discards frames still buffered in them. Closing the round is a
+barrier: only once every reader of the round is gone does the receiver
+wait for the frames they handed to the workers, and only then does it
+judge whether every chunk is present. A reader that was mid-frame when
+the round closed cannot slip that frame past the verification pass.
 A late connection that tries to join a closed round is rejected at
 admission, because its `round` no longer matches. If a late frame does get
 through before the shutdown, the claim bitset handles it:

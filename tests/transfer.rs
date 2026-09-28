@@ -747,6 +747,81 @@ fn many_chunks_over_two_connections_arrive_once() {
     assert_file_eq(&file, &out.path().join("big.bin"));
 }
 
+/// A hand-driven sender: the control connection through `RoundStart`, so a
+/// test can open data connections itself.
+struct FakeSender {
+    keys: mjolnir::crypto::SessionKeys,
+    addr: SocketAddr,
+    _control: std::net::TcpStream,
+}
+
+impl FakeSender {
+    fn open(addr: SocketAddr, key: &PrivateKey, peer: PublicKey, size: u64) -> FakeSender {
+        use mjolnir::crypto::handshake_initiator;
+        use mjolnir::manifest::OfferFile;
+        use mjolnir::wire::{self, ConnKind, Msg, Role};
+        let mut control = std::net::TcpStream::connect(addr).unwrap();
+        wire::write_preamble(&mut control, ConnKind::Control).unwrap();
+        let keys = handshake_initiator(&mut control, key, &peer).unwrap();
+        let (mut tx, mut rx) = wire::control_channel(
+            control.try_clone().unwrap(),
+            control.try_clone().unwrap(),
+            &keys,
+            Role::Sender,
+        );
+        tx.send(&Msg::Confirm).unwrap();
+        tx.send(&Msg::Offer {
+            chunk_size: 4096,
+            cipher: Cipher::Aes256Gcm,
+            files: vec![OfferFile {
+                path: vec![serde_bytes::ByteBuf::from(&b"fake.bin"[..])],
+                size,
+                mtime: 0,
+            }],
+        })
+        .unwrap();
+        assert!(matches!(rx.recv().unwrap(), Msg::Have { .. }));
+        tx.send(&Msg::RoundStart { round: 0 }).unwrap();
+        FakeSender {
+            keys,
+            addr,
+            _control: control,
+        }
+    }
+
+    /// Opens a data connection for `(round, conn)`; returns it if admitted.
+    fn data(&self, round: u32, conn: u32) -> Option<std::net::TcpStream> {
+        use mjolnir::wire::{self, ADMITTED, ConnKind, encode_hello};
+        use std::io::{Read, Write};
+        let mut s = std::net::TcpStream::connect(self.addr).unwrap();
+        wire::write_preamble(&mut s, ConnKind::Data).unwrap();
+        let mut challenge = [0u8; 32];
+        s.read_exact(&mut challenge).unwrap();
+        s.write_all(&encode_hello(&self.keys, &challenge, round, conn))
+            .unwrap();
+        let mut verdict = [0u8];
+        s.read_exact(&mut verdict).unwrap();
+        (verdict[0] == ADMITTED).then_some(s)
+    }
+}
+
+/// An authorized sender that opens data connections without end must be
+/// stopped at the cap, and the receiver must stay up.
+#[test]
+fn admitted_data_connections_are_capped() {
+    let out = TempDir::new().unwrap();
+    let (rk, rpub) = keypair();
+    let (sk, spub) = keypair();
+    let rx = start_receiver(rk, vec![spub], out.path());
+    let fake = FakeSender::open(rx.addr, &sk, rpub, 4096 * 4);
+    let cap = mjolnir::recv::MAX_DATA_CONNECTIONS as u32;
+    let held: Vec<_> = (0..cap + 8).filter_map(|conn| fake.data(0, conn)).collect();
+    assert_eq!(held.len() as u32, cap, "admissions past the cap");
+    drop(held);
+    rx.progress.cancel();
+    assert!(rx.join().unwrap_err().is::<Cancelled>());
+}
+
 /// A receiver that admits one data connection and then never reads from
 /// it, so the sender's writes block.
 fn stalled_receiver(key: PrivateKey, sender: PublicKey) -> (SocketAddr, JoinHandle<()>) {

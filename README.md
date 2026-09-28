@@ -107,7 +107,7 @@ as `incoming/photos/...`.
 |---|---|---|
 | `--key PATH` | required | this host's private key |
 | `--peer KEY` | required | the receiver's public key |
-| `-n, --connections N` | `8` | parallel data connections |
+| `-n, --connections N` | `8` | parallel data connections, 1 to 256 |
 | `-c, --chunk-size SIZE` | `1MiB` | chunk size, 4 KiB to 64 MiB; accepts `64K`, `256KiB`, `1M`, `4MiB` |
 | `--cipher NAME` | `aes256gcm` | `aes256gcm` or `chacha20poly1305` |
 | `--threads N` | `0` (one per core) | workers that read and encrypt chunks |

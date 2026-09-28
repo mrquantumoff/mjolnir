@@ -5,7 +5,7 @@
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufReader, ErrorKind, Read, Write};
-use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering::Relaxed};
 use std::sync::mpsc::{self, RecvTimeoutError};
@@ -108,6 +108,10 @@ const MAX_PENDING_HANDSHAKES: usize = 256;
 const HANDSHAKE_STACK: usize = 256 << 10;
 /// Data connections not yet admitted at once; more are dropped at accept.
 const MAX_PENDING_DATA: usize = 64;
+/// Admitted data connections open at once, and admissions per round. Each
+/// holds a thread and a 256 KiB reader buffer; the sender's `--connections`
+/// stops at the same number.
+pub const MAX_DATA_CONNECTIONS: usize = 256;
 const DATA_IDLE: Duration = Duration::from_secs(60);
 /// How long a data connection may wait for its round's `RoundStart`.
 const ROUND_START_WAIT: Duration = Duration::from_secs(10);
@@ -330,6 +334,7 @@ impl Receiver {
             fatal: Mutex::new(None),
             checkpoint_lock: Mutex::new(()),
             pending_data: Permits::new(MAX_PENDING_DATA),
+            active_data: Permits::new(MAX_DATA_CONNECTIONS),
             verify_failures: Mutex::new(HashMap::new()),
             pool: &pool,
             buffers: &buffers,
@@ -342,20 +347,25 @@ impl Receiver {
         };
         let checkpoints = Stop::default();
         let rounds = thread::scope(|s| {
-            for _ in 0..pool.threads() {
-                spawn_named(s, "mjolnir-worker", || pool.work(|job| session.run(job)));
-            }
-            spawn_named(s, "mjolnir-accept", || {
-                accept_data(s, &self.listener, &session)
-            });
-            spawn_named(s, "mjolnir-ckpt", || {
-                while !checkpoints.wait(CHECKPOINT_EVERY) {
-                    if let Err(e) = session.checkpoint() {
-                        eprintln!("mjolnir: checkpoint failed: {e:#}");
-                    }
+            let spawned = (|| {
+                for _ in 0..pool.threads() {
+                    spawn_named(s, "mjolnir-worker", || pool.work(|job| session.run(job)))?;
                 }
-            });
-            let result = session.rounds(rx, tx);
+                spawn_named(s, "mjolnir-accept", || {
+                    accept_data(s, &self.listener, &session)
+                })?;
+                spawn_named(s, "mjolnir-ckpt", || {
+                    while !checkpoints.wait(CHECKPOINT_EVERY) {
+                        if let Err(e) = session.checkpoint() {
+                            eprintln!("mjolnir: checkpoint failed: {e:#}");
+                        }
+                    }
+                })
+            })();
+            let result = match spawned {
+                Ok(()) => session.rounds(rx, tx),
+                Err(e) => Err(anyhow!(e).context("starting the session's threads")),
+            };
             checkpoints.stop();
             session.sync.shut();
             pool.close();
@@ -383,14 +393,14 @@ type Tx<'a> = ControlTx<Io<'a>>;
 type Rx<'a> = ControlRx<Io<'a>>;
 
 /// A scoped thread with a name, so profilers can tell the roles apart.
-fn spawn_named<'s, F>(s: &'s Scope<'s, '_>, name: &str, f: F)
+fn spawn_named<'s, F>(s: &'s Scope<'s, '_>, name: &str, f: F) -> io::Result<()>
 where
     F: FnOnce() + Send + 's,
 {
     thread::Builder::new()
         .name(name.into())
         .spawn_scoped(s, f)
-        .expect("spawning a session thread");
+        .map(drop)
 }
 
 /// Counters for one session's report.
@@ -661,6 +671,9 @@ struct Session<'a> {
     checkpoint_lock: Mutex<()>,
     /// Data connections accepted but not yet admitted or rejected.
     pending_data: Arc<Permits>,
+    /// Admitted data connections; a permit is held until the connection
+    /// closes, so a peer cannot open more than `MAX_DATA_CONNECTIONS`.
+    active_data: Arc<Permits>,
     /// Verification failures per `(file, chunk)` this session.
     verify_failures: Mutex<HashMap<(u32, u64), u8>>,
     pool: &'a Pool<RecvJob>,
@@ -1039,7 +1052,7 @@ fn accept_data<'s, 'e>(s: &'s Scope<'s, 'e>, listener: &'e TcpListener, session:
                     drop(stream);
                     continue;
                 };
-                spawn_named(s, "mjolnir-data", move || {
+                let spawned = spawn_named(s, "mjolnir-data", move || {
                     if let Err(e) = serve_data(session, stream, permit)
                         && !session.sync.is_shut()
                         && !session.progress.is_cancelled()
@@ -1047,6 +1060,11 @@ fn accept_data<'s, 'e>(s: &'s Scope<'s, 'e>, listener: &'e TcpListener, session:
                         eprintln!("mjolnir: data connection from {from}: {e:#}");
                     }
                 });
+                if let Err(e) = spawned {
+                    eprintln!(
+                        "mjolnir: cannot start a thread for the data connection from {from}: {e}"
+                    );
+                }
             }
             Err(e) if e.kind() == ErrorKind::WouldBlock => thread::sleep(ACCEPT_POLL),
             Err(e) => {
@@ -1072,14 +1090,24 @@ fn serve_data(session: &Session, stream: TcpStream, pending: Permit) -> Result<(
     hello_io.write_all(&challenge)?;
     let mut hello = [0u8; HELLO_LEN];
     hello_io.read_exact(&mut hello)?;
+    // The active permit is taken before admission, so a rejected hello
+    // never counts, and it is held until this function returns.
+    let active = session.active_data.try_acquire();
     let admitted = check_hello(&session.keys, &challenge, &hello)
-        .filter(|&(round, conn)| session.sync.admit(round, conn, session.progress));
-    let Some((round, conn)) = admitted else {
+        .filter(|_| active.is_some())
+        .and_then(|(round, conn)| {
+            let socket = hello_io.try_clone().ok()?.into_stream();
+            session
+                .sync
+                .admit(round, conn, socket, session.progress)
+                .map(|reader| (round, conn, reader))
+        });
+    let Some((round, conn, _reader)) = admitted else {
         hello_io.write_all(&[REJECTED])?;
         bail!("rejected data connection hello");
     };
     let _closed = ClosedGuard { session, round };
-    let _active = ActiveConnection::new(session.progress);
+    let _shown = ActiveConnection::new(session.progress);
     hello_io.write_all(&[ADMITTED])?;
     drop(pending);
     let conn = Arc::new(RecvConn {
@@ -1100,6 +1128,25 @@ struct ClosedGuard<'a> {
 impl Drop for ClosedGuard<'_> {
     fn drop(&mut self) {
         self.session.sync.closed(self.round);
+    }
+}
+
+/// Marks a round's reader thread as alive: while any exists, the round
+/// cannot close, because the reader might still hand the pool a frame.
+struct ReaderGuard<'a> {
+    sync: &'a RoundSync,
+    round: u32,
+}
+
+impl Drop for ReaderGuard<'_> {
+    fn drop(&mut self) {
+        let mut state = self.sync.state.lock().unwrap();
+        if let RoundState::Open { round, readers, .. } = &mut *state
+            && *round == self.round
+        {
+            *readers -= 1;
+            self.sync.cv.notify_all();
+        }
     }
 }
 
@@ -1181,6 +1228,10 @@ enum RoundState {
         round: u32,
         admitted: HashSet<u32>,
         closed: u32,
+        /// Reader threads of this round still running.
+        readers: usize,
+        /// The admitted sockets, so closing the round can shut them down.
+        sockets: Vec<TcpStream>,
     },
     /// The session is over; nothing more is admitted.
     Shut,
@@ -1203,14 +1254,23 @@ impl RoundSync {
             round,
             admitted: HashSet::new(),
             closed: 0,
+            readers: 0,
+            sockets: Vec::new(),
         };
         self.cv.notify_all();
         Ok(())
     }
 
-    /// Admits `(round, conn)` once. A connection may beat its `RoundStart`
-    /// to the receiver, so it waits a little for the round to open.
-    fn admit(&self, round: u32, conn: u32, progress: &Progress) -> bool {
+    /// Admits `(round, conn)` once, up to `MAX_DATA_CONNECTIONS` per round,
+    /// and registers its reader. A connection may beat its `RoundStart` to
+    /// the receiver, so it waits a little for the round to open.
+    fn admit(
+        &self,
+        round: u32,
+        conn: u32,
+        socket: TcpStream,
+        progress: &Progress,
+    ) -> Option<ReaderGuard<'_>> {
         let deadline = Instant::now() + ROUND_START_WAIT;
         let mut state = self.state.lock().unwrap();
         loop {
@@ -1218,14 +1278,23 @@ impl RoundSync {
                 RoundState::Open {
                     round: open,
                     admitted,
+                    readers,
+                    sockets,
                     ..
-                } if *open == round => return admitted.insert(conn),
+                } if *open == round => {
+                    if admitted.len() >= MAX_DATA_CONNECTIONS || !admitted.insert(conn) {
+                        return None;
+                    }
+                    *readers += 1;
+                    sockets.push(socket);
+                    return Some(ReaderGuard { sync: self, round });
+                }
                 RoundState::Between { next } if *next == round => {}
-                _ => return false,
+                _ => return None,
             }
             let now = Instant::now();
             if now >= deadline || progress.is_cancelled() {
-                return false;
+                return None;
             }
             let wait = (deadline - now).min(Duration::from_millis(100));
             state = self.cv.wait_timeout(state, wait).unwrap().0;
@@ -1255,8 +1324,10 @@ impl RoundSync {
     }
 
     /// Waits up to `ROUND_CLOSE_WAIT` for `connections` admitted
-    /// connections of `round` to close, then closes the round: connections
-    /// still open drop their buffered frames and hang up.
+    /// connections of `round` to close, then closes the round: it shuts
+    /// down every socket the round admitted and waits for every reader
+    /// thread to exit. Only then can nothing more be submitted for the
+    /// round, so the caller's `wait_idle` is a real barrier.
     fn end(&self, round: u32, connections: u32, progress: &Progress) -> Result<()> {
         let deadline = Instant::now() + ROUND_CLOSE_WAIT;
         let mut state = self.state.lock().unwrap();
@@ -1288,8 +1359,18 @@ impl RoundSync {
                 .unwrap()
                 .0;
         }
-        *state = RoundState::Between { next: round + 1 };
         self.closed_below.store(round + 1, Relaxed);
+        if let RoundState::Open { sockets, .. } = &mut *state {
+            for socket in sockets.drain(..) {
+                let _ = socket.shutdown(Shutdown::Both);
+            }
+        }
+        while let RoundState::Open { readers, .. } = &*state
+            && *readers > 0
+        {
+            state = self.cv.wait(state).unwrap();
+        }
+        *state = RoundState::Between { next: round + 1 };
         if progress.is_cancelled() {
             return Err(Cancelled::Local.into());
         }
@@ -1329,6 +1410,64 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    /// A reader that is still alive when `RoundEnd` arrives could hand the
+    /// pool a frame after the round's completeness has been judged. Closing
+    /// the round must shut its socket and wait for it to exit first.
+    #[test]
+    fn closing_a_round_shuts_its_sockets_and_waits_for_its_readers() {
+        let sync = RoundSync::default();
+        let progress = Progress::default();
+        sync.start(0).unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let mut peer = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (ours, _) = listener.accept().unwrap();
+        let reader = sync
+            .admit(0, 0, ours, &progress)
+            .expect("the open round admits its first connection");
+        let ended = AtomicBool::new(false);
+        thread::scope(|s| {
+            s.spawn(|| {
+                sync.end(0, 0, &progress).unwrap();
+                ended.store(true, Relaxed);
+            });
+            peer.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+            assert_eq!(
+                peer.read(&mut [0u8; 1]).unwrap(),
+                0,
+                "closing the round shuts the admitted socket"
+            );
+            assert!(sync.is_closed(0));
+            thread::sleep(Duration::from_millis(200));
+            assert!(!ended.load(Relaxed), "the round closed with a reader alive");
+            drop(reader);
+        });
+        assert!(ended.load(Relaxed));
+        assert!(
+            sync.admit(0, 1, peer, &progress).is_none(),
+            "closed rounds admit nothing"
+        );
+    }
+
+    #[test]
+    fn a_round_admits_at_most_the_connection_cap() {
+        let sync = RoundSync::default();
+        let progress = Progress::default();
+        sync.start(0).unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let socket = || {
+            let _peer = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+            listener.accept().unwrap().0
+        };
+        let held: Vec<_> = (0..MAX_DATA_CONNECTIONS as u32)
+            .map(|conn| {
+                sync.admit(0, conn, socket(), &progress)
+                    .expect("under the cap")
+            })
+            .collect();
+        assert!(sync.admit(0, u32::MAX, socket(), &progress).is_none());
+        drop(held);
     }
 
     #[test]

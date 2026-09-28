@@ -25,6 +25,7 @@ use crate::net::{self, Io, tell_peer_about, unexpected};
 use crate::pool::{Buffers, InFlight, Pool, buffer_count, resolve_threads};
 use crate::posio::read_exact_at;
 use crate::progress::{ActiveConnection, Cancelled, Phase, PhaseTimes, Progress};
+use crate::recv::MAX_DATA_CONNECTIONS;
 use crate::schedule::Scheduler;
 use crate::wire::{
     self, ADMITTED, CHALLENGE_LEN, ConnKind, ControlRx, ControlTx, DIGESTS_PER_MSG, FrameHeader,
@@ -178,8 +179,8 @@ fn run(cfg: &SendConfig, progress: &Progress) -> Result<SendReport> {
     let start = Instant::now();
     progress.set_phase(Phase::Connecting);
     ensure!(
-        (1..=1024).contains(&cfg.connections),
-        "connections must be between 1 and 1024"
+        (1..=MAX_DATA_CONNECTIONS).contains(&cfg.connections),
+        "connections must be between 1 and {MAX_DATA_CONNECTIONS}"
     );
     let chunk_size = ChunkSize::new(cfg.chunk_size)?;
     let captured = filemap::capture(&cfg.paths, cfg.preserve)?;
