@@ -313,7 +313,7 @@ impl Receiver {
         let pool = Pool::new(resolve_threads(self.cfg.threads));
         let buf_len = manifest.chunk_size.get() as usize + TAG_LEN;
         let buffers = Buffers::new(
-            buffer_count(pool.threads(), EXPECTED_CONNECTIONS, buf_len),
+            buffer_count(pool.threads(), EXPECTED_CONNECTIONS, buf_len, usize::MAX),
             buf_len,
         );
         let starts = targets
@@ -1211,7 +1211,10 @@ impl Session<'_> {
         self.progress.set_totals(total_chunks, total_bytes);
         let run = &self.verify_run;
         run.cursor.store(0, Relaxed);
-        for _ in 0..self.pool.threads().min(MAX_VERIFY_THREADS) {
+        let jobs = usize::try_from(total_chunks)
+            .map_or(MAX_VERIFY_THREADS, |n| n.min(MAX_VERIFY_THREADS))
+            .min(self.pool.threads());
+        for _ in 0..jobs {
             self.in_flight.add();
             self.pool.submit(RecvJob::Verify);
         }
@@ -1229,7 +1232,11 @@ impl Session<'_> {
     fn verify_some(&self) {
         let run = &self.verify_run;
         let total = self.targets.iter().map(|t| t.present.len()).sum();
-        let mut buf = vec![0u8; self.manifest.chunk_size.get() as usize];
+        let stop = || self.progress.is_cancelled();
+        // No frames move during verification, so a pooled buffer is free.
+        let Some(mut buf) = self.buffers.take(&stop) else {
+            return;
+        };
         while let n = run.cursor.fetch_add(1, Relaxed)
             && n < total
             && !self.progress.is_cancelled()
@@ -1238,9 +1245,10 @@ impl Session<'_> {
             let (t, index) = (&self.targets[file], n - run.starts[file]);
             if let Err(e) = self.verify_chunk(file as u32, t, index, &mut buf) {
                 *run.failure.lock().unwrap() = Some(e);
-                return;
+                break;
             }
         }
+        self.buffers.give(buf);
     }
 
     /// Runs one pool job.

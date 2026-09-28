@@ -83,12 +83,19 @@ pub(crate) struct Buffers {
     cv: Condvar,
 }
 
-/// Buffers held at once: `2 * threads + connections`, shrunk to fit in
-/// 1 GiB but never fewer than `threads`.
-pub(crate) fn buffer_count(threads: usize, connections: usize, buf_len: usize) -> usize {
+/// Buffers held at once: `2 * threads + connections`, but never more than
+/// `useful` (what the caller's pipeline can hold) and never more than fit
+/// in 1 GiB. The budget is real: with fewer buffers than workers, the
+/// spare workers wait, which costs nothing when the buffers are the limit.
+pub(crate) fn buffer_count(
+    threads: usize,
+    connections: usize,
+    buf_len: usize,
+    useful: usize,
+) -> usize {
     let wanted = 2 * threads + connections;
     let fits = (1usize << 30) / buf_len.max(1);
-    wanted.min(fits).max(threads)
+    wanted.min(useful).min(fits).max(1)
 }
 
 impl Buffers {
@@ -270,9 +277,14 @@ mod tests {
 
     #[test]
     fn buffer_count_bounds() {
-        assert_eq!(buffer_count(8, 4, 1 << 20), 20);
-        assert_eq!(buffer_count(32, 8, 64 << 20), 32);
-        assert_eq!(buffer_count(2, 1, 256 << 20), 4);
+        assert_eq!(buffer_count(8, 4, 1 << 20, usize::MAX), 20);
+        assert_eq!(
+            buffer_count(32, 8, 64 << 20, usize::MAX),
+            16,
+            "1 GiB budget"
+        );
+        assert_eq!(buffer_count(2, 1, 256 << 20, usize::MAX), 4);
+        assert_eq!(buffer_count(32, 1, 1 << 20, 8), 8, "pipeline cap");
     }
 
     #[test]

@@ -287,8 +287,12 @@ fn run(cfg: &SendConfig, progress: &Progress) -> Result<SendReport> {
         wire::control_channel(control.try_clone()?, control, &keys, Role::Sender);
     let pool = Pool::new(resolve_threads(cfg.threads));
     let buf_len = HEADER_LEN + chunk_size.get() as usize + TAG_LEN;
+    // Each connection holds at most DEPTH frames between sealing and the
+    // socket, so more buffers than that only wait; the hash passes keep a
+    // few workers reading even on one connection.
+    let useful = (cfg.connections * DEPTH).max(pool.threads().min(8));
     let buffers = Buffers::new(
-        buffer_count(pool.threads(), cfg.connections, buf_len),
+        buffer_count(pool.threads(), cfg.connections, buf_len, useful),
         buf_len,
     );
     let ctx = Ctx {
@@ -754,7 +758,8 @@ fn hash_window(ctx: &Ctx, file: u32, first: u64, n: u64) -> Result<Vec<u8>> {
     *run.window.lock().unwrap() = (file, first, n);
     *run.out.lock().unwrap() = vec![0u8; n as usize * DIGEST_LEN];
     run.cursor.store(0, Relaxed);
-    for _ in 0..ctx.pool.threads() {
+    let jobs = usize::try_from(n).map_or(ctx.pool.threads(), |n| ctx.pool.threads().min(n));
+    for _ in 0..jobs {
         ctx.in_flight.add();
         ctx.pool.submit(SendJob::Hash);
     }
@@ -773,12 +778,17 @@ fn hash_some(ctx: &Ctx) {
     let run = &ctx.hashing;
     let (file, first, n) = *run.window.lock().unwrap();
     let entry = &ctx.manifest.files[file as usize];
-    let mut buf = vec![0u8; ctx.manifest.chunk_size.get() as usize];
+    let stop = || ctx.progress.is_cancelled();
+    // A pooled frame buffer is idle between rounds and large enough.
+    let Some(mut buf) = ctx.buffers.take(&stop) else {
+        return;
+    };
     let mut done = Vec::new();
     let source = match ctx.files.get(file) {
         Ok(f) => f,
         Err(e) => {
             *run.error.lock().unwrap() = Some(e);
+            ctx.buffers.give(buf);
             return;
         }
     };
@@ -791,11 +801,13 @@ fn hash_some(ctx: &Ctx) {
         if let Err(e) = read_exact_at(&source, data, offset) {
             let e = anyhow!(e).context(format!("re-reading {}", entry.path.display()));
             *run.error.lock().unwrap() = Some(e);
+            ctx.buffers.give(buf);
             return;
         }
         done.push((i, chunk_digest(data)));
         ctx.progress.add_chunk(u64::from(len));
     }
+    ctx.buffers.give(buf);
     let mut out = run.out.lock().unwrap();
     for (i, digest) in done {
         out[i as usize * DIGEST_LEN..][..DIGEST_LEN].copy_from_slice(&digest);
