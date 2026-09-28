@@ -211,29 +211,31 @@ write to.
 ## Benchmark
 
 Full tables and method: [docs/BENCHMARKS.md](docs/BENCHMARKS.md). Loopback on
-one machine (Ryzen 9 9950X), 2 GiB of random data, medians of 3 runs, commit
-b8f5e18. Every output matched the source's SHA-256.
+one machine (Ryzen 9 9950X, Samsung 970 EVO Plus), 2 GiB of random data,
+medians of 3 runs, commit 4daa636. Every output matched the source's SHA-256.
 
 | Setup | Windows | Linux (WSL2, ext4) |
 |---|---|---|
-| Raw disk write + fsync, 1 writer | 2007 MiB/s | 1802 MiB/s |
-| 1 connection, 1 MiB chunks | 670 MiB/s | 1950 MiB/s |
-| 8 connections, 1 MiB chunks | 1155 MiB/s | 1167 MiB/s |
-| 8 connections, receiver discards data (no disk) | 4530 MiB/s | 4978 MiB/s |
-| No disk, 2 connections, 16 workers (transfer phase) | 3312 MiB/s | 5948 MiB/s |
+| Raw disk write + fsync, 1 writer | 868 MiB/s | 1311 MiB/s |
+| 1 connection, 1 MiB chunks | 823 MiB/s | 844 MiB/s |
+| 8 connections, 1 MiB chunks | 786 MiB/s | 744 MiB/s |
+| 8 connections, 16 files of 128 MiB | 1059 MiB/s | 1090 MiB/s |
+| 8 connections, receiver discards data (no disk) | 3553 MiB/s | 3713 MiB/s |
+| No disk, 2 connections, 16 workers (transfer phase) | 2218 MiB/s | 5583 MiB/s |
 
 Crypto scales with `--threads` until the connections' network threads are
-the limit, at about 1.4-2 GiB/s per connection with 1 worker and up to 3.5
-GiB/s with 4 or more. With a disk in the loop, the limit is mjolnir's receive
-write path. Linux writes at raw disk speed on 1 connection but slows down as
-more connections write into the same file. Windows plateaus at about 70% of
-raw disk speed. Capping concurrent writers per file is the next performance
-fix. 4 KiB chunks cost 4-5x throughput. Chunk size is independent of the
-network MTU; see [Chunks, frames, and the
+the limit, at about 1.4 GiB/s per connection with 1 worker and up to 3.5
+GiB/s with 16. With a disk in the loop, the drive is the limit: both OSes
+write one file at 750-850 MiB/s from 1 to 16 connections with the receiver
+on 1.3-1.7 cores, and a directory of files goes faster because files move
+in parallel. The drive itself was in a slower state than at the previous
+run (2.0 GiB/s raw then, 0.9-1.3 now); the tables say how that was handled.
+4 KiB chunks cost 4-5x throughput. Chunk size is independent of the network
+MTU; see [Chunks, frames, and the
 MTU](docs/PROTOCOL.md#chunks-frames-and-the-mtu).
 
 Rerun with `scripts/bench.sh [WORKDIR]` (`SIZE_MIB`, `REPEAT`, `PORT`,
-`ROWS`), and measure the raw drive with `python scripts/rawdisk.py FILE`.
+`ROWS`, `PAUSE`), and measure the raw drive with `python scripts/rawdisk.py FILE`.
 
 ## CI and releases
 
