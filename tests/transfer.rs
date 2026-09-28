@@ -662,8 +662,14 @@ fn receiver_cancel_is_prompt_with_a_silent_connection_pending() {
     let started = Instant::now();
     rx.progress.cancel();
     let err = rx.join().unwrap_err();
+    let latency = started.elapsed();
     assert_eq!(err.downcast_ref::<Cancelled>(), Some(&Cancelled::Local));
-    assert!(started.elapsed() < Duration::from_secs(1));
+    // The receiver returns at its next 5 ms accept poll, joining nothing;
+    // the rest is waiting for a CPU. On a loaded Windows runner a 5 ms
+    // sleep has overrun by 845 ms and this cancel took 2.1 s, so the bound
+    // sits well above that and well below the 10 s handshake deadline a
+    // receiver blocked on the silent peer would wait out.
+    assert!(latency < Duration::from_secs(5), "cancel took {latency:?}");
 }
 
 #[test]
