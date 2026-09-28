@@ -188,7 +188,7 @@ write to.
   before sending it. Two links to one target send it twice. Special files,
   dangling links, and link loops are skipped with a warning, and so is
   every link with `--no-follow-symlinks`, including a link given as a path.
-  A followed link given as a path arrives under its target's name. File
+  A followed link given as a path arrives under the link's own name. File
   names travel as raw bytes, so a
   name that the receiver's file system cannot store (a `:` or a trailing
   `.` on Windows, invalid UTF-8 on macOS) is stored with the affected

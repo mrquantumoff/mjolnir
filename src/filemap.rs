@@ -123,9 +123,10 @@ pub struct Skipped {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SkipReason {
-    /// A special file, a link to one, or any link when links are not
-    /// followed.
+    /// A special file or a link to one.
     NotRegular,
+    /// Any link, when links are not followed.
+    NotFollowed,
     /// A link whose target does not exist.
     Dangling,
     /// A directory link back to `ancestor`, which is already being walked,
@@ -137,6 +138,7 @@ impl std::fmt::Display for SkipReason {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             SkipReason::NotRegular => f.write_str("not a regular file or directory"),
+            SkipReason::NotFollowed => f.write_str("symbolic link, not followed"),
             SkipReason::Dangling => f.write_str("dangling symbolic link"),
             SkipReason::Loop { ancestor: None } => f.write_str("symlink loop"),
             SkipReason::Loop {
@@ -173,7 +175,8 @@ impl FileMap {
 /// Walks the sender's roots, naming them the way the sender does: a file
 /// root is its own name, and a directory root's name prefixes everything
 /// under it. With `follow_symlinks`, links, roots included, are sent as
-/// their targets, contents and metadata; without it, they are skipped.
+/// their targets' contents and metadata under the link's own name; without
+/// it, they are skipped.
 pub fn capture(roots: &[PathBuf], preserve: Preserve, follow_symlinks: bool) -> Result<Captured> {
     ensure!(!roots.is_empty(), "nothing to send");
     let mut out = Captured::default();
@@ -181,15 +184,18 @@ pub fn capture(roots: &[PathBuf], preserve: Preserve, follow_symlinks: bool) -> 
         let own = fs::symlink_metadata(root);
         let own = own.with_context(|| format!("reading {}", root.display()))?;
         if own.is_symlink() && !follow_symlinks {
-            out.skip(root.clone(), SkipReason::NotRegular);
+            out.skip(root.clone(), SkipReason::NotFollowed);
             continue;
         }
         let meta = fs::metadata(root).with_context(|| format!("reading {}", root.display()))?;
-        let base = root
-            .canonicalize()
-            .with_context(|| format!("resolving {}", root.display()))?
-            .file_name()
-            .map(PathBuf::from);
+        let base = if own.is_symlink() {
+            root.file_name().map(PathBuf::from)
+        } else {
+            root.canonicalize()
+                .with_context(|| format!("resolving {}", root.display()))?
+                .file_name()
+                .map(PathBuf::from)
+        };
         if meta.is_file() {
             let name = base.with_context(|| format!("{} has no file name", root.display()))?;
             out.push_file(root.clone(), &name, &meta, preserve)?;
@@ -237,6 +243,8 @@ pub fn capture(roots: &[PathBuf], preserve: Preserve, follow_symlinks: bool) -> 
                     .push(entry_for(path, EntryKind::Dir, &meta, preserve));
             } else if file_type.is_file() {
                 out.push_file(entry.into_path(), &named, &meta, preserve)?;
+            } else if file_type.is_symlink() {
+                out.skip(entry.into_path(), SkipReason::NotFollowed);
             } else {
                 out.skip(entry.into_path(), SkipReason::NotRegular);
             }

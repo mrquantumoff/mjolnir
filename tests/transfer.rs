@@ -930,6 +930,36 @@ fn awkward_names_round_trip() {
     assert_file_eq(&file, &out.path().join(awkward_name()));
 }
 
+#[test]
+fn root_links_arrive_under_their_own_names() {
+    let src = TempDir::new().unwrap();
+    let run = src.path().join("run-42");
+    write(&run.join("f.bin"), &noise(50_000, 23));
+    let (latest, current) = (src.path().join("latest"), src.path().join("current"));
+    #[cfg(unix)]
+    let made = std::os::unix::fs::symlink(&run, &latest)
+        .and_then(|()| std::os::unix::fs::symlink(&run, &current));
+    #[cfg(windows)]
+    let made = std::os::windows::fs::symlink_dir(&run, &latest)
+        .and_then(|()| std::os::windows::fs::symlink_dir(&run, &current));
+    if let Err(e) = made {
+        eprintln!("skipping: cannot create a symlink here: {e}");
+        return;
+    }
+    let out = TempDir::new().unwrap();
+    let (rk, _) = keypair();
+    let (sk, spub) = keypair();
+    let rx = start_receiver(rk, vec![spub], out.path());
+    let report = Send::to(sk, rx.public)
+        .run(rx.addr, &[&latest, &current])
+        .unwrap();
+    rx.join().unwrap();
+    assert_eq!(report.files, 2);
+    assert_file_eq(&run.join("f.bin"), &out.path().join("latest/f.bin"));
+    assert_file_eq(&run.join("f.bin"), &out.path().join("current/f.bin"));
+    assert!(!out.path().join("run-42").exists());
+}
+
 /// `data/{real.bin, flink, dlink}`, where `flink` and `dlink` link to a file
 /// and a directory (holding `deep.bin` and an empty `void/`) outside `data`.
 /// None when this system cannot make links.

@@ -222,11 +222,13 @@ fn not_following_skips_links_and_does_not_descend() {
     assert_eq!(
         skipped(&captured),
         [
-            (dir_link, SkipReason::NotRegular),
-            (file_link, SkipReason::NotRegular)
+            (dir_link, SkipReason::NotFollowed),
+            (file_link, SkipReason::NotFollowed)
         ]
     );
     assert!(paths(&captured).iter().all(|(p, _)| !p.contains("link")));
+    let shown = captured.skipped[0].reason.to_string();
+    assert_eq!(shown, "symbolic link, not followed");
 }
 
 #[test]
@@ -319,8 +321,15 @@ fn symlinked_roots_are_followed_or_skipped_like_any_link() {
     }
     let linked_roots = [dir_root.clone(), file_root.clone()];
     let direct = paths(&capture(&roots, Preserve::default()).unwrap());
+    let under_link_names: Vec<_> = direct
+        .iter()
+        .map(|(p, kind)| {
+            let p = p.replacen("tree", "rootlink", 1);
+            (p.replace("single.bin", "filelink"), *kind)
+        })
+        .collect();
     let followed = capture(&linked_roots, Preserve::default()).unwrap();
-    assert_eq!(paths(&followed), direct);
+    assert_eq!(paths(&followed), under_link_names);
     assert!(followed.skipped.is_empty());
 
     let unfollowed = super::capture(&linked_roots, Preserve::default(), false).unwrap();
@@ -328,10 +337,32 @@ fn symlinked_roots_are_followed_or_skipped_like_any_link() {
     assert_eq!(
         skipped(&unfollowed),
         [
-            (dir_root, SkipReason::NotRegular),
-            (file_root, SkipReason::NotRegular)
+            (dir_root, SkipReason::NotFollowed),
+            (file_root, SkipReason::NotFollowed)
         ]
     );
+}
+
+#[test]
+fn two_root_links_to_one_target_are_both_sent() {
+    let (tmp, roots) = sample_tree();
+    let (one, two) = (tmp.path().join("one"), tmp.path().join("two"));
+    if !made_links(&[(&roots[0], &one, true), (&roots[0], &two, true)]) {
+        return;
+    }
+    let captured = capture(&[one, two], Preserve::default()).unwrap();
+    let files: Vec<_> = captured.files.iter().map(|f| f.path.display()).collect();
+    assert_eq!(
+        files,
+        [
+            "one/a/b/c/deep.txt",
+            "one/a/top.txt",
+            "two/a/b/c/deep.txt",
+            "two/a/top.txt"
+        ]
+    );
+    let offer: Vec<_> = captured.files.iter().map(|f| f.path.clone()).collect();
+    captured.map.check(&offer).unwrap();
 }
 
 #[test]

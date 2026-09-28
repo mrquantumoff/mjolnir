@@ -302,13 +302,13 @@ walked as a directory, both under the link's own name and with the
 target's size, mtime, and mode. Links are followed wherever they point,
 including outside the sent root, and two links to one target send it
 twice, once under each name. A link given as a root is followed the same
-way, but is named after its target, not the link. The
-sender skips, and lists in a warning, special files (FIFOs, sockets,
-devices) and links to them, dangling links, and links that loop: a
-directory link back to one of its ancestors, or a chain of links that
+way and named after the link, so `latest` pointing to `run-42` arrives as
+`latest`. The sender skips, and lists in a warning, special files (FIFOs,
+sockets, devices) and links to them, dangling links, and links that loop:
+a directory link back to one of its ancestors, or a chain of links that
 never reaches a target. With `send --no-follow-symlinks`, it skips every
-link the same way, roots included, and does not descend into directory
-links.
+link, roots included, with the warning "symbolic link, not followed", and
+does not descend into directory links.
 
 ## File map
 
