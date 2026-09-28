@@ -11,7 +11,9 @@ use serde_json::{Value, json};
 
 use super::fs;
 use super::http::Method;
-use super::jobs::{FileHash, Job, JobId, JobState, Jobs, Outcome, RemoveError, Report};
+use super::jobs::{
+    Busy, FileHash, Job, JobId, JobState, Jobs, Outcome, RemoveError, Report, Summary, Totals,
+};
 use crate::filemap::{ApplyPolicy, Preserve};
 use crate::keys::{PrivateKey, PublicKey};
 use crate::manifest::{MAX_CHUNK_SIZE, MIN_CHUNK_SIZE};
@@ -113,20 +115,22 @@ fn file_hashes(pairs: Vec<(String, String)>) -> Vec<FileHash> {
 impl From<SendReport> for Report {
     fn from(r: SendReport) -> Report {
         Report {
-            files: r.files as u64,
-            bytes: r.bytes_sent,
-            elapsed_ms: r.elapsed.as_millis() as u64,
-            verified: r.verified,
-            hashed: r.hashed,
-            chunks_resent: r.chunks_resent,
-            repaired_chunks: 0,
-            hash_repaired_chunks: r.hash_repaired_chunks,
-            stale_chunks: 0,
-            duplicate_chunks: 0,
+            totals: Totals {
+                files: r.files as u64,
+                bytes: r.bytes_sent,
+                elapsed_ms: r.elapsed.as_millis() as u64,
+                verified: r.verified,
+                hashed: r.hashed,
+                chunks_resent: r.chunks_resent,
+                repaired_chunks: 0,
+                hash_repaired_chunks: r.hash_repaired_chunks,
+                stale_chunks: 0,
+                duplicate_chunks: 0,
+                phase_times: r.phase_times.into(),
+            },
             file_hashes: file_hashes(r.file_hashes),
             warnings: r.warnings,
             skipped: r.skipped,
-            phase_times: r.phase_times.into(),
         }
     }
 }
@@ -134,20 +138,22 @@ impl From<SendReport> for Report {
 impl From<RecvReport> for Report {
     fn from(r: RecvReport) -> Report {
         Report {
-            files: r.files as u64,
-            bytes: r.bytes_received,
-            elapsed_ms: r.elapsed.as_millis() as u64,
-            verified: r.verified,
-            hashed: r.hashed,
-            chunks_resent: 0,
-            repaired_chunks: r.repaired_chunks,
-            hash_repaired_chunks: r.hash_repaired_chunks,
-            stale_chunks: r.stale_chunks,
-            duplicate_chunks: r.duplicate_chunks,
+            totals: Totals {
+                files: r.files as u64,
+                bytes: r.bytes_received,
+                elapsed_ms: r.elapsed.as_millis() as u64,
+                verified: r.verified,
+                hashed: r.hashed,
+                chunks_resent: 0,
+                repaired_chunks: r.repaired_chunks,
+                hash_repaired_chunks: r.hash_repaired_chunks,
+                stale_chunks: r.stale_chunks,
+                duplicate_chunks: r.duplicate_chunks,
+                phase_times: r.phase_times.into(),
+            },
             file_hashes: file_hashes(r.file_hashes),
             warnings: r.warnings,
             skipped: r.skipped,
-            phase_times: r.phase_times.into(),
         }
     }
 }
@@ -165,9 +171,13 @@ pub fn route(
             "public_key": app.key.public_key().to_string(),
             "key_path": app.key_path,
         }))),
-        (Method::Get, ["transfers"]) => Ok(Reply::Json(json!({
-            "transfers": app.jobs.map_newest_first(view),
-        }))),
+        (Method::Get, ["transfers"]) => {
+            let transfers = app
+                .jobs
+                .map_newest_first(|job| view(job, |r| Summary::from(&**r)));
+            Ok(Reply::Json(json!({ "transfers": transfers })))
+        }
+        (Method::Get, ["transfers", id]) => transfer(app, job_id(id)?),
         (Method::Post, ["send"]) => start_send(app, parse(body)?),
         (Method::Post, ["receive"]) => start_receive(app, parse(body)?),
         (Method::Post, ["transfers", id, "cancel"]) => {
@@ -208,13 +218,22 @@ fn parse<T: for<'de> Deserialize<'de>>(body: Value) -> Result<T, ApiError> {
         .map_err(|e| ApiError::new(400, None, format!("invalid request: {e}")))
 }
 
+fn busy(Busy(max): Busy) -> ApiError {
+    ApiError::new(
+        429,
+        None,
+        format!("{max} transfers are already running; wait for one to end or cancel one"),
+    )
+}
+
 fn job_id(s: &str) -> Result<JobId, ApiError> {
     s.parse().map_err(|_| ApiError::not_found())
 }
 
 fn transfer(app: &App, id: JobId) -> Result<Reply, ApiError> {
     app.jobs
-        .with(id, |job| Reply::Json(json!(view(job))))
+        .with(id, |job| view(job, Arc::clone))
+        .map(|view| Reply::Json(json!(view)))
         .ok_or_else(ApiError::not_found)
 }
 
@@ -347,9 +366,12 @@ fn start_send(app: &App, req: SendRequest) -> Result<Reply, ApiError> {
         hash: req.hash,
         preserve: req.preserve,
     };
-    let id = app.jobs.spawn(spec, move |progress| {
-        crate::send(cfg, progress).map(Report::from)
-    });
+    let id = app
+        .jobs
+        .spawn(spec, move |progress| {
+            crate::send(cfg, progress).map(Report::from)
+        })
+        .map_err(busy)?;
     transfer(app, id)
 }
 
@@ -413,21 +435,27 @@ fn start_receive(app: &App, req: ReceiveRequest) -> Result<Reply, ApiError> {
         threads,
         apply: req.apply,
     };
-    let id = app.jobs.spawn(spec, move |progress| {
-        receiver.run(progress).map(Report::from)
-    });
+    let id = app
+        .jobs
+        .spawn(spec, move |progress| {
+            receiver.run(progress).map(Report::from)
+        })
+        .map_err(busy)?;
     transfer(app, id)
 }
 
 #[derive(Serialize)]
-struct TransferView<'a> {
+/// A job copied out of the registry, so it is serialized after the lock is
+/// released. `R` is the report's shape: a `Summary` in the list, the whole
+/// `Report` for one transfer.
+struct TransferView<R> {
     id: JobId,
     #[serde(flatten)]
-    spec: &'a JobSpec,
+    spec: JobSpec,
     created_at_ms: u64,
     state: &'static str,
-    error: Option<&'a str>,
-    report: Option<&'a Report>,
+    error: Option<String>,
+    report: Option<R>,
     bound_addr: Option<SocketAddr>,
     progress: ProgressView,
     elapsed_ms: u64,
@@ -443,12 +471,12 @@ struct ProgressView {
     active_connections: u64,
 }
 
-fn view(job: &Job) -> Value {
+fn view<R>(job: &Job, report: impl FnOnce(&Arc<Report>) -> R) -> TransferView<R> {
     let (state, error, report) = match &job.state {
         JobState::Running => ("running", None, None),
         JobState::Ended { outcome, .. } => match outcome {
-            Outcome::Done(r) => ("done", None, Some(r)),
-            Outcome::Failed(e) => ("failed", Some(e.as_str()), None),
+            Outcome::Done(r) => ("done", None, Some(report(r))),
+            Outcome::Failed(e) => ("failed", Some(e.clone()), None),
             Outcome::Cancelled => ("cancelled", None, None),
         },
     };
@@ -457,9 +485,9 @@ fn view(job: &Job) -> Value {
         JobSpec::Send { .. } => None,
     };
     let s = job.progress.snapshot();
-    json!(TransferView {
+    TransferView {
         id: job.id,
-        spec: &job.spec,
+        spec: job.spec.clone(),
         created_at_ms: job
             .created_at
             .duration_since(UNIX_EPOCH)
@@ -477,7 +505,7 @@ fn view(job: &Job) -> Value {
             active_connections: s.active_connections,
         },
         elapsed_ms: job.elapsed_ms(),
-    })
+    }
 }
 
 fn phase_name(p: Phase) -> &'static str {

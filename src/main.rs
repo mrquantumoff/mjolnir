@@ -8,6 +8,7 @@ use anyhow::{Result, bail};
 use clap::{Parser, Subcommand};
 
 use mjolnir::filemap::{ApplyPolicy, Preserve};
+use mjolnir::printable::escape;
 use mjolnir::{
     Cipher, Phase, PhaseTimes, PrivateKey, Progress, PublicKey, Receiver, RecvConfig, SendConfig,
     load_authorized_keys, parse_size, web,
@@ -111,7 +112,7 @@ enum Cmd {
 
 fn main() {
     if let Err(e) = run(Cli::parse().cmd) {
-        eprintln!("mjolnir: error: {e:#}");
+        eprintln!("mjolnir: error: {}", escape(&format!("{e:#}")));
         std::process::exit(1);
     }
 }
@@ -351,11 +352,11 @@ fn peak_memory() -> Option<u64> {
 fn report_files(hashed: bool, file_hashes: &[(String, String)], warnings: &[String]) {
     if hashed {
         for (path, hash) in file_hashes {
-            eprintln!("file_hash {hash}  {path}");
+            eprintln!("file_hash {hash}  {}", escape(path));
         }
     }
     for w in warnings {
-        eprintln!("warning: {w}");
+        eprintln!("warning: {}", escape(w));
     }
 }
 

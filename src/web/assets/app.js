@@ -812,6 +812,28 @@ function buildReport(report) {
   ];
 }
 
+// The list carries a summary of each report. The full report, with its
+// warnings, skipped files and file hashes, is fetched once and built once,
+// so an opened hashes section survives later polls.
+function showReport(refs, transfer) {
+  refs.report.hidden = !transfer.report;
+  if (!transfer.report || refs.reportFull) return;
+  refs.report.replaceChildren(...buildReport(transfer.report).filter(Boolean));
+  refs.reportFull = Array.isArray(transfer.report.file_hashes);
+  if (!refs.reportFull && !refs.reportLoading) loadReport(transfer.id, refs);
+}
+
+async function loadReport(id, refs) {
+  refs.reportLoading = true;
+  try {
+    showReport(refs, await api('GET', '/api/transfers/' + id));
+  } catch {
+    // Tried again on the next poll.
+  } finally {
+    refs.reportLoading = false;
+  }
+}
+
 function updateCard(refs, transfer) {
   const running = transfer.state === 'running';
   const info = statusInfo(transfer);
@@ -837,12 +859,7 @@ function updateCard(refs, transfer) {
 
   refs.error.hidden = !transfer.error;
   refs.error.textContent = transfer.error || '';
-  refs.report.hidden = !transfer.report;
-  // Built once so an opened hashes section survives later polls.
-  if (transfer.report && !refs.reportBuilt) {
-    refs.report.replaceChildren(...buildReport(transfer.report).filter(Boolean));
-    refs.reportBuilt = true;
-  }
+  showReport(refs, transfer);
 
   if (refs.boundAddr) {
     const addr = transfer.bound_addr || transfer.spec.listen;

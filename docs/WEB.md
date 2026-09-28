@@ -128,8 +128,11 @@ so every request is treated as hostile until it proves otherwise.
   most 64 connections are served at once; further ones are closed at
   accept. Every field is parsed and range-checked in the handler before any
   work starts.
-- **The private key never leaves the process.** The API returns only the
-  public key and the key file's path.
+- **No endpoint returns the private key.** The API gives only the public
+  key and the key file's path. The key file is still a file this user can
+  read, though, so whoever holds the token can pick it, like any other
+  readable file, in a send to a receiver of their choosing. The token is
+  what guards it.
 
 ## API
 
@@ -156,7 +159,16 @@ have the shape `{ "error": "message", "field": "name" | null }`, where
 
 ### `GET /api/transfers`
 
-`{ "transfers": [Transfer, ...] }`, newest first.
+`{ "transfers": [Transfer, ...] }`, newest first. The 100 most recently
+ended transfers are kept; older ones drop off the list. In the list, a
+`report` is a summary: the totals below, with `file_hash_count`,
+`warning_count`, and `skipped_count` in place of the three lists, so a poll
+stays small however many files the finished transfers held.
+
+### `GET /api/transfers/{id}`
+
+One Transfer with its whole `report`, lists included. The UI fetches it
+once when a transfer ends.
 
 ```json
 {
@@ -243,6 +255,10 @@ per core), `hash`, and `preserve` are optional with the defaults shown.
 `preserve` must name all three flags when given.
 `addr` may be a host name; it is resolved when the transfer starts. Every
 path must exist. Returns the new Transfer.
+
+At most 16 transfers, sends and receives together, run at once; one more
+is refused with 429 until one ends. A transfer whose thread cannot start,
+or whose code panics, ends as `failed` rather than staying `running`.
 
 ### `POST /api/receive`
 

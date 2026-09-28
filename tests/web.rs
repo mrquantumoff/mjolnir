@@ -403,6 +403,26 @@ fn receiver_on_a_busy_port_is_400() {
 }
 
 #[test]
+fn running_transfers_are_capped_at_16() {
+    let ui = start();
+    let out = tempfile::tempdir().unwrap();
+    let folder = |i: usize| {
+        let dir = out.path().join(format!("r{i}"));
+        std::fs::create_dir(&dir).unwrap();
+        dir
+    };
+    let ids: Vec<u64> = (0..16).map(|i| start_receiver(&ui, &folder(i)).0).collect();
+    let body =
+        json!({ "listen": "127.0.0.1:0", "authorized": [ui.public_key], "out_dir": folder(16) });
+    let r = post(&ui, "/api/receive", body.clone());
+    assert_eq!(r.status, 429, "{}", r.body);
+    let c = post(&ui, &format!("/api/transfers/{}/cancel", ids[0]), json!({}));
+    assert_eq!(c.status, 200);
+    wait_until_ended(&ui, ids[0]);
+    assert_eq!(post(&ui, "/api/receive", body).status, 200);
+}
+
+#[test]
 fn index_is_served_with_security_headers() {
     let ui = start();
     let r = raw(&ui, "GET", "/", &[("Authorization", "")], b"");
@@ -498,6 +518,12 @@ fn send_a_directory_end_to_end() {
     assert_eq!(sent["state"], "done", "{sent}");
     let received = wait_until_ended(&ui, recv_id);
     assert_eq!(received["state"], "done", "{received}");
+    let summary = &sent["report"];
+    assert_eq!(summary["file_hash_count"], files.len(), "{summary}");
+    assert_eq!(summary["files"], files.len(), "{summary}");
+    assert!(summary.get("file_hashes").is_none(), "{summary}");
+    let sent = get(&ui, &format!("/api/transfers/{send_id}")).body;
+    let received = get(&ui, &format!("/api/transfers/{recv_id}")).body;
     assert_eq!(received["report"]["files"], files.len());
     assert_eq!(received["report"]["verified"], true);
     assert_eq!(received["report"]["hashed"], true);

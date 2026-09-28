@@ -11,6 +11,11 @@ permissions:
 env:
   CARGO_TERM_COLOR: always
 
+# Third-party actions are pinned to full commit SHAs, and the toolchain to
+# an exact release, so a moved tag upstream cannot change what builds the
+# release binaries. To update one, resolve the new tag with
+# `gh api repos/OWNER/REPO/git/ref/tags/TAG` and keep the comment in step.
+
 jobs:
   build:
     name: ${{ matrix.target }}
@@ -35,10 +40,11 @@ jobs:
             os: windows-2022
             test: false
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master, 2026-09-12
         with:
+          toolchain: 1.98.1
           targets: ${{ matrix.target }}
 
       - name: Install the AArch64 cross toolchain
@@ -48,7 +54,7 @@ jobs:
           sudo apt-get install -y gcc-aarch64-linux-gnu
           echo "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc" >> "$GITHUB_ENV"
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           key: ${{ matrix.target }}
 
@@ -58,6 +64,17 @@ jobs:
 
       - name: Build
         run: cargo build --release --locked --target ${{ matrix.target }}
+
+      # .cargo/config.toml turns on the ARMv8 AES and GHASH backends; without
+      # them the binary holds no AESE or PMULL instruction at all.
+      - name: Check for ARMv8 AES and PMULL code
+        if: matrix.target == 'aarch64-unknown-linux-gnu'
+        run: |
+          aarch64-linux-gnu-objdump -d target/${{ matrix.target }}/release/mjolnir > "$RUNNER_TEMP/disasm"
+          aese="$(grep -cw aese "$RUNNER_TEMP/disasm" || true)"
+          pmull="$(grep -cw pmull "$RUNNER_TEMP/disasm" || true)"
+          echo "aese: $aese, pmull: $pmull"
+          [ "$aese" -gt 0 ] && [ "$pmull" -gt 0 ]
 
       - name: Package (Linux)
         if: runner.os == 'Linux'
@@ -75,21 +92,40 @@ jobs:
           Compress-Archive -Path "target/${{ matrix.target }}/release/mjolnir.exe", README.md `
             -DestinationPath "dist/mjolnir-${{ matrix.target }}.zip"
 
-      - uses: actions/upload-artifact@v7
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: mjolnir-${{ matrix.target }}
           path: dist/*
           if-no-files-found: error
 
+  # Tests only: no macOS build is released. The runner is Apple silicon, so
+  # this is also where the ARMv8 AES backend runs, on APFS.
+  macos:
+    name: aarch64-apple-darwin (tests)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master, 2026-09-12
+        with:
+          toolchain: 1.98.1
+
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+
+      - name: Test
+        run: cargo test --locked
+
   release:
     name: Release
-    needs: build
-    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [build, macos]
+    # Only a pushed tag publishes. A manual run started on a tag has the same
+    # ref, and the README promises that manual runs publish nothing.
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     permissions:
       contents: write
     steps:
-      - uses: actions/download-artifact@v8
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           path: dist
           merge-multiple: true

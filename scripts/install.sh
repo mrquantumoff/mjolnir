@@ -50,15 +50,22 @@ download_with_gh() {
     die "gh could not download $asset from $repo ($version)"
 }
 
+# curl with the token's Authorization header. The header goes in as a curl
+# config on stdin, written by the printf builtin, so the token never appears
+# in a process's arguments, where other users could read it.
+curl_with_token() {
+  printf 'header = "Authorization: Bearer %s"\n' "$token" |
+    curl --config - -fsSL -H "X-GitHub-Api-Version: 2022-11-28" "$@"
+}
+
 download_with_token() {
   local api="https://api.github.com/repos/$repo/releases" release url name
-  local auth=(-H "Authorization: Bearer $token" -H "X-GitHub-Api-Version: 2022-11-28")
   if [ "$version" = latest ]; then url="$api/latest"; else url="$api/tags/$version"; fi
-  release="$(curl -fsSL "${auth[@]}" -H "Accept: application/vnd.github+json" "$url")" ||
+  release="$(curl_with_token -H "Accept: application/vnd.github+json" "$url")" ||
     die "no release $version in $repo, or the token cannot read it"
   for name in "$asset" SHA256SUMS; do
     url="$(asset_url "$release" "$name")" || die "release $version has no $name"
-    curl -fsSL "${auth[@]}" -H "Accept: application/octet-stream" -o "$tmp/$name" "$url" ||
+    curl_with_token -H "Accept: application/octet-stream" -o "$tmp/$name" "$url" ||
       die "downloading $name failed"
   done
 }

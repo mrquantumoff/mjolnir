@@ -22,11 +22,12 @@ gh api repos/mrquantumoff/mjolnir/contents/scripts/install.sh \
     -H "Accept: application/vnd.github.raw" | bash
 ```
 
-With a token and no GitHub CLI:
+With a token and no GitHub CLI (the header reaches curl as a config on
+stdin, so the token does not show up in the process list):
 
 ```sh
-curl -fsSL -H "Authorization: Bearer $GH_TOKEN" \
-    -H "Accept: application/vnd.github.raw" \
+printf 'header = "Authorization: Bearer %s"\n' "$GH_TOKEN" |
+    curl -fsSL --config - -H "Accept: application/vnd.github.raw" \
     https://api.github.com/repos/mrquantumoff/mjolnir/contents/scripts/install.sh | bash
 ```
 
@@ -76,7 +77,11 @@ at the end.
 
 `mjolnir keygen [--out PATH]` writes a new private key (default
 `mjolnir.key`) and prints its public key. It refuses to overwrite an
-existing file. On Unix the file has mode `0600`.
+existing file. On Unix the file has mode `0600`. On Windows it gets an
+access list of its own, inheriting nothing from its folder, that grants
+only your account, SYSTEM, and Administrators. Every command that reads a
+key refuses one that other accounts can read or change, and says how to
+restrict it (`chmod 600` or `icacls`).
 
 `mjolnir pubkey --key PATH` prints the public key of an existing private
 key.
@@ -92,7 +97,7 @@ key.
 | `--out DIR` | `.` | where files land |
 | `--force` | off | overwrite existing files; without it a file that appears at the destination during the transfer fails the transfer instead of being replaced |
 | `--no-verify` | off | skip reading every chunk back before finishing |
-| `--threads N` | `0` (one per core) | workers that decrypt, write, and verify chunks |
+| `--threads N` | `0` (one per core) | workers that decrypt, write, and verify chunks, at most 1024 |
 | `--allow-owner` | off | apply file owners from the sender (only as root, on Unix) |
 | `--allow-special-bits` | off | keep setuid, setgid, and sticky bits from the sender |
 
@@ -110,7 +115,7 @@ as `incoming/photos/...`.
 | `-n, --connections N` | `8` | parallel data connections, 1 to 256 |
 | `-c, --chunk-size SIZE` | `1MiB` | chunk size, 4 KiB to 64 MiB; accepts `64K`, `256KiB`, `1M`, `4MiB` |
 | `--cipher NAME` | `aes256gcm` | `aes256gcm` or `chacha20poly1305` |
-| `--threads N` | `0` (one per core) | workers that read and encrypt chunks |
+| `--threads N` | `0` (one per core) | workers that read and encrypt chunks, at most 1024 |
 | `--hash` | off | after delivery, re-read every file and have the receiver compare chunk digests; mismatched chunks are sent again |
 | `--preserve LIST` | `perms` | metadata to copy: `none`, or any of `perms`, `times`, `owner` |
 
@@ -227,7 +232,8 @@ not receive into a directory that other users can write to.
 
 Full tables and method: [docs/BENCHMARKS.md](docs/BENCHMARKS.md). Loopback on
 one machine (Ryzen 9 9950X, Samsung 970 EVO Plus), 2 GiB of random data,
-medians of 3 runs, commit 4daa636. Every output matched the source's SHA-256.
+medians of 3 runs, commit 4daa636. Every disk-writing output matched the
+source's SHA-256; the discard rows write nothing to check.
 
 | Setup | Windows | Linux (WSL2, ext4) |
 |---|---|---|
@@ -258,9 +264,11 @@ Rerun with `scripts/bench.sh [WORKDIR]` (`SIZE_MIB`, `REPEAT`, `PORT`,
 binaries for `x86_64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu`,
 `x86_64-pc-windows-msvc`, and `aarch64-pc-windows-msvc`, and runs the tests
 on the two x86_64 targets. The aarch64 targets cross-compile on x86_64
-runners, so their tests do not run. It runs only for tags that start with
+runners, so their tests do not run. A macOS job runs the tests on Apple
+silicon and APFS; no macOS binary is released. It runs only for tags that start with
 `v`, or when started by hand from the Actions tab, which builds without
-publishing anything.
+publishing anything. Every action it uses is pinned to a commit SHA, and
+the toolchain to an exact Rust release.
 
 Pushing a `v` tag builds and publishes a release from that tag:
 

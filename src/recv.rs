@@ -28,6 +28,7 @@ use crate::manifest::{ChunkSize, FileEntry, Manifest, chunk_count, chunk_span};
 use crate::net::{self, Io, tell_peer_about, unexpected};
 use crate::pool::{Buffers, Gate, InFlight, Permit, Permits, Pool, buffer_count, resolve_threads};
 use crate::posio::{read_exact_at, write_all_at};
+use crate::printable;
 use crate::progress::{ActiveConnection, Cancelled, Phase, PhaseTimes, Progress, Stop};
 use crate::wire::{
     self, ADMITTED, CHALLENGE_LEN, ConnKind, ControlRx, ControlTx, FrameHeader, HEADER_LEN,
@@ -142,6 +143,7 @@ struct Handshaken {
 impl Receiver {
     pub fn bind(cfg: RecvConfig) -> Result<Self> {
         require_nonempty(&cfg.authorized)?;
+        crate::pool::check_threads(cfg.threads)?;
         let listener =
             net::listen(cfg.listen).with_context(|| format!("listening on {}", cfg.listen))?;
         listener.set_nonblocking(true)?;
@@ -225,8 +227,9 @@ impl Receiver {
                 Ok(report) => return Ok(report),
                 Err(e) if progress.is_cancelled() => return Err(e),
                 Err(e) => {
+                    let e = printable::escape(&format!("{e:#}")).into_owned();
                     eprintln!(
-                        "mjolnir: session with {peer} failed: {e:#}; waiting for the next sender"
+                        "mjolnir: session with {peer} failed: {e}; waiting for the next sender"
                     )
                 }
             }
@@ -262,7 +265,7 @@ impl Receiver {
         let mut rx = ControlRx::resume(control, rx_cipher);
         let result = self.receive(h.keys, h.peer, offer, &mut rx, &mut tx, progress);
         if let Err(e) = &result {
-            tell_peer_about(e, progress, Some(&mut tx));
+            tell_peer_about(e, progress, Some(&mut tx), Some(&self.cfg.out_dir));
             net::linger(rx.into_inner().into_stream());
         }
         let o = result?;
@@ -372,7 +375,10 @@ impl Receiver {
                 spawn_named(s, "mjolnir-ckpt", || {
                     while !checkpoints.wait(CHECKPOINT_EVERY) {
                         if let Err(e) = session.checkpoint() {
-                            eprintln!("mjolnir: checkpoint failed: {e:#}");
+                            eprintln!(
+                                "mjolnir: checkpoint failed: {}",
+                                printable::escape(&format!("{e:#}"))
+                            );
                         }
                     }
                 })
@@ -392,7 +398,10 @@ impl Receiver {
         if rounds.is_err()
             && let Err(e) = session.checkpoint()
         {
-            eprintln!("mjolnir: checkpoint failed: {e:#}");
+            eprintln!(
+                "mjolnir: checkpoint failed: {}",
+                printable::escape(&format!("{e:#}"))
+            );
         }
         let finish = rounds?;
         Ok(Outcome {
@@ -1001,7 +1010,7 @@ impl Session<'_> {
                 self.finalize(&done.map)?;
                 let warnings = filemap::apply(&done.map, self.out_dir, self.policy);
                 for w in &warnings {
-                    eprintln!("mjolnir: {w}");
+                    eprintln!("mjolnir: {}", printable::escape(w));
                 }
                 tx.send(&Msg::Finished {
                     verified: self.verify,

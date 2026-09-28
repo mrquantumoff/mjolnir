@@ -66,6 +66,39 @@ rm -f "$work/s.key" "$work/r.key"
 spub="$("$bin" keygen --out "$work/s.key" 2>/dev/null)"
 rpub="$("$bin" keygen --out "$work/r.key" 2>/dev/null)"
 
+# The receiver and typeperf of the run in progress, stopped on any exit so a
+# failed or interrupted run leaves nothing behind.
+rpid=""
+tpid=""
+stop_typeperf() {
+  [ -n "$tpid" ] || return 0
+  # typeperf is a native Windows process: stop it by its own PID, never by
+  # image name, which would also end typeperf runs this script did not start.
+  local winpid
+  winpid="$(cat "/proc/$tpid/winpid" 2> /dev/null || true)"
+  if [ -n "$winpid" ]; then
+    taskkill /F /PID "$winpid" > /dev/null 2>&1 || true
+  else
+    kill "$tpid" 2> /dev/null || true
+  fi
+  wait "$tpid" 2> /dev/null || true
+  tpid=""
+}
+cleanup() {
+  if [ -n "$rpid" ]; then
+    kill "$rpid" 2> /dev/null || true
+    wait "$rpid" 2> /dev/null || true
+  fi
+  stop_typeperf
+}
+# Subshells do not inherit traps, and each row's runs happen in one.
+clean_on_exit() {
+  trap cleanup EXIT
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
+}
+clean_on_exit
+
 cores() { sed -n 's/^cpu .* s, \([0-9.]*\) cores busy.*/\1/p' "$1"; }
 transfer_rate() { sed -n 's/^transfer [0-9.]* s (\([0-9]*\) MiB\/s).*/\1/p' "$1"; }
 
@@ -91,26 +124,26 @@ run_once() {
   MJOLNIR_BENCH="$recv_env" "$bin" recv --key "$work/r.key" --allow "$spub" \
     --listen "127.0.0.1:$port" --out "$out" --threads "$threads" "${recv_flags[@]}" \
     2> "$work/recv.log" &
-  local rpid=$!
+  rpid=$!
   for _ in $(seq 100); do
     grep -q "listening on" "$work/recv.log" 2>/dev/null && break
     sleep 0.05
   done
   if $have_typeperf; then
     typeperf '\Processor(_Total)\% Processor Time' -si 1 > "$work/cpu.txt" 2>&1 &
+    tpid=$!
   fi
   if ! MJOLNIR_BENCH="$send_env" "$bin" send "127.0.0.1:$port" --key "$work/s.key" \
     --peer "$rpub" -n "$n" --threads "$threads" -c "$chunk" --cipher "$cipher" \
     "${send_flags[@]}" "$input" 2> "$work/send.log"; then
-    kill "$rpid" 2> /dev/null || true
     cat "$work/send.log" >&2
     exit 1
   fi
   wait "$rpid"
+  rpid=""
   local cpu="-"
   if $have_typeperf; then
-    taskkill /F /IM typeperf.exe > /dev/null 2>&1 || true
-    wait 2> /dev/null || true
+    stop_typeperf
     cpu="$(tr -d '\r' < "$work/cpu.txt" | grep '^"[0-9]' | cut -d, -f2 | tr -d '"' |
       awk 'NF { s += $1; c++ } END { if (c) printf "%.0f", s / c; else print "-" }')"
   fi
@@ -148,7 +181,7 @@ bench() {
   local row="$1 $2 $3 $4 $5 $6 $7 $files"
   if [ -n "${ROWS:-}" ] && ! echo "$row" | grep -Eq "$ROWS"; then return; fi
   local runs
-  runs="$(for _ in $(seq "$repeat"); do run_once "$1" "$2" "$3" "$4" "$5" "$6" "$7" "$files"; done)"
+  runs="$(clean_on_exit; for _ in $(seq "$repeat"); do run_once "$1" "$2" "$3" "$4" "$5" "$6" "$7" "$files"; done)"
   col() { echo "$runs" | cut -d' ' -f"$1" | median; }
   # "median (min-max)" for the rate columns.
   spread() {

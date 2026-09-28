@@ -202,10 +202,10 @@ Also relevant, briefly:
   - There is no multipath across interfaces, which iroh 1.x has.
 - **No SSH ecosystem.** mscp, HPN-SSH, lftp and rclone reuse existing `sshd`, keys, agents, bastions, FIDO tokens and audit logging. Mjolnir needs its own listener and its own key distribution. Revocation means editing a file.
 - **Single-shot receiver.** One process serves one transfer, then exits. There is no daemon mode, no multi-tenant access control, no third-party transfers (GridFTP/Globus/FDT do these) and no multicast (UFTP).
-  - Also note: after message 1, the receiver "closes ... and exits" on an unauthorized key. Anyone who can reach the port can therefore end a waiting receiver with a single bogus handshake. Consider dropping the connection and continuing to listen.
+  - A bogus or unauthorized handshake does not end a waiting receiver: it drops that connection, logs it, and keeps listening, as does a failed session. Only a finished transfer or a local cancel ends it.
 - **Integrity scope.** The per-chunk AEAD proves that chunks arrived intact from the authenticated sender. Some gaps remain:
-  - No whole-file content hash (compare sendme's BLAKE3 root or `hpnscp`'s BLAKE2b), so a source file that changes during the transfer is not detected.
-  - No re-check of already-written data when resuming.
+  - The sender compares each file's size and mtime with the offer after every round, so a source that grows, shrinks or is touched during the transfer fails it. A change that keeps both goes unnoticed unless `--hash` is on, which re-reads every file after delivery and sends again each chunk whose digest differs. `file_hash` is a BLAKE3 over those chunk digests, not a hash of the file's bytes (compare sendme's BLAKE3 root or `hpnscp`'s BLAKE2b).
+  - Resumed data is read back and checked by default, like every chunk. It is checked against digests saved by the earlier session, though, so this proves the bytes are what arrived then, not that they still match the source. Only `--hash` compares them with fresh digests from the sender.
   - Resume matching uses `size`, `mtime` and `chunk_size` only.
 - **Metadata leakage.** File sizes and timing are visible, since there is no padding. XFTP pads its chunks [53].
 - **Maturity.** Every tool above has years of field use or a published evaluation (mscp: PEARC '23; WDT: Facebook production; FASP: industry standard). Mjolnir has none yet.

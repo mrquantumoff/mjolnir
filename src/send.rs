@@ -23,7 +23,7 @@ use crate::filemap::{self, EntryKind, FileMap, Preserve};
 use crate::keys::{PrivateKey, PublicKey};
 use crate::manifest::{ChunkId, ChunkSize, FileEntry, Manifest, chunk_count, chunk_span, mtime_of};
 use crate::net::{self, Io, tell_peer_about, unexpected};
-use crate::pool::{Buffers, InFlight, Pool, buffer_count, resolve_threads};
+use crate::pool::{Buffers, InFlight, Pool, buffer_count, check_threads, resolve_threads};
 use crate::posio::read_exact_at;
 use crate::progress::{ActiveConnection, Cancelled, Phase, PhaseTimes, Progress};
 use crate::recv::MAX_DATA_CONNECTIONS;
@@ -245,6 +245,7 @@ fn run(cfg: &SendConfig, progress: &Progress) -> Result<SendReport> {
         (1..=MAX_DATA_CONNECTIONS).contains(&cfg.connections),
         "connections must be between 1 and {MAX_DATA_CONNECTIONS}"
     );
+    check_threads(cfg.threads)?;
     let chunk_size = ChunkSize::new(cfg.chunk_size)?;
     let captured = filemap::capture(&cfg.paths, cfg.preserve)?;
     let paths: Vec<PathBuf> = captured.files.iter().map(|f| f.source.clone()).collect();
@@ -277,7 +278,10 @@ fn run(cfg: &SendConfig, progress: &Progress) -> Result<SendReport> {
         .map(|p| p.display().to_string())
         .collect();
     for p in &skipped {
-        eprintln!("mjolnir: skipping {p}: not a regular file or directory");
+        eprintln!(
+            "mjolnir: skipping {}: not a regular file or directory",
+            crate::printable::escape(p)
+        );
     }
 
     let addrs = net::resolve(&cfg.addr)?;
@@ -325,7 +329,7 @@ fn run(cfg: &SendConfig, progress: &Progress) -> Result<SendReport> {
         result
     });
     if let Err(e) = &result {
-        tell_peer_about(e, progress, Some(&mut tx));
+        tell_peer_about(e, progress, Some(&mut tx), None);
         net::linger(rx.into_inner().into_stream());
     }
     let done = result?;
@@ -851,7 +855,9 @@ fn seal(ctx: &Ctx, job: SealJob) {
     conn.slots[k as usize % DEPTH].put(buf, sealed.map(|()| frame_len));
 }
 
-/// Fails if any source's size or mtime differs from the offer.
+/// Fails if any source's size or mtime differs from the offer. The error
+/// goes to the receiver too, so it names the file by its transfer path,
+/// not by where it lives on this host.
 fn check_unchanged(ctx: &Ctx) -> Result<()> {
     for (entry, path) in ctx.manifest.files.iter().zip(ctx.paths) {
         let changed = match fs::metadata(path) {
@@ -861,7 +867,7 @@ fn check_unchanged(ctx: &Ctx) -> Result<()> {
         ensure!(
             !changed,
             "source file changed during transfer: {}",
-            path.display()
+            entry.path.display()
         );
     }
     Ok(())

@@ -186,8 +186,11 @@ rights, so this is attributed to the SSD's write cache and heat, not
 measured. Hence PAUSE=20 before each disk run, one OS per block, rests
 between blocks, and medians with ranges. Treat differences under about
 20% between disk rows as noise, and use the CPU columns, which are
-stable, when comparing builds. The no-disk rows do not touch the drive
-and were consistent all day.
+stable, when comparing builds. The no-disk rows do not touch the drive,
+so its state does not explain their spread, but they are not steady
+either: on Linux, `memory+discard` at 8 connections ranged from 596 to
+2,778 MiB/s in the transfer phase across its three runs. Read them by
+median and range like the disk rows; the tables keep each row's range.
 
 One NTFS effect is worth knowing and was left alone: writing far past
 the valid data length of a pre-sized file makes NTFS zero-fill up to

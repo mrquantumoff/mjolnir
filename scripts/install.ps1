@@ -18,6 +18,17 @@ param(
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
 
+# The directory goes into the user PATH, so it must be one absolute
+# filesystem path: a relative entry would resolve against whatever folder a
+# later terminal starts in, and a ';' would split it into several entries.
+if ($InstallDir.Contains(';')) {
+    throw "install: the install directory must not contain ';', the PATH separator: $InstallDir"
+}
+$InstallDir = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($InstallDir)
+if (-not [System.IO.Path]::IsPathRooted($InstallDir) -or $InstallDir -notmatch '^([A-Za-z]:\\|\\\\)') {
+    throw "install: the install directory must be a filesystem path: $InstallDir"
+}
+
 $arch = switch ([System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture) {
     'X64' { 'x86_64' }
     'Arm64' { 'aarch64' }
