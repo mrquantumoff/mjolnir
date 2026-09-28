@@ -143,19 +143,20 @@ pub fn control_channel<R: Read, W: Write>(
 }
 
 impl<W: Write> ControlTx<W> {
+    /// Serializes straight into one buffer with the length prefix's four
+    /// bytes reserved, seals in place, and writes it once: no copy of the
+    /// sealed message into a framed buffer.
     pub fn send(&mut self, msg: &Msg) -> Result<()> {
-        let mut buf = postcard::to_allocvec(msg)?;
-        buf.extend_from_slice(&[0u8; TAG_LEN]);
+        let mut buf = postcard::to_extend(msg, vec![0u8; 4])?;
+        buf.resize(buf.len() + TAG_LEN, 0);
+        let len = buf.len() - 4;
         ensure!(
-            buf.len() <= MAX_CONTROL_LEN,
-            "control message is {} bytes, over the 64 MiB limit",
-            buf.len()
+            len <= MAX_CONTROL_LEN,
+            "control message is {len} bytes, over the 64 MiB limit"
         );
-        self.cipher.seal(b"", &mut buf)?;
-        let mut framed = Vec::with_capacity(4 + buf.len());
-        framed.extend_from_slice(&(buf.len() as u32).to_be_bytes());
-        framed.extend_from_slice(&buf);
-        self.writer.write_all(&framed)?;
+        self.cipher.seal(b"", &mut buf[4..])?;
+        buf[..4].copy_from_slice(&(len as u32).to_be_bytes());
+        self.writer.write_all(&buf)?;
         Ok(())
     }
 }
@@ -489,6 +490,44 @@ mod tests {
         let err = rx.recv().unwrap_err();
         assert!(format!("{err:#}").contains("mid-message"), "{err:#}");
         assert!(rx.into_inner().largest_read <= READ_STEP + 16);
+    }
+
+    /// Cost of sending a 64 MiB `Have`, the old two-copy framing against
+    /// the reserved-prefix one. Run with
+    /// `cargo test --release --lib bench_control_framing -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn bench_control_framing() {
+        use std::time::Instant;
+        let keys = SessionKeys::derive(&[1u8; 32], &[2u8; 32]);
+        let big = Msg::Have {
+            bitmaps: vec![vec![0xA5; MAX_CONTROL_LEN - 64]],
+        };
+        for _ in 0..3 {
+            let mut old_cipher = CipherState::new(Cipher::ChaCha20Poly1305, &keys.ctrl_s2r);
+            let started = Instant::now();
+            let mut buf = postcard::to_allocvec(&big).unwrap();
+            buf.extend_from_slice(&[0u8; TAG_LEN]);
+            old_cipher.seal(b"", &mut buf).unwrap();
+            let mut framed = Vec::with_capacity(4 + buf.len());
+            framed.extend_from_slice(&(buf.len() as u32).to_be_bytes());
+            framed.extend_from_slice(&buf);
+            std::hint::black_box(&framed);
+            let old = started.elapsed();
+            let old_bytes = buf.capacity() + framed.capacity();
+            drop((buf, framed));
+
+            let (mut tx, _) = control_channel(&[][..], Vec::new(), &keys, Role::Sender);
+            let started = Instant::now();
+            tx.send(&big).unwrap();
+            let new = started.elapsed();
+            let new_bytes = tx.writer.capacity();
+            eprintln!(
+                "64 MiB Have: old {old:?} with {} MiB of buffers; new {new:?} with {} MiB",
+                old_bytes >> 20,
+                new_bytes >> 20
+            );
+        }
     }
 
     #[test]

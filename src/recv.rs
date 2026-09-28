@@ -662,6 +662,24 @@ struct Store {
     handles: Handles,
 }
 
+/// `BLAKE3(chunk_size u32 | chunk digests)` of a sums file holding `count`
+/// digests, streamed in 1 MiB steps so a file of any chunk count hashes
+/// in bounded memory.
+fn hash_sums(sums: &File, count: u64, chunk_size: u32) -> io::Result<String> {
+    const STEP: u64 = 1 << 20;
+    let mut buf = vec![0u8; STEP as usize];
+    let mut hasher = FileHasher::new(chunk_size);
+    let total = count * DIGEST_LEN as u64;
+    let mut offset = 0;
+    while offset < total {
+        let n = (total - offset).min(STEP) as usize;
+        read_exact_at(sums, &mut buf[..n], offset)?;
+        hasher.update(&buf[..n]);
+        offset += n as u64;
+    }
+    Ok(hasher.hex())
+}
+
 fn hex16(id: &[u8; 32]) -> String {
     id[..16].iter().map(|b| format!("{b:02x}")).collect()
 }
@@ -1138,27 +1156,15 @@ impl Session<'_> {
         Ok(())
     }
 
-    /// `(path, BLAKE3(chunk_size u32 | chunk digests))` for every file,
-    /// streamed from the sums files in fixed-size steps, so a file of any
-    /// chunk count hashes in bounded memory.
+    /// `(path, file_hash)` for every file, from the sums files.
     fn file_hashes(&self) -> Result<Vec<(String, String)>> {
-        const STEP: u64 = 1 << 20;
         let chunk_size = self.manifest.chunk_size.get();
-        let mut buf = vec![0u8; STEP as usize];
         self.targets
             .iter()
             .map(|t| {
                 let files = self.store.handles.get(t)?;
-                let mut hasher = FileHasher::new(chunk_size);
-                let total = t.present.len() * DIGEST_LEN as u64;
-                let mut offset = 0;
-                while offset < total {
-                    let n = (total - offset).min(STEP) as usize;
-                    read_exact_at(&files.sums, &mut buf[..n], offset)?;
-                    hasher.update(&buf[..n]);
-                    offset += n as u64;
-                }
-                Ok((t.entry.path.display(), hasher.hex()))
+                let hash = hash_sums(&files.sums, t.present.len(), chunk_size)?;
+                Ok((t.entry.path.display(), hash))
             })
             .collect()
     }
@@ -1866,6 +1872,42 @@ mod tests {
         );
         assert!(t.check(&files, 0, &mut buf).unwrap());
         drop((files, t, store));
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// Finalization's file hash over 2^24 digests (a 64 GiB file at 4 KiB
+    /// chunks), read whole against streamed. Run with
+    /// `cargo test --release --lib bench_file_hash -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn bench_file_hash() {
+        let dir = tempdir("filehash");
+        let count = 1u64 << 24;
+        let sums_path = dir.join("sums");
+        let sums = fsops::open_private(&sums_path, true).unwrap();
+        let digests: Vec<u8> = (0..count * DIGEST_LEN as u64).map(|i| i as u8).collect();
+        write_all_at(&sums, &digests, 0).unwrap();
+        drop(digests);
+        for _ in 0..3 {
+            let started = Instant::now();
+            let mut all = vec![0u8; count as usize * DIGEST_LEN];
+            read_exact_at(&sums, &mut all, 0).unwrap();
+            let mut hasher = FileHasher::new(4096);
+            hasher.update(&all);
+            let old_hash = hasher.hex();
+            let old = started.elapsed();
+            let old_bytes = all.capacity();
+            drop(all);
+            let started = Instant::now();
+            let new_hash = hash_sums(&sums, count, 4096).unwrap();
+            let new = started.elapsed();
+            assert_eq!(old_hash, new_hash);
+            eprintln!(
+                "2^24 digests: old {old:?} with a {} MiB buffer; new {new:?} with 1 MiB",
+                old_bytes >> 20
+            );
+        }
+        drop(sums);
         fs::remove_dir_all(dir).unwrap();
     }
 
