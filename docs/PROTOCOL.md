@@ -208,7 +208,10 @@ index into `files`.
 `[k * chunk_size, min(size, (k + 1) * chunk_size))`. An empty file has zero
 chunks.
 
-`cipher` is `Aes256Gcm` (default, hardware accelerated on x86-64 and ARMv8)
+`cipher` is `Aes256Gcm` (default; AES-NI and CLMUL are detected at run
+time on x86-64, and ARMv8 AES and PMULL on aarch64 Linux and macOS, while
+Windows ARM64 builds use software AES because the cipher crates have no
+CPU-feature detection there)
 or `ChaCha20Poly1305`.
 
 ### Session flow
