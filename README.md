@@ -251,7 +251,8 @@ binaries for `x86_64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu`,
 on the two x86_64 targets. The aarch64 targets cross-compile on x86_64
 runners, so their tests do not run. It runs only for tags that start with
 `v`, or when started by hand from the Actions tab, which builds without
-publishing anything.
+publishing anything. Every action it uses is pinned to a commit SHA, and
+the toolchain to an exact Rust release.
 
 Pushing a `v` tag builds and publishes a release from that tag:
 
