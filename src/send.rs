@@ -421,17 +421,17 @@ fn transfer(ctx: &Ctx, cfg: &SendConfig, map: &FileMap, tx: &mut Tx, rx: &mut Rx
             other => return Err(unexpected(other, "Have")),
         };
     }
-    let queue = missing(&have);
-    let bytes: u64 = queue.iter().map(|&c| u64::from(m.chunk_len(c))).sum();
-    ctx.progress.set_totals(queue.len() as u64, bytes);
+    let (chunks, bytes) = missing_totals(m, &have);
+    ctx.progress.set_totals(chunks, bytes);
     ctx.progress.set_phase(Phase::Transferring);
 
     let mut failed_rounds = 0;
     for round in 0u32.. {
-        let queue = missing(&have);
+        let (to_send, _) = missing_totals(m, &have);
         let sched = Scheduler::new(&have);
         tx.send(&Msg::RoundStart { round })?;
-        let admitted = run_round(ctx, round, connections.min(queue.len()), &sched);
+        let wanted = usize::try_from(to_send).map_or(connections, |n| connections.min(n));
+        let admitted = run_round(ctx, round, wanted, &sched);
         if ctx.progress.is_cancelled() {
             return Err(Cancelled::Local.into());
         }
@@ -479,22 +479,28 @@ fn transfer(ctx: &Ctx, cfg: &SendConfig, map: &FileMap, tx: &mut Tx, rx: &mut Rx
                     warnings,
                 });
             }
-            Msg::Have { bitmaps } => have = parse_have(m, &bitmaps)?,
+            Msg::Have { bitmaps } => {
+                let after = parse_have(m, &bitmaps)?;
+                // Progress means some chunk this round carried is now
+                // held. Chunks the receiver's verification sent back to
+                // missing do not count against the round.
+                let landed = after
+                    .iter()
+                    .zip(&have)
+                    .any(|(now, then)| now.gained_over(then));
+                have = after;
+                if to_send > 0 && !landed {
+                    failed_rounds += 1;
+                    if failed_rounds == MAX_FAILED_ROUNDS {
+                        bail!("{MAX_FAILED_ROUNDS} rounds in a row made no progress");
+                    }
+                } else {
+                    failed_rounds = 0;
+                }
+            }
             other => return Err(unexpected(other, "Have, Delivered, or Finished")),
         }
         ctx.progress.set_phase(Phase::Transferring);
-        // Progress means some chunk this round carried is now held. Chunks
-        // the receiver's verification sent back to missing do not count
-        // against the round.
-        let landed = queue.iter().any(|c| have[c.file as usize].get(c.index));
-        if !queue.is_empty() && !landed {
-            failed_rounds += 1;
-            if failed_rounds == MAX_FAILED_ROUNDS {
-                bail!("{MAX_FAILED_ROUNDS} rounds in a row made no progress");
-            }
-        } else {
-            failed_rounds = 0;
-        }
     }
     unreachable!("u32 rounds exhausted")
 }
@@ -869,23 +875,27 @@ fn parse_have(m: &Manifest, bitmaps: &[Vec<u8>]) -> Result<Vec<AtomicBitset>> {
         .collect()
 }
 
-/// Every absent chunk in file order: what a round has to send, kept so the
-/// round can tell whether any of it landed.
-fn missing(have: &[AtomicBitset]) -> Vec<ChunkId> {
-    let mut queue = Vec::new();
-    for (file, bits) in have.iter().enumerate() {
-        for index in 0..bits.len() {
-            if !bits.get(index) {
-                queue.push(ChunkId {
-                    file: file as u32,
-                    index,
-                });
-            }
+/// `(chunks, bytes)` still to send, counted from the bitmap words: every
+/// missing chunk is a full chunk except a missing last chunk of a file.
+fn missing_totals(m: &Manifest, have: &[AtomicBitset]) -> (u64, u64) {
+    let cs = u64::from(m.chunk_size.get());
+    let (mut chunks, mut bytes) = (0, 0);
+    for (j, bits) in have.iter().enumerate() {
+        let missing = bits.count_zeros();
+        chunks += missing;
+        bytes += missing * cs;
+        let last = bits.len().wrapping_sub(1);
+        if missing > 0 && !bits.get(last) {
+            bytes -= cs
+                - u64::from(m.chunk_len(ChunkId {
+                    file: j as u32,
+                    index: last,
+                }));
         }
     }
-    queue
+    (chunks, bytes)
 }
 
 fn missing_count(have: &[AtomicBitset]) -> u64 {
-    have.iter().map(|b| b.len() - b.count_ones()).sum()
+    have.iter().map(AtomicBitset::count_zeros).sum()
 }

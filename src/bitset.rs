@@ -21,19 +21,87 @@ impl AtomicBitset {
     }
 
     /// Builds from the wire/state byte form (bit `k` = byte `k / 8`, bit
-    /// `k % 8`, least significant first). Bits past `len` are ignored.
+    /// `k % 8`, least significant first), a word at a time. Bits past
+    /// `len` are ignored.
     pub fn from_bytes(len: u64, bytes: &[u8]) -> Self {
-        let set = AtomicBitset::new(len);
-        for k in 0..len.min(bytes.len() as u64 * 8) {
-            if bytes[(k / 8) as usize] >> (k % 8) & 1 == 1 {
-                set.set(k);
-            }
+        let words = (0..len.div_ceil(64))
+            .map(|w| {
+                let mut raw = [0u8; 8];
+                let start = (w * 8) as usize;
+                if start < bytes.len() {
+                    let n = (bytes.len() - start).min(8);
+                    raw[..n].copy_from_slice(&bytes[start..start + n]);
+                }
+                AtomicU64::new(u64::from_le_bytes(raw) & Self::mask(len, w))
+            })
+            .collect();
+        AtomicBitset { words, len }
+    }
+
+    /// The valid bits of word `w` of a bitset `len` long.
+    fn mask(len: u64, w: u64) -> u64 {
+        let valid = len - w * 64;
+        if valid >= 64 {
+            u64::MAX
+        } else {
+            (1u64 << valid) - 1
         }
-        set
     }
 
     pub fn len(&self) -> u64 {
         self.len
+    }
+
+    pub fn count_zeros(&self) -> u64 {
+        self.len - self.count_ones()
+    }
+
+    /// Snapshot of the words; bits past `len` are always zero.
+    pub fn words(&self) -> Vec<u64> {
+        self.words
+            .iter()
+            .map(|w| w.load(Ordering::Acquire))
+            .collect()
+    }
+
+    /// Indices of clear bits, ascending, scanned a word at a time.
+    pub fn zeros(&self) -> impl Iterator<Item = u64> + '_ {
+        self.words.iter().enumerate().flat_map(move |(w, word)| {
+            let mut clear = !word.load(Ordering::Acquire) & Self::mask(self.len, w as u64);
+            std::iter::from_fn(move || {
+                if clear == 0 {
+                    return None;
+                }
+                let bit = clear.trailing_zeros() as u64;
+                clear &= clear - 1;
+                Some(w as u64 * 64 + bit)
+            })
+        })
+    }
+
+    pub fn first_zero(&self) -> Option<u64> {
+        self.zeros().next()
+    }
+
+    pub fn last_zero(&self) -> Option<u64> {
+        self.words.iter().enumerate().rev().find_map(|(w, word)| {
+            let clear = !word.load(Ordering::Acquire) & Self::mask(self.len, w as u64);
+            (clear != 0).then(|| w as u64 * 64 + 63 - clear.leading_zeros() as u64)
+        })
+    }
+
+    /// Whether any bit clear in `before` is set here.
+    pub fn gained_over(&self, before: &AtomicBitset) -> bool {
+        self.words
+            .iter()
+            .zip(&before.words)
+            .enumerate()
+            .any(|(w, (now, then))| {
+                !then.load(Ordering::Acquire)
+                    & now.load(Ordering::Acquire)
+                    & Self::mask(self.len, w as u64)
+                    != 0
+            })
     }
 
     pub fn is_empty(&self) -> bool {
@@ -159,6 +227,32 @@ mod tests {
         assert_eq!(c.count_ones(), 3);
         let d = AtomicBitset::from_bytes(20, &[0xFF]);
         assert_eq!(d.count_ones(), 8);
+    }
+
+    #[test]
+    fn word_scans_match_bit_scans() {
+        for len in [0u64, 1, 63, 64, 65, 130, 1000] {
+            let b = AtomicBitset::new(len);
+            for k in (0..len).filter(|k| k % 7 == 0 || k % 11 == 3) {
+                b.set(k);
+            }
+            let slow: Vec<u64> = (0..len).filter(|&k| !b.get(k)).collect();
+            assert_eq!(b.zeros().collect::<Vec<_>>(), slow, "{len}");
+            assert_eq!(b.count_zeros(), slow.len() as u64);
+            assert_eq!(b.first_zero(), slow.first().copied());
+            assert_eq!(b.last_zero(), slow.last().copied());
+            assert_eq!(
+                AtomicBitset::from_bytes(len, &b.to_bytes()).to_bytes(),
+                b.to_bytes()
+            );
+            let later = AtomicBitset::from_bytes(len, &b.to_bytes());
+            assert!(!later.gained_over(&b));
+            if let Some(k) = slow.first() {
+                later.set(*k);
+                assert!(later.gained_over(&b));
+                assert!(!b.gained_over(&later));
+            }
+        }
     }
 
     #[test]

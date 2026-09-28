@@ -868,11 +868,15 @@ fn have_msg(targets: &[Target]) -> Msg {
 
 /// Points the progress totals at the chunks still missing.
 fn set_missing_totals(progress: &Progress, targets: &[Target], chunk_size: ChunkSize) {
+    let cs = u64::from(chunk_size.get());
     let (mut chunks, mut bytes) = (0, 0);
     for t in targets {
-        for k in (0..t.present.len()).filter(|&k| !t.present.get(k)) {
-            chunks += 1;
-            bytes += u64::from(chunk_span(t.entry.size, chunk_size, k).1);
+        let missing = t.present.count_zeros();
+        chunks += missing;
+        bytes += missing * cs;
+        let last = t.present.len().wrapping_sub(1);
+        if missing > 0 && !t.present.get(last) {
+            bytes -= cs - u64::from(t.span(last).1);
         }
     }
     progress.reset_counts();

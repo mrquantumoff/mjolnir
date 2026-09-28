@@ -97,18 +97,19 @@ impl Scheduler {
             owners: HashMap::new(),
         };
         for (file, bits) in have.iter().enumerate() {
-            let missing: Vec<u64> = (0..bits.len()).filter(|&k| !bits.get(k)).collect();
-            let Some((&first, &last)) = missing.first().zip(missing.last()) else {
+            let missing = bits.count_zeros();
+            let Some((first, last)) = bits.first_zero().zip(bits.last_zero()) else {
                 continue;
             };
-            let chunks = if last - first + 1 == missing.len() as u64 {
+            // A contiguous gap needs no list at all: its bounds say it all.
+            let chunks = if last - first + 1 == missing {
                 Chunks::Range {
                     next: first,
                     end: last + 1,
                 }
             } else {
                 Chunks::List {
-                    items: missing,
+                    items: bits.zeros().collect(),
                     next: 0,
                 }
             };
@@ -328,6 +329,70 @@ mod tests {
         let mut all: Vec<_> = claims.iter().flatten().map(|c| c.index).collect();
         all.sort_unstable();
         assert_eq!(all, (1..50).collect::<Vec<_>>());
+    }
+
+    /// Metadata cost of starting a round, old way against new, on 2^26
+    /// chunks (a 256 GiB file at 4 KiB, or 64 TiB at 1 MiB). Run with
+    /// `cargo test --release --lib bench_round_metadata -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn bench_round_metadata() {
+        use std::hint::black_box;
+        use std::time::Instant;
+        let n = 1u64 << 26;
+        type Shape = Box<dyn Fn(u64) -> bool>;
+        let shapes: [(&str, Shape); 3] = [
+            ("fresh", Box::new(|_| false)),
+            ("contiguous resume", Box::new(move |k| k < n / 2)),
+            ("fragmented", Box::new(|k| k % 3 != 0)),
+        ];
+        for (name, present) in shapes {
+            let bits = AtomicBitset::new(n);
+            for k in (0..n).filter(|&k| present(k)) {
+                bits.set(k);
+            }
+            let have = [bits];
+            let started = Instant::now();
+            let queue: Vec<ChunkId> = have
+                .iter()
+                .enumerate()
+                .flat_map(|(f, b)| {
+                    (0..b.len()).filter(|&k| !b.get(k)).map(move |k| ChunkId {
+                        file: f as u32,
+                        index: k,
+                    })
+                })
+                .collect();
+            let missing: Vec<u64> = (0..have[0].len()).filter(|&k| !have[0].get(k)).collect();
+            let contiguous = missing
+                .first()
+                .zip(missing.last())
+                .is_some_and(|(&a, &z)| z - a + 1 == missing.len() as u64);
+            black_box((&queue, &missing, contiguous));
+            let old = started.elapsed();
+            let old_bytes = queue.len() * std::mem::size_of::<ChunkId>() + missing.len() * 8;
+            drop((queue, missing));
+
+            let started = Instant::now();
+            let count = have[0].count_zeros();
+            let sched = Scheduler::new(&have);
+            let list_bytes = match &sched.state.lock().unwrap().entries[..] {
+                [
+                    Some(Entry {
+                        chunks: Chunks::List { items, .. },
+                        ..
+                    }),
+                ] => items.len() * 8,
+                _ => 0,
+            };
+            black_box((count, &sched));
+            let new = started.elapsed();
+            eprintln!(
+                "{name:>18}: old {old:?} and {} MiB; new {new:?} and {} MiB",
+                old_bytes >> 20,
+                list_bytes >> 20
+            );
+        }
     }
 
     #[test]
