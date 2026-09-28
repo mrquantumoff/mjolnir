@@ -22,7 +22,7 @@ use crate::filemap::{self, FileMap, Preserve};
 use crate::keys::{PrivateKey, PublicKey};
 use crate::manifest::{ChunkId, ChunkSize, FileEntry, Manifest, chunk_count, chunk_span, mtime_of};
 use crate::net::{self, Io, tell_peer_about, unexpected};
-use crate::pool::{Buffers, InFlight, Pool, buffer_count, resolve_threads};
+use crate::pool::{Buffers, InFlight, Pool, buffer_count, check_threads, resolve_threads};
 use crate::posio::read_exact_at;
 use crate::progress::{ActiveConnection, Cancelled, Phase, PhaseTimes, Progress};
 use crate::schedule::Scheduler;
@@ -181,6 +181,7 @@ fn run(cfg: &SendConfig, progress: &Progress) -> Result<SendReport> {
         (1..=1024).contains(&cfg.connections),
         "connections must be between 1 and 1024"
     );
+    check_threads(cfg.threads)?;
     let chunk_size = ChunkSize::new(cfg.chunk_size)?;
     let captured = filemap::capture(&cfg.paths, cfg.preserve)?;
     let files = captured

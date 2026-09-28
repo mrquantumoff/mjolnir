@@ -8,10 +8,22 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::Duration;
 
-/// Worker count for `threads = 0`: one per core.
+/// Most crypto workers one transfer runs.
+pub(crate) const MAX_THREADS: usize = 1024;
+
+/// The check `SendConfig` and `RecvConfig` get at their entry points.
+pub(crate) fn check_threads(threads: usize) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        threads <= MAX_THREADS,
+        "threads must be between 0 (one per core) and {MAX_THREADS}, got {threads}"
+    );
+    Ok(())
+}
+
+/// Worker count for `threads = 0`: one per core, at most `MAX_THREADS`.
 pub(crate) fn resolve_threads(threads: usize) -> usize {
     match threads {
-        0 => thread::available_parallelism().map_or(4, |n| n.get()),
+        0 => thread::available_parallelism().map_or(4, |n| n.get().min(MAX_THREADS)),
         n => n,
     }
 }

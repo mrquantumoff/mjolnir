@@ -96,7 +96,7 @@ key.
 | `--out DIR` | `.` | where files land |
 | `--force` | off | overwrite existing files |
 | `--no-verify` | off | skip reading every chunk back before finishing |
-| `--threads N` | `0` (one per core) | workers that decrypt, write, and verify chunks |
+| `--threads N` | `0` (one per core) | workers that decrypt, write, and verify chunks, at most 1024 |
 | `--allow-owner` | off | apply file owners from the sender (only as root, on Unix) |
 | `--allow-special-bits` | off | keep setuid, setgid, and sticky bits from the sender |
 
@@ -114,7 +114,7 @@ as `incoming/photos/...`.
 | `-n, --connections N` | `8` | parallel data connections |
 | `-c, --chunk-size SIZE` | `1MiB` | chunk size, 4 KiB to 64 MiB; accepts `64K`, `256KiB`, `1M`, `4MiB` |
 | `--cipher NAME` | `aes256gcm` | `aes256gcm` or `chacha20poly1305` |
-| `--threads N` | `0` (one per core) | workers that read and encrypt chunks |
+| `--threads N` | `0` (one per core) | workers that read and encrypt chunks, at most 1024 |
 | `--hash` | off | after delivery, re-read every file and have the receiver compare chunk digests; mismatched chunks are sent again |
 | `--preserve LIST` | `perms` | metadata to copy: `none`, or any of `perms`, `times`, `owner` |
 

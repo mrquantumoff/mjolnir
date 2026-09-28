@@ -446,6 +446,26 @@ fn more_connections_than_chunks() {
 }
 
 #[test]
+fn worker_counts_are_checked_where_the_library_is_entered() {
+    let out = TempDir::new().unwrap();
+    let (rk, rpub) = keypair();
+    let (sk, spub) = keypair();
+    let mut cfg = recv_config(rk, vec![spub], out.path());
+    cfg.threads = 1025;
+    let err = Receiver::bind(cfg).err().expect("1025 receiver threads");
+    assert!(format!("{err:#}").contains("threads must be"), "{err:#}");
+
+    let mut send = Send::to(sk, rpub);
+    for (connections, threads) in [(1, usize::MAX), (0, 1), (1025, 1)] {
+        send.connections = connections;
+        send.threads = threads;
+        let addr = "127.0.0.1:9".parse().unwrap();
+        let err = send.run(addr, &[out.path()]).unwrap_err();
+        assert!(format!("{err:#}").contains("must be between"), "{err:#}");
+    }
+}
+
+#[test]
 fn existing_target_fails_the_session_without_force() {
     let src = TempDir::new().unwrap();
     let file = src.path().join("f.bin");

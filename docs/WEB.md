@@ -142,7 +142,8 @@ have the shape `{ "error": "message", "field": "name" | null }`, where
 
 ### `GET /api/transfers`
 
-`{ "transfers": [Transfer, ...] }`, newest first.
+`{ "transfers": [Transfer, ...] }`, newest first. The 100 most recently
+ended transfers are kept; older ones drop off the list.
 
 ```json
 {
@@ -229,6 +230,10 @@ per core), `hash`, and `preserve` are optional with the defaults shown.
 `preserve` must name all three flags when given.
 `addr` may be a host name; it is resolved when the transfer starts. Every
 path must exist. Returns the new Transfer.
+
+At most 16 transfers, sends and receives together, run at once; one more
+is refused with 429 until one ends. A transfer whose thread cannot start,
+or whose code panics, ends as `failed` rather than staying `running`.
 
 ### `POST /api/receive`
 

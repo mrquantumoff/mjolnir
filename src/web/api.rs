@@ -11,7 +11,7 @@ use serde_json::{Value, json};
 use tiny_http::Method;
 
 use super::fs;
-use super::jobs::{FileHash, Job, JobId, JobState, Jobs, Outcome, RemoveError, Report};
+use super::jobs::{Busy, FileHash, Job, JobId, JobState, Jobs, Outcome, RemoveError, Report};
 use crate::filemap::{ApplyPolicy, Preserve};
 use crate::keys::{PrivateKey, PublicKey};
 use crate::manifest::{MAX_CHUNK_SIZE, MIN_CHUNK_SIZE};
@@ -206,6 +206,14 @@ fn parse<T: for<'de> Deserialize<'de>>(body: Value) -> Result<T, ApiError> {
         .map_err(|e| ApiError::new(400, None, format!("invalid request: {e}")))
 }
 
+fn busy(Busy(max): Busy) -> ApiError {
+    ApiError::new(
+        429,
+        None,
+        format!("{max} transfers are already running; wait for one to end or cancel one"),
+    )
+}
+
 fn job_id(s: &str) -> Result<JobId, ApiError> {
     s.parse().map_err(|_| ApiError::not_found())
 }
@@ -345,9 +353,12 @@ fn start_send(app: &App, req: SendRequest) -> Result<Reply, ApiError> {
         hash: req.hash,
         preserve: req.preserve,
     };
-    let id = app.jobs.spawn(spec, move |progress| {
-        crate::send(cfg, progress).map(Report::from)
-    });
+    let id = app
+        .jobs
+        .spawn(spec, move |progress| {
+            crate::send(cfg, progress).map(Report::from)
+        })
+        .map_err(busy)?;
     transfer(app, id)
 }
 
@@ -398,9 +409,12 @@ fn start_receive(app: &App, req: ReceiveRequest) -> Result<Reply, ApiError> {
         threads,
         apply: req.apply,
     };
-    let id = app.jobs.spawn(spec, move |progress| {
-        receiver.run(progress).map(Report::from)
-    });
+    let id = app
+        .jobs
+        .spawn(spec, move |progress| {
+            receiver.run(progress).map(Report::from)
+        })
+        .map_err(busy)?;
     transfer(app, id)
 }
 

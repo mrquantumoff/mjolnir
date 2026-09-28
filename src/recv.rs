@@ -131,6 +131,7 @@ struct Handshaken {
 impl Receiver {
     pub fn bind(cfg: RecvConfig) -> Result<Self> {
         require_nonempty(&cfg.authorized)?;
+        crate::pool::check_threads(cfg.threads)?;
         let listener =
             net::listen(cfg.listen).with_context(|| format!("listening on {}", cfg.listen))?;
         listener.set_nonblocking(true)?;

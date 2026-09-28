@@ -294,6 +294,21 @@ fn receiver_on_a_busy_port_is_400() {
 }
 
 #[test]
+fn running_transfers_are_capped_at_16() {
+    let ui = start();
+    let out = tempfile::tempdir().unwrap();
+    let ids: Vec<u64> = (0..16).map(|_| start_receiver(&ui, out.path()).0).collect();
+    let body =
+        json!({ "listen": "127.0.0.1:0", "authorized": [ui.public_key], "out_dir": out.path() });
+    let r = post(&ui, "/api/receive", body.clone());
+    assert_eq!(r.status, 429, "{}", r.body);
+    let c = post(&ui, &format!("/api/transfers/{}/cancel", ids[0]), json!({}));
+    assert_eq!(c.status, 200);
+    wait_until_ended(&ui, ids[0]);
+    assert_eq!(post(&ui, "/api/receive", body).status, 200);
+}
+
+#[test]
 fn index_is_served_with_security_headers() {
     let ui = start();
     let r = raw(&ui, "GET", "/", &[("Authorization", "")], b"");
