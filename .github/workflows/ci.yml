@@ -98,9 +98,26 @@ jobs:
           path: dist/*
           if-no-files-found: error
 
+  # Tests only: no macOS build is released. The runner is Apple silicon, so
+  # this is also where the ARMv8 AES backend runs, on APFS.
+  macos:
+    name: aarch64-apple-darwin (tests)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master, 2026-09-12
+        with:
+          toolchain: 1.98.1
+
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+
+      - name: Test
+        run: cargo test --locked
+
   release:
     name: Release
-    needs: build
+    needs: [build, macos]
     # Only a pushed tag publishes. A manual run started on a tag has the same
     # ref, and the README promises that manual runs publish nothing.
     if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')

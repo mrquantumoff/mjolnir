@@ -249,7 +249,8 @@ Rerun with `scripts/bench.sh [WORKDIR]` (`SIZE_MIB`, `REPEAT`, `PORT`,
 binaries for `x86_64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu`,
 `x86_64-pc-windows-msvc`, and `aarch64-pc-windows-msvc`, and runs the tests
 on the two x86_64 targets. The aarch64 targets cross-compile on x86_64
-runners, so their tests do not run. It runs only for tags that start with
+runners, so their tests do not run. A macOS job runs the tests on Apple
+silicon and APFS; no macOS binary is released. It runs only for tags that start with
 `v`, or when started by hand from the Actions tab, which builds without
 publishing anything. Every action it uses is pinned to a commit SHA, and
 the toolchain to an exact Rust release.

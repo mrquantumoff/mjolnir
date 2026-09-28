@@ -951,15 +951,14 @@ fn awkward_names_round_trip() {
     assert_file_eq(&file, &out.path().join(awkward_name()));
 }
 
+/// Sends directory `d` holding `name` with perms and times kept. The name
+/// must reach the wire as `wire` and land on disk as `name` again.
 #[cfg(unix)]
-#[test]
-fn perms_times_and_non_utf8_names_arrive_on_unix() {
-    use std::ffi::OsStr;
-    use std::os::unix::ffi::OsStrExt;
+fn perms_times_and_odd_name_arrive(name: &std::ffi::OsStr, wire: &str) {
     use std::os::unix::fs::PermissionsExt;
     let src = TempDir::new().unwrap();
     let dir = src.path().join("d");
-    let odd = dir.join(OsStr::from_bytes(b"caf\xe9.bin"));
+    let odd = dir.join(name);
     write(&odd, &noise(4000, 20));
     fs::set_permissions(&odd, fs::Permissions::from_mode(0o640)).unwrap();
     let when = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000_000);
@@ -977,10 +976,12 @@ fn perms_times_and_non_utf8_names_arrive_on_unix() {
     let rx = start_receiver(rk, vec![spub], out.path());
     let mut send = Send::to(sk, rx.public);
     send.preserve = "perms,times".parse().unwrap();
-    send.run(rx.addr, &[&dir]).unwrap();
+    send.hash = true;
+    let report = send.run(rx.addr, &[&dir]).unwrap();
     let recv = rx.join().unwrap();
     assert!(recv.warnings.is_empty(), "{:?}", recv.warnings);
-    let got = out.path().join("d").join(OsStr::from_bytes(b"caf\xe9.bin"));
+    assert_eq!(report.file_hashes[0].0, format!("d/{wire}"));
+    let got = out.path().join("d").join(name);
     assert_file_eq(&odd, &got);
     let meta = fs::metadata(&got).unwrap();
     assert_eq!(meta.permissions().mode() & 0o7777, 0o640);
@@ -990,6 +991,27 @@ fn perms_times_and_non_utf8_names_arrive_on_unix() {
         .permissions()
         .mode();
     assert_eq!(dmode & 0o7777, 0o750);
+}
+
+/// Linux file systems hold any bytes, so an invalid UTF-8 name travels and
+/// lands as those bytes.
+#[cfg(all(unix, not(target_os = "macos")))]
+#[test]
+fn perms_times_and_non_utf8_names_arrive_on_linux() {
+    use std::os::unix::ffi::OsStrExt;
+    perms_times_and_odd_name_arrive(
+        std::ffi::OsStr::from_bytes(b"caf\xe9.bin"),
+        "caf\u{FFFD}.bin",
+    );
+}
+
+/// APFS takes only valid UTF-8, so the byte 0xE9 sits on disk as its escape
+/// U+F0E9. The sender turns the escape back into the raw byte on the wire,
+/// and the receiver writes the escape again.
+#[cfg(target_os = "macos")]
+#[test]
+fn perms_times_and_escaped_names_arrive_on_macos() {
+    perms_times_and_odd_name_arrive(std::ffi::OsStr::new("caf\u{F0E9}.bin"), "caf\u{FFFD}.bin");
 }
 
 /// A TCP proxy to `target` that also keeps the first `keep` bytes the first
