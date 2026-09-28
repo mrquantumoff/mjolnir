@@ -22,6 +22,9 @@ export MSYS_NO_PATHCONV=1
 
 root="$(cd "$(dirname "$0")/.." && { pwd -W 2> /dev/null || pwd; })"
 work="${1:-$root/target/bench}"
+# With path conversion off, a /c/... workdir would reach the Windows binary
+# unconverted.
+command -v cygpath > /dev/null 2>&1 && work="$(cygpath -m "$work")"
 size_mib="${SIZE_MIB:-2048}"
 repeat="${REPEAT:-3}"
 port="${PORT:-7799}"
