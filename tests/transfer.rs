@@ -85,8 +85,21 @@ impl RunningReceiver {
         self.handle.join().unwrap()
     }
 
-    /// Still serving after a failed session: give it a moment to settle.
+    /// Still serving after a failed session: back to `Connecting` once the
+    /// session winds down, and still there a moment later. Winding down
+    /// takes one socket poll, but a loaded runner can stretch that past any
+    /// fixed sleep, so wait for the phase rather than for a set time.
     fn assert_waiting(&self) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while self.progress.phase() != Phase::Connecting {
+            assert!(!self.handle.is_finished(), "receiver exited");
+            assert!(
+                Instant::now() < deadline,
+                "receiver stuck in {:?}",
+                self.progress.phase()
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
         thread::sleep(Duration::from_millis(200));
         assert!(!self.handle.is_finished(), "receiver exited");
         assert_eq!(self.progress.phase(), Phase::Connecting);
