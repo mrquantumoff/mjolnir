@@ -322,6 +322,31 @@ fn process_cpu() -> Option<Duration> {
     (ok != 0).then(|| Duration::from_nanos((ticks(kernel) + ticks(user)) * 100))
 }
 
+/// The most memory this process has had resident, in bytes.
+#[cfg(unix)]
+fn peak_memory() -> Option<u64> {
+    let mut usage = std::mem::MaybeUninit::<libc::rusage>::zeroed();
+    if unsafe { libc::getrusage(libc::RUSAGE_SELF, usage.as_mut_ptr()) } != 0 {
+        return None;
+    }
+    let usage = unsafe { usage.assume_init() };
+    // Linux reports kibibytes, macOS bytes.
+    let unit = if cfg!(target_os = "macos") { 1 } else { 1024 };
+    Some(usage.ru_maxrss as u64 * unit)
+}
+
+#[cfg(windows)]
+fn peak_memory() -> Option<u64> {
+    use windows_sys::Win32::System::ProcessStatus::{
+        GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS,
+    };
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+    let mut counters = unsafe { std::mem::zeroed::<PROCESS_MEMORY_COUNTERS>() };
+    counters.cb = std::mem::size_of::<PROCESS_MEMORY_COUNTERS>() as u32;
+    let ok = unsafe { GetProcessMemoryInfo(GetCurrentProcess(), &mut counters, counters.cb) };
+    (ok != 0).then_some(counters.PeakWorkingSetSize as u64)
+}
+
 /// Prints each file's hash after a `--hash` transfer, then any warnings.
 fn report_files(hashed: bool, file_hashes: &[(String, String)], warnings: &[String]) {
     if hashed {
@@ -337,8 +362,11 @@ fn report_files(hashed: bool, file_hashes: &[(String, String)], warnings: &[Stri
 fn summary(verb: &str, bytes: u64, elapsed: Duration, phases: PhaseTimes, detail: &str) {
     let secs = elapsed.as_secs_f64();
     if let Some(cpu) = process_cpu() {
+        let peak = peak_memory().map_or(String::new(), |b| {
+            format!(", peak memory {:.1} MiB", b as f64 / MIB)
+        });
         eprintln!(
-            "cpu {:.2} s, {:.1} cores busy on average",
+            "cpu {:.2} s, {:.1} cores busy on average{peak}",
             cpu.as_secs_f64(),
             cpu.as_secs_f64() / secs.max(1e-9)
         );
