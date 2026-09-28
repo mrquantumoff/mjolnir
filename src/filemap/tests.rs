@@ -6,6 +6,20 @@ fn wp(parts: &[&str]) -> WirePath {
     WirePath::parse(parts.iter().copied()).unwrap()
 }
 
+/// A validated offer of `files`, one byte each, and `dirs`.
+fn offer(files: Vec<WirePath>, dirs: Vec<WirePath>) -> Manifest {
+    use crate::manifest::{ChunkSize, FileEntry, MIN_CHUNK_SIZE};
+    let files = files
+        .into_iter()
+        .map(|path| FileEntry {
+            path,
+            size: 1,
+            mtime: 0,
+        })
+        .collect();
+    Manifest::new(ChunkSize::new(MIN_CHUNK_SIZE).unwrap(), files, dirs).unwrap()
+}
+
 /// Stands in for the receiver renaming each file into place: the bytes
 /// arrive, the metadata comes only from `apply`.
 fn deliver(captured: &Captured, out: &Path) {
@@ -70,8 +84,15 @@ fn capture_names_roots_like_the_sender() {
         ]
     );
     assert!(captured.files.iter().all(|f| f.mtime > 0));
-    let offer: Vec<_> = captured.files.iter().map(|f| f.path.clone()).collect();
-    captured.map.check(&offer).unwrap();
+    let files = captured.files.iter().map(|f| f.path.clone()).collect();
+    let dirs = captured
+        .map
+        .entries
+        .iter()
+        .filter(|e| e.kind == EntryKind::Dir)
+        .map(|e| e.path.clone())
+        .collect();
+    captured.map.check(&offer(files, dirs)).unwrap();
     assert!(captured.skipped.is_empty());
 }
 
@@ -234,9 +255,31 @@ fn check_rejects_a_mismatched_file_id() {
             owner: None,
         }],
     };
-    assert!(map.check(&[wp(&["a"])]).is_err());
-    assert!(map.check(&[wp(&["b"]), wp(&["b"])]).is_err());
-    map.check(&[wp(&["b"]), wp(&["a"])]).unwrap();
+    assert!(map.check(&offer(vec![wp(&["a"])], vec![])).is_err());
+    assert!(
+        map.check(&offer(vec![wp(&["b"]), wp(&["c"])], vec![]))
+            .is_err()
+    );
+    map.check(&offer(vec![wp(&["b"]), wp(&["a"])], vec![]))
+        .unwrap();
+}
+
+#[test]
+fn check_rejects_a_directory_the_offer_does_not_list() {
+    let map = FileMap {
+        entries: vec![Entry {
+            path: wp(&["d"]),
+            kind: EntryKind::Dir,
+            mode: None,
+            mtime: None,
+            atime: None,
+            owner: None,
+        }],
+    };
+    let err = map.check(&offer(vec![], vec![wp(&["D"])])).unwrap_err();
+    assert!(err.to_string().contains("does not list"), "{err}");
+    assert!(map.check(&offer(vec![wp(&["d", "x"])], vec![])).is_err());
+    map.check(&offer(vec![], vec![wp(&["d"])])).unwrap();
 }
 
 #[test]

@@ -778,6 +778,7 @@ impl FakeSender {
                 size,
                 mtime: 0,
             }],
+            dirs: Vec::new(),
         })
         .unwrap();
         assert!(matches!(rx.recv().unwrap(), Msg::Have { .. }));

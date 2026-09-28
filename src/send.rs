@@ -18,7 +18,7 @@ use crate::crypto::{
     Cipher, DIGEST_LEN, FileHasher, FrameKey, SessionKeys, TAG_LEN, chunk_digest,
     handshake_initiator,
 };
-use crate::filemap::{self, FileMap, Preserve};
+use crate::filemap::{self, EntryKind, FileMap, Preserve};
 use crate::keys::{PrivateKey, PublicKey};
 use crate::manifest::{ChunkId, ChunkSize, FileEntry, Manifest, chunk_count, chunk_span, mtime_of};
 use crate::net::{self, Io, tell_peer_about, unexpected};
@@ -204,7 +204,14 @@ fn run(cfg: &SendConfig, progress: &Progress) -> Result<SendReport> {
             mtime: f.mtime,
         })
         .collect();
-    let manifest = Manifest::new(chunk_size, entries)?;
+    let dirs = captured
+        .map
+        .entries
+        .iter()
+        .filter(|e| e.kind == EntryKind::Dir)
+        .map(|e| e.path.clone())
+        .collect();
+    let manifest = Manifest::new(chunk_size, entries, dirs)?;
     let skipped: Vec<String> = captured
         .skipped
         .iter()
@@ -341,6 +348,7 @@ fn transfer(ctx: &Ctx, cfg: &SendConfig, map: &FileMap, tx: &mut Tx, rx: &mut Rx
         chunk_size: m.chunk_size.get(),
         cipher: ctx.cipher,
         files: m.to_offer(),
+        dirs: m.offer_dirs(),
     })?;
     let mut have = match rx.recv()? {
         Msg::Have { bitmaps } => parse_have(m, &bitmaps)?,

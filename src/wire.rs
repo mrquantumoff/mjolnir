@@ -5,6 +5,7 @@ use std::io::{BufReader, Read, Write};
 
 use anyhow::{Context, Result, bail, ensure};
 use serde::{Deserialize, Serialize};
+use serde_bytes::ByteBuf;
 
 use crate::crypto::{Cipher, CipherState, FrameKey, SessionKeys, TAG_LEN};
 use crate::filemap::FileMap;
@@ -47,6 +48,7 @@ pub enum Msg {
         chunk_size: u32,
         cipher: Cipher,
         files: Vec<OfferFile>,
+        dirs: Vec<Vec<ByteBuf>>,
     },
     Have {
         bitmaps: Vec<Vec<u8>>,

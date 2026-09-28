@@ -295,8 +295,9 @@ impl Receiver {
                 chunk_size,
                 cipher,
                 files,
+                dirs,
             } => (
-                Manifest::from_offer(chunk_size, files).context("rejected the offer")?,
+                Manifest::from_offer(chunk_size, files, dirs).context("rejected the offer")?,
                 cipher,
             ),
             other => return Err(unexpected(other, "Offer")),
@@ -793,9 +794,7 @@ impl Session<'_> {
                     self.compare_digests(file, first, &digests, &mut expected)?;
                 }
                 Msg::Finalize { hash, map } => {
-                    let offer: Vec<_> =
-                        self.manifest.files.iter().map(|f| f.path.clone()).collect();
-                    map.check(&offer).context("rejected the file map")?;
+                    map.check(&self.manifest).context("rejected the file map")?;
                     return Ok(Finalized {
                         hash,
                         map,
@@ -1400,6 +1399,7 @@ mod tests {
                 size,
                 mtime: 1,
             }],
+            Vec::new(),
         )
         .unwrap();
         prepare_targets(dir, &m, false).unwrap().pop().unwrap()

@@ -134,7 +134,7 @@ starting at 0):
 
 | Message                              | Direction | Meaning                                                   |
 |--------------------------------------|-----------|-----------------------------------------------------------|
-| `Offer { chunk_size, cipher, files }`| S to R    | manifest; `files[j] = { path, size, mtime }`               |
+| `Offer { chunk_size, cipher, files, dirs }` | S to R | manifest; `files[j] = { path, size, mtime }`; `dirs`: every directory under the sent roots, including empty ones, same path encoding |
 | `Have { bitmaps }`                   | R to S    | per file, the chunks the receiver already holds           |
 | `RoundStart { round }`               | S to R    | sender is about to open data connections for `round`      |
 | `RoundEnd { round, connections }`    | S to R    | sender's data connections for `round` are closed; `connections` is how many the receiver admitted |
@@ -150,7 +150,8 @@ starting at 0):
 Field encodings: `chunk_size` is a `u32`; `cipher` is an enum
 (`Aes256Gcm` = 0, `ChaCha20Poly1305` = 1); each file is
 `{ path: [bytes], size: u64, mtime: u64 }` with `mtime` in nanoseconds since
-the Unix epoch (0 if unknown); `round` and `connections` are `u32`. `bitmaps`
+the Unix epoch (0 if unknown); each entry of `dirs` is a `[bytes]` path
+like a file's; `round` and `connections` are `u32`. `bitmaps`
 holds one byte string per file, in offer order, of exactly
 `ceil(chunk_count / 8)` bytes: chunk `k` is bit `k % 8` (least significant
 first) of byte `k / 8`. The sender rejects a `Have` whose shape does not
@@ -167,7 +168,8 @@ empty components, `.` and `..` components, components containing NUL or
 components joined with `/`), components whose folded name (below) ends in
 `.mjolnir-part`, `.mjolnir-state`, `.mjolnir-state.tmp`, `.mjolnir-sums`,
 `.mjolnir-journal`, `.mjolnir-journal.tmp`, or `.mjolnir-staging`, and
-paths whose folded names are equal. The suffix rule covers directories
+offers whose names collide (below). The same rules apply to `dirs`. The
+suffix rule covers directories
 too, because a directory `a.mjolnir-part` would collide with the part file
 of a sibling `a`, and it compares folded names because on a
 case-insensitive file system `a.MJOLNIR-PART` and `a.mjolnir-ſums` (with a
@@ -187,7 +189,16 @@ they are. (Context-sensitive lowercasing would turn `AΣ` into `aς` but
 `aσ` into `aσ`, two keys for what Windows stores as one file.) The rule
 uses one key on every OS, so the same offer is valid or invalid
 everywhere, and any two names that collide on Windows also collide under
-it; it may reject a few pairs Windows would keep apart. `file_id` is the
+it; it may reject a few pairs Windows would keep apart.
+
+The receiver creates every file, every directory in `dirs`, and every
+parent of either (`a/b/c` has the parents `a` and `a/b`) in one tree, so
+they form one namespace, keyed by the path with each component folded.
+The receiver rejects an offer in which two different paths share a key, a
+key is both a file and a directory (listed or parent), or a directory is
+listed twice. A listed directory that is also a parent is one entry, not a
+collision. So a file `tree/a` and a directory `tree/A` collide, as do the
+files `a` and `a/b` and the files `Docs/x` and `docs/y`. `file_id` is the
 index into `files`.
 
 `chunk_size` is between 4 KiB and 64 MiB. File `j` has
@@ -342,10 +353,12 @@ Entry {
 ```
 
 The map lists every sent file and every directory under the sent roots,
-including empty directories. **Empty directories are always recreated,
-whatever the preserve options.** The receiver validates each entry's path
-exactly like an `Offer` path. A `File` entry's path must match its
-`file_id` in the offer.
+including empty directories. **Every directory in the `Offer` is created
+before the files are published, whatever the preserve options, and failing
+to create one fails the transfer.** The receiver validates each entry's
+path exactly like an `Offer` path. A `File` entry's path must match its
+`file_id` in the offer, and a `Dir` entry's path must be one of the
+offer's `dirs`.
 
 What the sender fills in is chosen with `send --preserve`, a comma-separated
 list:

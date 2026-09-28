@@ -196,6 +196,11 @@ impl WirePath {
         &self.0
     }
 
+    /// The first `len` components, `1 <= len <= components().len()`.
+    pub fn prefix(&self, len: usize) -> WirePath {
+        WirePath(self.0[..len].to_vec())
+    }
+
     /// Lossy text for terminals, logs, and the web UI.
     pub fn display(&self) -> String {
         let parts: Vec<_> = self

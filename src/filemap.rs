@@ -3,6 +3,7 @@
 //! in `docs/PROTOCOL.md`.
 
 use std::cmp::Reverse;
+use std::collections::HashSet;
 use std::fs::{self, Metadata};
 use std::io;
 use std::path::{Path, PathBuf};
@@ -14,6 +15,7 @@ use filetime::FileTime;
 use serde::{Deserialize, Serialize};
 use walkdir::WalkDir;
 
+use crate::manifest::Manifest;
 use crate::names::WirePath;
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -116,23 +118,32 @@ pub struct Captured {
 }
 
 impl FileMap {
-    /// Checks that every `File` entry names its file in the offer.
-    pub fn check(&self, offer: &[WirePath]) -> Result<()> {
+    /// Checks that every `File` entry names its file in the offer and every
+    /// `Dir` entry one of its directories.
+    pub fn check(&self, offer: &Manifest) -> Result<()> {
+        let dirs: HashSet<&WirePath> = offer.dirs.iter().collect();
         for entry in &self.entries {
-            if let EntryKind::File { file_id } = entry.kind {
-                let offered = offer.get(file_id as usize).with_context(|| {
-                    format!(
-                        "file map entry {} has file_id {file_id}, but the offer has {} files",
+            match entry.kind {
+                EntryKind::File { file_id } => {
+                    let offered = offer.files.get(file_id as usize).with_context(|| {
+                        format!(
+                            "file map entry {} has file_id {file_id}, but the offer has {} files",
+                            entry.path.display(),
+                            offer.files.len()
+                        )
+                    })?;
+                    ensure!(
+                        offered.path == entry.path,
+                        "file map entry {} does not match offered file {file_id} ({})",
                         entry.path.display(),
-                        offer.len()
-                    )
-                })?;
-                ensure!(
-                    *offered == entry.path,
-                    "file map entry {} does not match offered file {file_id} ({})",
-                    entry.path.display(),
-                    offered.display()
-                );
+                        offered.path.display()
+                    );
+                }
+                EntryKind::Dir => ensure!(
+                    dirs.contains(&entry.path),
+                    "file map entry {} is a directory the offer does not list",
+                    entry.path.display()
+                ),
             }
         }
         Ok(())

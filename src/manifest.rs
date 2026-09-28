@@ -1,6 +1,7 @@
 //! The file manifest: validated relative paths, chunk size, and chunk math.
 
-use std::collections::HashSet;
+use std::collections::HashMap;
+use std::collections::hash_map::Entry;
 use std::fs::Metadata;
 use std::time::UNIX_EPOCH;
 
@@ -8,7 +9,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use serde::{Deserialize, Serialize};
 use serde_bytes::ByteBuf;
 
-use crate::names::WirePath;
+use crate::names::{NameError, WireName, WirePath};
 
 pub const MIN_CHUNK_SIZE: u32 = 4 << 10;
 pub const MAX_CHUNK_SIZE: u32 = 64 << 20;
@@ -81,16 +82,19 @@ pub const END_FILE_ID: u32 = u32::MAX;
 /// Most files one transfer may hold; far below `END_FILE_ID`.
 pub const MAX_FILES: usize = 10_000_000;
 
-/// A validated manifest: paths unique after case and Unicode folding,
-/// fewer than `END_FILE_ID` files.
+/// A validated manifest: files, directories, and their parents name
+/// distinct paths after case and Unicode folding, and there are fewer than
+/// `END_FILE_ID` files.
 #[derive(Clone, Debug)]
 pub struct Manifest {
     pub chunk_size: ChunkSize,
     pub files: Vec<FileEntry>,
+    /// Every directory under the sent roots, empty ones included.
+    pub dirs: Vec<WirePath>,
 }
 
 impl Manifest {
-    pub fn new(chunk_size: ChunkSize, files: Vec<FileEntry>) -> Result<Self> {
+    pub fn new(chunk_size: ChunkSize, files: Vec<FileEntry>, dirs: Vec<WirePath>) -> Result<Self> {
         if files.len() > MAX_FILES {
             bail!("too many files ({}, at most {MAX_FILES})", files.len());
         }
@@ -103,28 +107,27 @@ impl Manifest {
         if have_bytes.is_none_or(|b| b + 1024 > crate::wire::MAX_CONTROL_LEN as u64) {
             bail!("too many chunks for one transfer; use a larger chunk size");
         }
-        let mut seen = HashSet::new();
-        for f in &files {
-            if !seen.insert(f.path.fold_key()) {
-                bail!(
-                    "duplicate path {} (paths that differ only in case or Unicode \
-                     normalization collide)",
-                    f.path.display()
-                );
-            }
-        }
-        Ok(Manifest { chunk_size, files })
+        check_namespace(&files, &dirs)?;
+        Ok(Manifest {
+            chunk_size,
+            files,
+            dirs,
+        })
     }
 
     /// Validates an offer received from the network.
-    pub fn from_offer(chunk_size: u32, files: Vec<OfferFile>) -> Result<Self> {
+    pub fn from_offer(
+        chunk_size: u32,
+        files: Vec<OfferFile>,
+        dirs: Vec<Vec<ByteBuf>>,
+    ) -> Result<Self> {
         let chunk_size = ChunkSize::new(chunk_size)?;
         let files = files
             .into_iter()
             .enumerate()
             .map(|(j, f)| {
-                let path = WirePath::parse(f.path.into_iter().map(ByteBuf::into_vec))
-                    .with_context(|| format!("file {j} of the offer"))?;
+                let path =
+                    parse_offered(f.path).with_context(|| format!("file {j} of the offer"))?;
                 Ok(FileEntry {
                     path,
                     size: f.size,
@@ -132,23 +135,27 @@ impl Manifest {
                 })
             })
             .collect::<Result<_>>()?;
-        Manifest::new(chunk_size, files)
+        let dirs = dirs
+            .into_iter()
+            .enumerate()
+            .map(|(j, d)| parse_offered(d).with_context(|| format!("directory {j} of the offer")))
+            .collect::<Result<_>>()?;
+        Manifest::new(chunk_size, files, dirs)
     }
 
     pub fn to_offer(&self) -> Vec<OfferFile> {
         self.files
             .iter()
             .map(|f| OfferFile {
-                path: f
-                    .path
-                    .components()
-                    .iter()
-                    .map(|c| ByteBuf::from(c.as_bytes()))
-                    .collect(),
+                path: offered(&f.path),
                 size: f.size,
                 mtime: f.mtime,
             })
             .collect()
+    }
+
+    pub fn offer_dirs(&self) -> Vec<Vec<ByteBuf>> {
+        self.dirs.iter().map(offered).collect()
     }
 
     pub fn chunk_count(&self, file_id: u32) -> u64 {
@@ -163,6 +170,114 @@ impl Manifest {
         )
         .1
     }
+}
+
+fn parse_offered(path: Vec<ByteBuf>) -> Result<WirePath, NameError> {
+    WirePath::parse(path.into_iter().map(ByteBuf::into_vec))
+}
+
+fn offered(path: &WirePath) -> Vec<ByteBuf> {
+    path.components()
+        .iter()
+        .map(|c| ByteBuf::from(c.as_bytes()))
+        .collect()
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Kind {
+    File,
+    Dir,
+    /// A directory implied as the parent of a listed path.
+    Parent,
+}
+
+/// One name the receiver creates: the first `len` components of `path`.
+#[derive(Clone, Copy)]
+struct Node<'a> {
+    path: &'a WirePath,
+    len: usize,
+    kind: Kind,
+}
+
+impl Node<'_> {
+    fn components(&self) -> &[WireName] {
+        &self.path.components()[..self.len]
+    }
+
+    fn describe(&self) -> String {
+        let own = self.path.prefix(self.len).display();
+        match self.kind {
+            Kind::File => format!("file {own}"),
+            Kind::Dir => format!("directory {own}"),
+            Kind::Parent => format!("directory {own} (parent of {})", self.path.display()),
+        }
+    }
+}
+
+/// Files, directories, and every parent of either share one namespace on
+/// the receiver, so no two of them may fold to the same key unless they
+/// are the same directory.
+fn check_namespace(files: &[FileEntry], dirs: &[WirePath]) -> Result<()> {
+    let mut names = HashMap::new();
+    let listed = files
+        .iter()
+        .map(|f| (&f.path, Kind::File))
+        .chain(dirs.iter().map(|d| (d, Kind::Dir)));
+    for (path, kind) in listed {
+        let depth = path.components().len();
+        claim(
+            &mut names,
+            path.fold_key(),
+            Node {
+                path,
+                len: depth,
+                kind,
+            },
+        )?;
+        for len in (1..depth).rev() {
+            let parent = Node {
+                path,
+                len,
+                kind: Kind::Parent,
+            };
+            if !claim(&mut names, path.prefix(len).fold_key(), parent)? {
+                break;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Records `node` under `key`. Returns false when `node` is a parent that
+/// was already recorded, and with it all of its own parents.
+fn claim<'a>(names: &mut HashMap<String, Node<'a>>, key: String, node: Node<'a>) -> Result<bool> {
+    let old = match names.entry(key) {
+        Entry::Vacant(v) => {
+            v.insert(node);
+            return Ok(true);
+        }
+        Entry::Occupied(o) => o.into_mut(),
+    };
+    let same = old.components() == node.components();
+    match (old.kind, node.kind) {
+        (Kind::Dir | Kind::Parent, Kind::Parent) if same => return Ok(false),
+        (Kind::Parent, Kind::Dir) if same => {
+            *old = node;
+            return Ok(true);
+        }
+        (Kind::Dir, Kind::Dir) if same => bail!("directory {} is listed twice", old.path.display()),
+        _ => {}
+    }
+    let why = if same {
+        ""
+    } else {
+        " (names that differ only in case or Unicode normalization collide)"
+    };
+    bail!(
+        "duplicate name: {} and {}{why}",
+        old.describe(),
+        node.describe()
+    )
 }
 
 /// A chunk of a file in the manifest.
@@ -250,17 +365,41 @@ mod tests {
         assert!(parse_size("8G").is_err());
     }
 
+    fn file(p: &str) -> FileEntry {
+        FileEntry {
+            path: wire(p),
+            size: 1,
+            mtime: 0,
+        }
+    }
+
+    fn namespace(files: &[&str], dirs: &[&str]) -> Result<Manifest> {
+        Manifest::new(
+            cs(4096),
+            files.iter().map(|p| file(p)).collect(),
+            dirs.iter().map(|p| wire(p)).collect(),
+        )
+    }
+
+    fn rejected(files: &[&str], dirs: &[&str]) -> String {
+        namespace(files, dirs).unwrap_err().to_string()
+    }
+
     #[test]
     fn offer_with_bad_path_or_chunk_size_is_rejected() {
+        let path = |p: &str| p.split('/').map(|c| ByteBuf::from(c.as_bytes())).collect();
         let f = |p: &str| OfferFile {
-            path: p.split('/').map(|c| ByteBuf::from(c.as_bytes())).collect(),
+            path: path(p),
             size: 10,
             mtime: 0,
         };
-        assert!(Manifest::from_offer(4096, vec![f("ok/file")]).is_ok());
-        let err = Manifest::from_offer(4096, vec![f("ok"), f("../evil")]).unwrap_err();
+        assert!(Manifest::from_offer(4096, vec![f("ok/file")], vec![path("ok")]).is_ok());
+        let err = Manifest::from_offer(4096, vec![f("ok"), f("../evil")], Vec::new()).unwrap_err();
         assert!(format!("{err:#}").contains("file 1"), "{err:#}");
-        assert!(Manifest::from_offer(1, vec![f("ok")]).is_err());
+        let err =
+            Manifest::from_offer(4096, Vec::new(), vec![path("d"), path("x/..")]).unwrap_err();
+        assert!(format!("{err:#}").contains("directory 1"), "{err:#}");
+        assert!(Manifest::from_offer(1, vec![f("ok")], Vec::new()).is_err());
     }
 
     #[test]
@@ -270,9 +409,9 @@ mod tests {
             size: 1 << 50,
             mtime: 0,
         };
-        let err = Manifest::new(cs(4096), vec![huge.clone()]).unwrap_err();
+        let err = Manifest::new(cs(4096), vec![huge.clone()], Vec::new()).unwrap_err();
         assert!(err.to_string().contains("too many chunks"), "{err}");
-        assert!(Manifest::new(cs(MAX_CHUNK_SIZE), vec![huge]).is_ok());
+        assert!(Manifest::new(cs(MAX_CHUNK_SIZE), vec![huge], Vec::new()).is_ok());
     }
 
     #[test]
@@ -284,25 +423,73 @@ mod tests {
                 mtime: 0,
             })
             .collect();
-        let err = Manifest::new(cs(4096), files).unwrap_err();
+        let err = Manifest::new(cs(4096), files, Vec::new()).unwrap_err();
         assert!(err.to_string().contains("too many chunks"), "{err}");
     }
 
     #[test]
     fn manifest_rejects_duplicates() {
-        let f = |p: &str| FileEntry {
-            path: wire(p),
-            size: 1,
-            mtime: 0,
-        };
-        assert!(Manifest::new(cs(4096), vec![f("a"), f("b/a")]).is_ok());
-        let err = Manifest::new(cs(4096), vec![f("a"), f("b"), f("a")]).unwrap_err();
-        assert!(err.to_string().contains("duplicate"));
-        let err = Manifest::new(cs(4096), vec![f("README"), f("readme")]).unwrap_err();
-        assert!(err.to_string().contains("duplicate"));
-        let err = Manifest::new(cs(4096), vec![f("caf\u{e9}"), f("cafe\u{301}")]).unwrap_err();
-        assert!(err.to_string().contains("duplicate"));
-        let err = Manifest::new(cs(4096), vec![f("A\u{3A3}"), f("a\u{3C3}")]).unwrap_err();
-        assert!(err.to_string().contains("duplicate"));
+        assert!(namespace(&["a", "b/a"], &[]).is_ok());
+        assert!(rejected(&["a", "b", "a"], &[]).contains("duplicate"));
+        assert!(rejected(&["README", "readme"], &[]).contains("duplicate"));
+        assert!(rejected(&["caf\u{e9}", "cafe\u{301}"], &[]).contains("duplicate"));
+        assert!(rejected(&["A\u{3A3}", "a\u{3C3}"], &[]).contains("duplicate"));
+    }
+
+    #[test]
+    fn manifest_accepts_a_tree_with_its_directories() {
+        let m = namespace(
+            &["tree/a/b/c/deep.txt", "tree/a/top.txt", "single.bin"],
+            &["tree", "tree/a", "tree/a/b", "tree/a/b/c", "tree/empty"],
+        )
+        .unwrap();
+        assert_eq!(m.dirs.len(), 5);
+        assert!(namespace(&["x/a", "x/b"], &[]).is_ok());
+    }
+
+    #[test]
+    fn manifest_rejects_a_file_that_is_a_parent() {
+        let err = rejected(&["a", "a/b"], &[]);
+        assert!(
+            err.contains("file a and directory a (parent of a/b)"),
+            "{err}"
+        );
+        let err = rejected(&["x/A/b", "x/a"], &[]);
+        assert!(err.contains("x/A/b") && err.contains("file x/a"), "{err}");
+    }
+
+    #[test]
+    fn manifest_rejects_a_file_and_directory_differing_in_case() {
+        let err = rejected(&["tree/a"], &["tree", "tree/A"]);
+        assert!(err.contains("file tree/a and directory tree/A"), "{err}");
+    }
+
+    #[test]
+    fn manifest_rejects_directories_differing_in_case() {
+        let err = rejected(&[], &["Docs", "docs"]);
+        assert!(err.contains("directory Docs and directory docs"), "{err}");
+        let err = rejected(&["Docs/x"], &["docs"]);
+        assert!(
+            err.contains("Docs/x") && err.contains("directory docs"),
+            "{err}"
+        );
+        let err = rejected(&["A/x", "a/y"], &[]);
+        assert!(err.contains("A/x") && err.contains("a/y"), "{err}");
+    }
+
+    #[test]
+    fn manifest_rejects_a_directory_equal_to_a_file() {
+        let err = rejected(&["a"], &["a"]);
+        assert!(err.contains("file a and directory a"), "{err}");
+        let err = rejected(&[], &["d", "d"]);
+        assert!(err.contains("directory d is listed twice"), "{err}");
+    }
+
+    #[test]
+    fn manifest_rejects_parents_differing_in_normalization() {
+        let err = rejected(&["caf\u{e9}/a", "cafe\u{301}/b"], &[]);
+        assert!(err.contains("duplicate"), "{err}");
+        let err = rejected(&["caf\u{e9}/a"], &["cafe\u{301}"]);
+        assert!(err.contains("duplicate"), "{err}");
     }
 }
