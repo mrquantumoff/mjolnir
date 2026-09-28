@@ -689,7 +689,9 @@ fn seal(ctx: &Ctx, job: SealJob) {
     conn.slots[k as usize % DEPTH].put(buf, sealed.map(|()| frame_len));
 }
 
-/// Fails if any source's size or mtime differs from the offer.
+/// Fails if any source's size or mtime differs from the offer. The error
+/// goes to the receiver too, so it names the file by its transfer path,
+/// not by where it lives on this host.
 fn check_unchanged(ctx: &Ctx) -> Result<()> {
     for (entry, path) in ctx.manifest.files.iter().zip(ctx.paths) {
         let changed = match fs::metadata(path) {
@@ -699,7 +701,7 @@ fn check_unchanged(ctx: &Ctx) -> Result<()> {
         ensure!(
             !changed,
             "source file changed during transfer: {}",
-            path.display()
+            entry.path.display()
         );
     }
     Ok(())

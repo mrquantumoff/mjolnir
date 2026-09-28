@@ -612,9 +612,11 @@ fn source_changed_during_transfer_fails_the_sender() {
     touch.join().unwrap();
     assert!(
         err.to_string()
-            .contains("source file changed during transfer"),
+            .contains("source file changed during transfer: big.bin"),
         "{err:#}"
     );
+    let source_dir = src.path().display().to_string();
+    assert!(!format!("{err:#}").contains(&source_dir), "{err:#}");
     rx.assert_waiting();
     assert!(!out.path().join("big.bin").exists());
     rx.progress.cancel();
