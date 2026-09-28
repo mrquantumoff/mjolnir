@@ -3,7 +3,7 @@
 //! them on disk before finishing.
 
 use std::collections::{HashMap, HashSet};
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, File};
 use std::io::{self, BufReader, ErrorKind, Read, Write};
 use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
@@ -21,7 +21,8 @@ use crate::crypto::{
     Cipher, CipherState, DIGEST_LEN, FileHasher, FrameKey, SessionKeys, TAG_LEN, chunk_digest,
     handshake_responder,
 };
-use crate::filemap::{self, ApplyPolicy, FileMap};
+use crate::filemap::{self, ApplyPolicy, EntryKind, FileMap};
+use crate::fsops;
 use crate::keys::{PrivateKey, PublicKey, require_nonempty};
 use crate::manifest::{ChunkSize, FileEntry, Manifest, chunk_count, chunk_span};
 use crate::net::{self, Io, tell_peer_about, unexpected};
@@ -68,6 +69,9 @@ pub struct RecvReport {
     pub hashed: bool,
     /// Chunks the hash check found different and fetched again.
     pub hash_repaired_chunks: u64,
+    /// Resumed chunks whose digest no longer matched the sender's fresh
+    /// read of the source, and were fetched again.
+    pub stale_chunks: u64,
     /// `(path, file_hash)` per file.
     pub file_hashes: Vec<(String, String)>,
     /// File map entries that could not be applied.
@@ -256,7 +260,7 @@ impl Receiver {
             }
         };
         let mut rx = ControlRx::resume(control, rx_cipher);
-        let result = self.receive(h.keys, offer, &mut rx, &mut tx, progress);
+        let result = self.receive(h.keys, h.peer, offer, &mut rx, &mut tx, progress);
         if let Err(e) = &result {
             tell_peer_about(e, progress, Some(&mut tx));
             net::linger(rx.into_inner().into_stream());
@@ -272,6 +276,7 @@ impl Receiver {
             verified: o.verified,
             hashed: o.finish.hashed,
             hash_repaired_chunks: o.stats.hash_repaired.load(Relaxed),
+            stale_chunks: o.stats.stale.load(Relaxed),
             file_hashes: o.finish.file_hashes,
             warnings: o.finish.warnings,
             skipped: Vec::new(),
@@ -285,6 +290,7 @@ impl Receiver {
     fn receive(
         &self,
         keys: SessionKeys,
+        peer: PublicKey,
         offer: Msg,
         rx: &mut Rx,
         tx: &mut Tx,
@@ -302,11 +308,8 @@ impl Receiver {
             ),
             other => return Err(unexpected(other, "Offer")),
         };
-        let targets = prepare_targets(&self.cfg.out_dir, &manifest, self.cfg.force)?;
-        set_missing_totals(progress, &targets, manifest.chunk_size);
-        tx.send(&have_msg(&targets))?;
-        progress.set_phase(Phase::Transferring);
-
+        let (store, targets) =
+            prepare_targets(&self.cfg.out_dir, &manifest, &peer, self.cfg.force)?;
         let pool = Pool::new(resolve_threads(self.cfg.threads));
         let buf_len = manifest.chunk_size.get() as usize + TAG_LEN;
         let buffers = Buffers::new(
@@ -326,6 +329,7 @@ impl Receiver {
             cipher,
             manifest,
             targets,
+            store,
             verify: self.cfg.verify,
             out_dir: &self.cfg.out_dir,
             policy: self.cfg.apply,
@@ -346,6 +350,16 @@ impl Receiver {
                 failure: Mutex::new(None),
             },
         };
+        set_missing_totals(progress, &session.targets, session.manifest.chunk_size);
+        tx.send(&have_msg(&session.targets))?;
+        if session.targets.iter().any(|t| t.present.count_ones() > 0) {
+            progress.set_phase(Phase::Hashing);
+            session.check_resume(rx)?;
+            session.checkpoint()?;
+            set_missing_totals(progress, &session.targets, session.manifest.chunk_size);
+            tx.send(&have_msg(&session.targets))?;
+        }
+        progress.set_phase(Phase::Transferring);
         let checkpoints = Stop::default();
         let rounds = thread::scope(|s| {
             let spawned = (|| {
@@ -412,6 +426,7 @@ struct Stats {
     duplicates: AtomicU64,
     repaired: AtomicU64,
     hash_repaired: AtomicU64,
+    stale: AtomicU64,
 }
 
 struct Outcome {
@@ -469,17 +484,31 @@ fn handshake(
     }))
 }
 
-/// One output file and its side files.
+/// Open handles kept at once by the receiver's handle cache; a transfer
+/// of more files than this reopens them as its work moves along.
+const MAX_OPEN_TARGETS: usize = 256;
+/// How long the receiver waits for the sender's `Ack` of `Finished`
+/// before keeping its journal for a retry.
+const ACK_WAIT: Duration = Duration::from_secs(5);
+/// The private directory under the output directory that holds every
+/// transfer's staging files, keyed by transfer identity.
+pub const STAGING_DIR: &str = ".mjolnir-staging";
+
+/// One output file: its staging files, its bitmaps, and its commit state.
 struct Target {
+    file_id: u32,
     entry: FileEntry,
     chunk_size: ChunkSize,
     final_path: PathBuf,
+    /// Where the bytes live: the staging part file until the file is
+    /// committed, the final path afterwards.
+    payload: Mutex<PathBuf>,
     part_path: PathBuf,
+    /// `DIGEST_LEN` bytes of BLAKE3 per chunk, at `index * DIGEST_LEN`.
     sums_path: PathBuf,
     state_path: PathBuf,
-    part: File,
-    /// `DIGEST_LEN` bytes of BLAKE3 per chunk, at `index * DIGEST_LEN`.
-    sums: File,
+    /// Renamed into place; the journal treats the file as published.
+    committed: AtomicBool,
     /// Chunks whose bytes and digest are written. Checkpointed.
     present: AtomicBitset,
     /// Chunks some thread has taken on writing. In memory only; a superset
@@ -497,6 +526,70 @@ struct Target {
     writers: Gate,
 }
 
+/// A target's payload and sums handles, shared by whoever has them open.
+struct Open {
+    part: File,
+    sums: File,
+}
+
+/// At most `MAX_OPEN_TARGETS` targets open at once, least recently used
+/// closed first, so a tree of many files never exhausts descriptors.
+struct Handles {
+    cap: usize,
+    state: Mutex<HandleState>,
+}
+
+struct HandleState {
+    open: HashMap<u32, (Arc<Open>, u64)>,
+    tick: u64,
+}
+
+impl Handles {
+    fn new(cap: usize) -> Self {
+        Handles {
+            cap,
+            state: Mutex::new(HandleState {
+                open: HashMap::new(),
+                tick: 0,
+            }),
+        }
+    }
+
+    fn get(&self, t: &Target) -> io::Result<Arc<Open>> {
+        let mut s = self.state.lock().unwrap();
+        s.tick += 1;
+        let tick = s.tick;
+        if let Some((open, used)) = s.open.get_mut(&t.file_id) {
+            *used = tick;
+            return Ok(open.clone());
+        }
+        let part = fsops::open_private(&t.payload.lock().unwrap(), false)?;
+        let sums = fsops::open_private(&t.sums_path, false)?;
+        let open = Arc::new(Open { part, sums });
+        if s.open.len() >= self.cap
+            && let Some(&oldest) = s
+                .open
+                .iter()
+                .min_by_key(|(_, (_, used))| *used)
+                .map(|(k, _)| k)
+        {
+            s.open.remove(&oldest);
+        }
+        s.open.insert(t.file_id, (open.clone(), tick));
+        Ok(open)
+    }
+
+    /// Drops the cached handles of a target whose payload moved.
+    fn forget(&self, file_id: u32) {
+        self.state.lock().unwrap().open.remove(&file_id);
+    }
+
+    /// Drops every cached handle, so the staging directory can be moved.
+    fn clear(&self) {
+        self.state.lock().unwrap().open.clear();
+    }
+}
+
 /// What became of one authenticated chunk.
 #[derive(Debug, PartialEq, Eq)]
 enum Landed {
@@ -511,7 +604,7 @@ impl Target {
 
     /// Writes an authenticated chunk exactly once: claim, write bytes,
     /// write digest, then mark present. A failed write releases the claim.
-    fn land(&self, index: u64, plaintext: &[u8]) -> io::Result<Landed> {
+    fn land(&self, files: &Open, index: u64, plaintext: &[u8]) -> io::Result<Landed> {
         if !self.claimed.set(index) {
             return Ok(Landed::Duplicate);
         }
@@ -521,10 +614,10 @@ impl Target {
         let data = if crate::benchmode::get().discard {
             Ok(())
         } else {
-            write_all_at(&self.part, plaintext, self.span(index).0)
+            write_all_at(&files.part, plaintext, self.span(index).0)
         };
         let written =
-            data.and_then(|()| write_all_at(&self.sums, &digest, index * DIGEST_LEN as u64));
+            data.and_then(|()| write_all_at(&files.sums, &digest, index * DIGEST_LEN as u64));
         drop(slot);
         if let Err(e) = written {
             self.claimed.clear(index);
@@ -536,12 +629,12 @@ impl Target {
     }
 
     /// Reads chunk `index` back and compares it with its stored digest.
-    fn check(&self, index: u64, buf: &mut [u8]) -> io::Result<bool> {
+    fn check(&self, files: &Open, index: u64, buf: &mut [u8]) -> io::Result<bool> {
         let (offset, len) = self.span(index);
         let data = &mut buf[..len as usize];
-        read_exact_at(&self.part, data, offset)?;
+        read_exact_at(&files.part, data, offset)?;
         let mut stored = [0u8; DIGEST_LEN];
-        read_exact_at(&self.sums, &mut stored, index * DIGEST_LEN as u64)?;
+        read_exact_at(&files.sums, &mut stored, index * DIGEST_LEN as u64)?;
         Ok(chunk_digest(data) == stored)
     }
 
@@ -553,86 +646,217 @@ impl Target {
     }
 }
 
-fn with_suffix(path: &Path, suffix: &str) -> PathBuf {
-    let mut s = path.as_os_str().to_owned();
-    s.push(suffix);
-    PathBuf::from(s)
+/// The receiver's staging area for one transfer: `<out>/.mjolnir-staging`
+/// is owner-only and holds a lock file, so one session runs per output
+/// directory, and one directory per transfer identity holds every file's
+/// `<id>.part`, `<id>.sums`, and `<id>.state`. That directory is the
+/// finalization journal: it exists from the first chunk until the sender
+/// acknowledges `Finished`, and a file whose part is gone from it while
+/// the directory remains was renamed into place.
+struct Store {
+    stage: PathBuf,
+    _lock: File,
+    #[cfg_attr(windows, allow(dead_code))]
+    umask: u32,
+    force: bool,
+    handles: Handles,
 }
 
-/// Opens every part and sums file, resuming from the state file when the
-/// part, sums, and state all exist and the state matches the offer, and
-/// starting the file from scratch otherwise.
-fn prepare_targets(out: &Path, m: &Manifest, force: bool) -> Result<Vec<Target>> {
+fn hex16(id: &[u8; 32]) -> String {
+    id[..16].iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// Where a transfer of `m` from `peer` into `out` keeps its staging files.
+pub fn staging_dir(out: &Path, m: &Manifest, peer: &PublicKey) -> PathBuf {
+    crate::names::local_dir(out)
+        .join(STAGING_DIR)
+        .join(hex16(&m.identity(peer)))
+}
+
+/// Fault injection for the crash tests, scoped to one output directory so
+/// tests in one process do not disturb each other.
+#[doc(hidden)]
+pub mod testing {
+    use std::path::{Path, PathBuf};
+    use std::sync::Mutex;
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum Fault {
+        /// Fail finalization right after the first file is renamed into
+        /// place, leaving the rest staged.
+        FailAfterFirstPublish,
+        /// Behave as if `Finished` never reached the sender: keep the
+        /// journal instead of waiting for `Ack`.
+        LoseFinished,
+    }
+
+    static FAULTS: Mutex<Vec<(PathBuf, Fault)>> = Mutex::new(Vec::new());
+
+    pub fn inject(out_dir: &Path, fault: Fault) {
+        FAULTS.lock().unwrap().push((out_dir.to_path_buf(), fault));
+    }
+
+    pub(crate) fn take(out_dir: &Path, fault: Fault) -> bool {
+        let mut faults = FAULTS.lock().unwrap();
+        match faults.iter().position(|(d, f)| d == out_dir && *f == fault) {
+            Some(i) => {
+                faults.remove(i);
+                true
+            }
+            None => false,
+        }
+    }
+}
+
+/// Prepares every target: takes the output directory's lock, creates the
+/// transfer's staging directory and every directory the offer lists,
+/// resumes part files whose state is valid, treats files that an
+/// interrupted finalization already renamed into place as committed, and
+/// starts everything else from scratch.
+fn prepare_targets(
+    out: &Path,
+    m: &Manifest,
+    peer: &PublicKey,
+    force: bool,
+) -> Result<(Store, Vec<Target>)> {
+    let out = crate::names::local_dir(out);
+    let root = out.join(STAGING_DIR);
+    fsops::create_private_dir(&root).with_context(|| format!("creating {}", root.display()))?;
+    let lock = fsops::open_private(&root.join("lock"), true)?;
+    ensure!(
+        fsops::try_lock_exclusive(&lock)?,
+        "another receiver is using {}",
+        out.display()
+    );
+    let stage = staging_dir(&out, m, peer);
+    let done = stage.with_extension("done");
+    if done.is_dir() && !stage.is_dir() {
+        fsops::rename_durable(&done, &stage, false)?;
+    }
+    let journal = stage.is_dir();
+    fsops::create_private_dir(&stage)?;
+    for dir in &m.dirs {
+        let local = dir.to_local_path(&out);
+        fs::create_dir_all(&local).with_context(|| format!("creating {}", local.display()))?;
+    }
+    let store = Store {
+        stage: stage.clone(),
+        _lock: lock,
+        #[cfg(unix)]
+        umask: fsops::umask(),
+        #[cfg(windows)]
+        umask: 0,
+        force,
+        handles: Handles::new(MAX_OPEN_TARGETS),
+    };
     let mut targets = Vec::with_capacity(m.files.len());
-    for entry in &m.files {
-        let final_path = entry.path.to_local_path(out);
-        if !force && fs::symlink_metadata(&final_path).is_ok() {
-            bail!(
-                "{} already exists (use --force to overwrite)",
-                final_path.display()
-            );
-        }
-        if let Some(parent) = final_path.parent() {
-            fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
-        }
-        let part_path = with_suffix(&final_path, ".mjolnir-part");
-        let sums_path = with_suffix(&final_path, ".mjolnir-sums");
-        let state_path = with_suffix(&final_path, ".mjolnir-state");
+    let mut regenerate = Vec::new();
+    for (j, entry) in m.files.iter().enumerate() {
+        let file_id = j as u32;
+        let final_path = entry.path.to_local_path(&out);
+        let part_path = stage.join(format!("{j}.part"));
+        let sums_path = stage.join(format!("{j}.sums"));
+        let state_path = stage.join(format!("{j}.state"));
         let count = chunk_count(entry.size, m.chunk_size);
-        let resumed = (part_path.exists() && sums_path.exists())
-            .then(|| PartState::load(&state_path).ok())
-            .flatten()
-            .filter(|s| {
-                s.size == entry.size
-                    && s.mtime == entry.mtime
-                    && s.chunk_size == m.chunk_size.get()
-                    && s.bitmap.len() as u64 == count.div_ceil(8)
-            });
-        // A stale state file goes before the part file is truncated, so no
-        // crash can leave a matching state next to zeroed data.
-        if resumed.is_none() {
-            remove_if_exists(&state_path)?;
-        }
-        let open = |path: &Path, len: u64| -> Result<File> {
-            let file = OpenOptions::new()
-                .read(true)
-                .write(true)
-                .create(true)
-                .truncate(resumed.is_none())
-                .open(path)
-                .with_context(|| format!("opening {}", path.display()))?;
-            file.set_len(len)?;
-            Ok(file)
-        };
-        let part = open(&part_path, entry.size)?;
-        let sums = open(&sums_path, count * DIGEST_LEN as u64)?;
-        let present = match &resumed {
-            Some(state) => AtomicBitset::from_bytes(count, &state.bitmap),
-            None => AtomicBitset::new(count),
+        let part_exists = part_path.is_file();
+        let published = journal
+            && !part_exists
+            && fs::metadata(&final_path).is_ok_and(|md| md.is_file() && md.len() == entry.size);
+        let (present, payload) = if published {
+            let sums = fsops::open_private(&sums_path, true)?;
+            if sums.metadata()?.len() != count * DIGEST_LEN as u64 {
+                sums.set_len(count * DIGEST_LEN as u64)?;
+                regenerate.push(file_id);
+            }
+            let present = AtomicBitset::new(count);
+            for k in 0..count {
+                present.set(k);
+            }
+            (present, final_path.clone())
+        } else {
+            if !force && fs::symlink_metadata(&final_path).is_ok() {
+                bail!(
+                    "{} already exists (use --force to overwrite)",
+                    final_path.display()
+                );
+            }
+            if let Some(parent) = final_path.parent() {
+                fs::create_dir_all(parent)
+                    .with_context(|| format!("creating {}", parent.display()))?;
+            }
+            let resumed = (part_exists && sums_path.is_file())
+                .then(|| PartState::load(&state_path).ok())
+                .flatten()
+                .filter(|s| {
+                    s.size == entry.size
+                        && s.mtime == entry.mtime
+                        && s.chunk_size == m.chunk_size.get()
+                        && s.bitmap.len() as u64 == count.div_ceil(8)
+                });
+            // A stale state file goes before the part file is truncated,
+            // so no crash can leave a matching state next to zeroed data.
+            if resumed.is_none() {
+                fsops::remove_durable(&state_path)?;
+            }
+            let open = |path: &Path, len: u64| -> Result<()> {
+                let file = fsops::open_private(path, true)
+                    .with_context(|| format!("opening {}", path.display()))?;
+                if resumed.is_none() {
+                    file.set_len(0)?;
+                }
+                file.set_len(len)?;
+                Ok(())
+            };
+            open(&part_path, entry.size)?;
+            open(&sums_path, count * DIGEST_LEN as u64)?;
+            let present = match &resumed {
+                Some(state) => AtomicBitset::from_bytes(count, &state.bitmap),
+                None => AtomicBitset::new(count),
+            };
+            (present, part_path.clone())
         };
         let claimed = AtomicBitset::from_bytes(count, &present.to_bytes());
         targets.push(Target {
+            file_id,
             entry: entry.clone(),
             chunk_size: m.chunk_size,
             final_path,
+            payload: Mutex::new(payload),
             part_path,
             sums_path,
             state_path,
-            part,
-            sums,
+            committed: AtomicBool::new(published),
             present,
             claimed,
             dirty: AtomicBool::new(false),
             writers: Gate::new(crate::benchmode::get().writers_per_file),
         });
     }
-    Ok(targets)
+    for file_id in regenerate {
+        let t = &targets[file_id as usize];
+        let files = store.handles.get(t)?;
+        let mut buf = vec![0u8; m.chunk_size.get() as usize];
+        for k in 0..t.present.len() {
+            let (offset, len) = t.span(k);
+            read_exact_at(&files.part, &mut buf[..len as usize], offset)
+                .with_context(|| format!("reading back {}", t.final_path.display()))?;
+            let digest = chunk_digest(&buf[..len as usize]);
+            write_all_at(&files.sums, &digest, k * DIGEST_LEN as u64)?;
+        }
+        files.sums.sync_data()?;
+    }
+    Ok((store, targets))
 }
 
-fn remove_if_exists(path: &Path) -> io::Result<()> {
-    match fs::remove_file(path) {
-        Err(e) if e.kind() != ErrorKind::NotFound => Err(e),
-        _ => Ok(()),
+impl Store {
+    /// After the sender acknowledged `Finished`: the journal is renamed
+    /// aside, so a crash mid-removal still reads as complete, then removed.
+    fn cleanup(&self) -> Result<()> {
+        self.handles.clear();
+        let done = self.stage.with_extension("done");
+        fsops::rename_durable(&self.stage, &done, false)?;
+        fsops::remove_tree_durable(&done)?;
+        Ok(())
     }
 }
 
@@ -660,6 +884,7 @@ struct Session<'a> {
     cipher: Cipher,
     manifest: Manifest,
     targets: Vec<Target>,
+    store: Store,
     verify: bool,
     out_dir: &'a Path,
     policy: ApplyPolicy,
@@ -751,7 +976,7 @@ impl Session<'_> {
                 let done = finalized.expect("finalized before every chunk is present");
                 self.progress.set_phase(Phase::Finishing);
                 let file_hashes = self.file_hashes()?;
-                self.finalize()?;
+                self.finalize(&done.map)?;
                 let warnings = filemap::apply(&done.map, self.out_dir, self.policy);
                 for w in &warnings {
                     eprintln!("mjolnir: {w}");
@@ -761,6 +986,27 @@ impl Session<'_> {
                     hashed: done.hash,
                     warnings: warnings.clone(),
                 })?;
+                // Only an acknowledged Finished lets the journal go; a
+                // sender that never saw it can run again and replay.
+                rx.inner_mut().set_deadline(ACK_WAIT);
+                let acked = !testing::take(self.out_dir, testing::Fault::LoseFinished)
+                    && matches!(rx.recv(), Ok(Msg::Ack));
+                // The transfer is complete either way; what remains is
+                // housekeeping, so its failures are reported, not fatal.
+                match acked {
+                    true => {
+                        if let Err(e) = self.store.cleanup() {
+                            eprintln!(
+                                "mjolnir: could not remove {}: {e:#}",
+                                self.store.stage.display()
+                            );
+                        }
+                    }
+                    false => eprintln!(
+                        "mjolnir: the sender did not acknowledge Finished; keeping {} for a retry",
+                        self.store.stage.display()
+                    ),
+                }
                 return Ok(Finish {
                     rounds: round + 1,
                     hashed: done.hash,
@@ -778,6 +1024,27 @@ impl Session<'_> {
         self.targets.iter().all(|t| t.present.is_full())
     }
 
+    /// Before round 0 of a resumed transfer: the sender re-reads every
+    /// chunk the `Have` reported present and sends its digests. A chunk
+    /// whose stored digest differs is stale (the source changed behind
+    /// its size and mtime, or an earlier session left other bytes) and
+    /// becomes missing again.
+    fn check_resume(&self, rx: &mut Rx) -> Result<()> {
+        loop {
+            match rx.recv()? {
+                Msg::Digests {
+                    file,
+                    first,
+                    digests,
+                } => self.compare_digests(file, first, &digests, |_, _, _| {
+                    self.stats.stale.fetch_add(1, Relaxed);
+                })?,
+                Msg::Resume => return Ok(()),
+                other => return Err(unexpected(other, "Digests or Resume")),
+            }
+        }
+    }
+
     /// After `Delivered`: reads the sender's `Digests` (if any) and its
     /// `Finalize`. Chunks whose stored digest differs from the sender's
     /// become missing and are remembered for the repair round.
@@ -791,7 +1058,10 @@ impl Session<'_> {
                     digests,
                 } => {
                     self.progress.set_phase(Phase::Hashing);
-                    self.compare_digests(file, first, &digests, &mut expected)?;
+                    self.compare_digests(file, first, &digests, |file, index, theirs| {
+                        self.stats.hash_repaired.fetch_add(1, Relaxed);
+                        expected.insert((file, index), theirs);
+                    })?;
                 }
                 Msg::Finalize { hash, map } => {
                     map.check(&self.manifest).context("rejected the file map")?;
@@ -806,12 +1076,15 @@ impl Session<'_> {
         }
     }
 
+    /// Compares the sender's digests for chunks `first..` of `file` with
+    /// the stored ones. A mismatched chunk becomes missing and is reported
+    /// to `mismatch` with the sender's digest.
     fn compare_digests(
         &self,
         file: u32,
         first: u64,
         digests: &[u8],
-        expected: &mut HashMap<(u32, u64), [u8; DIGEST_LEN]>,
+        mut mismatch: impl FnMut(u32, u64, [u8; DIGEST_LEN]),
     ) -> Result<()> {
         let t = self
             .targets
@@ -829,16 +1102,16 @@ impl Session<'_> {
             "Digests for chunks past the end of {}",
             t.entry.path.display()
         );
+        let files = self.store.handles.get(t)?;
         let mut ours = vec![0u8; digests.len()];
-        read_exact_at(&t.sums, &mut ours, first * DIGEST_LEN as u64)?;
+        read_exact_at(&files.sums, &mut ours, first * DIGEST_LEN as u64)?;
         let (theirs, _) = digests.as_chunks::<DIGEST_LEN>();
         let (mine, _) = ours.as_chunks::<DIGEST_LEN>();
         for (i, (theirs, mine)) in theirs.iter().zip(mine).enumerate() {
             if theirs != mine {
                 let index = first + i as u64;
                 t.reject(index);
-                self.stats.hash_repaired.fetch_add(1, Relaxed);
-                expected.insert((file, index), *theirs);
+                mismatch(file, index, *theirs);
             }
         }
         Ok(())
@@ -849,8 +1122,9 @@ impl Session<'_> {
     fn check_repairs(&self, done: &Finalized) -> Result<()> {
         for (&(file, index), want) in &done.expected {
             let t = &self.targets[file as usize];
+            let files = self.store.handles.get(t)?;
             let mut stored = [0u8; DIGEST_LEN];
-            read_exact_at(&t.sums, &mut stored, index * DIGEST_LEN as u64)?;
+            read_exact_at(&files.sums, &mut stored, index * DIGEST_LEN as u64)?;
             ensure!(
                 stored == *want,
                 "{} changed during transfer",
@@ -860,17 +1134,26 @@ impl Session<'_> {
         Ok(())
     }
 
-    /// `(path, BLAKE3(chunk_size u32 | chunk digests))` for every file, from
-    /// the sums files.
+    /// `(path, BLAKE3(chunk_size u32 | chunk digests))` for every file,
+    /// streamed from the sums files in fixed-size steps, so a file of any
+    /// chunk count hashes in bounded memory.
     fn file_hashes(&self) -> Result<Vec<(String, String)>> {
+        const STEP: u64 = 1 << 20;
         let chunk_size = self.manifest.chunk_size.get();
+        let mut buf = vec![0u8; STEP as usize];
         self.targets
             .iter()
             .map(|t| {
-                let mut digests = vec![0u8; t.present.len() as usize * DIGEST_LEN];
-                read_exact_at(&t.sums, &mut digests, 0)?;
+                let files = self.store.handles.get(t)?;
                 let mut hasher = FileHasher::new(chunk_size);
-                hasher.update(&digests);
+                let total = t.present.len() * DIGEST_LEN as u64;
+                let mut offset = 0;
+                while offset < total {
+                    let n = (total - offset).min(STEP) as usize;
+                    read_exact_at(&files.sums, &mut buf[..n], offset)?;
+                    hasher.update(&buf[..n]);
+                    offset += n as u64;
+                }
                 Ok((t.entry.path.display(), hasher.hex()))
             })
             .collect()
@@ -878,7 +1161,12 @@ impl Session<'_> {
 
     /// Handles one authenticated chunk from any connection.
     fn land(&self, target: &Target, index: u64, plaintext: &[u8]) -> Result<()> {
-        match target.land(index, plaintext) {
+        let landed = self
+            .store
+            .handles
+            .get(target)
+            .and_then(|files| target.land(&files, index, plaintext));
+        match landed {
             Ok(Landed::Written) => {
                 let len = plaintext.len() as u64;
                 self.stats.chunks.fetch_add(1, Relaxed);
@@ -903,8 +1191,9 @@ impl Session<'_> {
     /// Mismatches become missing again.
     fn verify_all(&self) -> Result<()> {
         for t in &self.targets {
-            t.part.sync_data()?;
-            t.sums.sync_data()?;
+            let files = self.store.handles.get(t)?;
+            files.part.sync_data()?;
+            files.sums.sync_data()?;
         }
         let total_bytes: u64 = self.targets.iter().map(|t| t.entry.size).sum();
         let total_chunks: u64 = self.targets.iter().map(|t| t.present.len()).sum();
@@ -976,9 +1265,12 @@ impl Session<'_> {
     }
 
     fn verify_chunk(&self, file: u32, t: &Target, index: u64, buf: &mut [u8]) -> Result<()> {
-        let ok = t
-            .check(index, buf)
-            .with_context(|| format!("reading back {}", t.part_path.display()))?;
+        let ok = self
+            .store
+            .handles
+            .get(t)
+            .and_then(|files| t.check(&files, index, buf))
+            .with_context(|| format!("reading back {}", t.payload.lock().unwrap().display()))?;
         self.progress.add_chunk(u64::from(t.span(index).1));
         if ok {
             return Ok(());
@@ -1007,8 +1299,9 @@ impl Session<'_> {
             }
             let saved = (|| {
                 let bitmap = t.present.to_bytes();
-                t.part.sync_data()?;
-                t.sums.sync_data()?;
+                let files = self.store.handles.get(t)?;
+                files.part.sync_data()?;
+                files.sums.sync_data()?;
                 PartState {
                     size: t.entry.size,
                     mtime: t.entry.mtime,
@@ -1025,18 +1318,73 @@ impl Session<'_> {
         Ok(())
     }
 
-    fn finalize(&self) -> Result<()> {
+    /// Publishes every file not yet committed: sync it, give it its final
+    /// mode while it is still private, rename it into place durably (and
+    /// without replacing anything unless `--force`), and drop its state.
+    /// Sums stay until the sender acknowledges `Finished`, so a replayed
+    /// finalization can still verify. Each file's commit is one rename,
+    /// so a crash leaves every file either staged or published.
+    fn finalize(&self, map: &FileMap) -> Result<()> {
+        let _no_checkpoint = self.checkpoint_lock.lock().unwrap();
+        let modes: HashMap<u32, Option<u32>> = map
+            .entries
+            .iter()
+            .filter_map(|e| match e.kind {
+                EntryKind::File { file_id } => Some((file_id, e.mode)),
+                EntryKind::Dir => None,
+            })
+            .collect();
         for t in &self.targets {
-            t.part
+            if t.committed.load(Relaxed) {
+                continue;
+            }
+            let files = self.store.handles.get(t)?;
+            files
+                .part
                 .sync_all()
                 .with_context(|| format!("syncing {}", t.part_path.display()))?;
-        }
-        for t in &self.targets {
-            fs::rename(&t.part_path, &t.final_path)
+            let mode = modes.get(&t.file_id).copied().flatten();
+            self.set_final_mode(&files.part, mode)?;
+            drop(files);
+            self.store.handles.forget(t.file_id);
+            fsops::rename_durable(&t.part_path, &t.final_path, self.store.force)
                 .with_context(|| format!("renaming into {}", t.final_path.display()))?;
-            remove_if_exists(&t.state_path)?;
-            remove_if_exists(&t.sums_path)?;
+            fsops::inherit_parent_acl(&t.final_path)?;
+            *t.payload.lock().unwrap() = t.final_path.clone();
+            t.committed.store(true, Relaxed);
+            fsops::remove_durable(&t.state_path)?;
+            if testing::take(self.out_dir, testing::Fault::FailAfterFirstPublish) {
+                bail!(
+                    "injected failure after publishing {}",
+                    t.final_path.display()
+                );
+            }
         }
+        Ok(())
+    }
+
+    /// The mode a file is published with: the map's, under the special-bit
+    /// policy, or what `creat` would give under the current umask.
+    #[cfg(unix)]
+    fn set_final_mode(&self, file: &File, mode: Option<u32>) -> Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+        let keep = if self.policy.allow_special_bits {
+            0o7777
+        } else {
+            0o777
+        };
+        let mode = match mode {
+            Some(m) => m & keep,
+            None => 0o666 & !self.store.umask,
+        };
+        file.set_permissions(fs::Permissions::from_mode(mode))?;
+        Ok(())
+    }
+
+    /// Windows has no mode; the file map's read-only bit is applied by
+    /// `filemap::apply` through the published path.
+    #[cfg(windows)]
+    fn set_final_mode(&self, _: &File, _: Option<u32>) -> Result<()> {
         Ok(())
     }
 }
@@ -1391,7 +1739,7 @@ mod tests {
     use crate::manifest::MIN_CHUNK_SIZE;
     use crate::names::WirePath;
 
-    fn target_in(dir: &Path, size: u64) -> Target {
+    fn target_in(dir: &Path, size: u64) -> (Store, Target) {
         let m = Manifest::new(
             ChunkSize::new(MIN_CHUNK_SIZE).unwrap(),
             vec![FileEntry {
@@ -1402,7 +1750,9 @@ mod tests {
             Vec::new(),
         )
         .unwrap();
-        prepare_targets(dir, &m, false).unwrap().pop().unwrap()
+        let peer = PrivateKey::generate().public_key();
+        let (store, mut targets) = prepare_targets(dir, &m, &peer, false).unwrap();
+        (store, targets.pop().unwrap())
     }
 
     fn tempdir(name: &str) -> PathBuf {
@@ -1473,40 +1823,76 @@ mod tests {
     #[test]
     fn a_duplicate_chunk_is_dropped_without_writing() {
         let dir = tempdir("dup");
-        let t = target_in(&dir, 3 * u64::from(MIN_CHUNK_SIZE));
+        let (store, t) = target_in(&dir, 3 * u64::from(MIN_CHUNK_SIZE));
+        let files = store.handles.get(&t).unwrap();
         let chunk = vec![7u8; MIN_CHUNK_SIZE as usize];
-        assert_eq!(t.land(1, &chunk).unwrap(), Landed::Written);
+        assert_eq!(t.land(&files, 1, &chunk).unwrap(), Landed::Written);
         assert!(t.present.get(1) && t.claimed.get(1));
 
         let marker = vec![0xAAu8; MIN_CHUNK_SIZE as usize];
-        write_all_at(&t.part, &marker, u64::from(MIN_CHUNK_SIZE)).unwrap();
-        assert_eq!(t.land(1, &chunk).unwrap(), Landed::Duplicate);
+        write_all_at(&files.part, &marker, u64::from(MIN_CHUNK_SIZE)).unwrap();
+        assert_eq!(t.land(&files, 1, &chunk).unwrap(), Landed::Duplicate);
         let mut on_disk = vec![0u8; MIN_CHUNK_SIZE as usize];
-        read_exact_at(&t.part, &mut on_disk, u64::from(MIN_CHUNK_SIZE)).unwrap();
+        read_exact_at(&files.part, &mut on_disk, u64::from(MIN_CHUNK_SIZE)).unwrap();
         assert_eq!(on_disk, marker, "the duplicate must not touch the file");
-        drop(t);
+        drop((files, t, store));
         fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
     fn check_detects_corruption_and_reject_makes_the_chunk_missing() {
         let dir = tempdir("check");
-        let t = target_in(&dir, 2 * u64::from(MIN_CHUNK_SIZE) - 5);
+        let (store, t) = target_in(&dir, 2 * u64::from(MIN_CHUNK_SIZE) - 5);
+        let files = store.handles.get(&t).unwrap();
         let mut buf = vec![0u8; MIN_CHUNK_SIZE as usize];
-        t.land(0, &vec![1u8; MIN_CHUNK_SIZE as usize]).unwrap();
-        t.land(1, &vec![2u8; MIN_CHUNK_SIZE as usize - 5]).unwrap();
-        assert!(t.check(0, &mut buf).unwrap());
-        assert!(t.check(1, &mut buf).unwrap());
-        write_all_at(&t.part, &[9u8], 3).unwrap();
-        assert!(!t.check(0, &mut buf).unwrap());
+        t.land(&files, 0, &vec![1u8; MIN_CHUNK_SIZE as usize])
+            .unwrap();
+        t.land(&files, 1, &vec![2u8; MIN_CHUNK_SIZE as usize - 5])
+            .unwrap();
+        assert!(t.check(&files, 0, &mut buf).unwrap());
+        assert!(t.check(&files, 1, &mut buf).unwrap());
+        write_all_at(&files.part, &[9u8], 3).unwrap();
+        assert!(!t.check(&files, 0, &mut buf).unwrap());
         t.reject(0);
         assert!(!t.present.get(0) && !t.claimed.get(0));
         assert_eq!(
-            t.land(0, &vec![1u8; MIN_CHUNK_SIZE as usize]).unwrap(),
+            t.land(&files, 0, &vec![1u8; MIN_CHUNK_SIZE as usize])
+                .unwrap(),
             Landed::Written
         );
-        assert!(t.check(0, &mut buf).unwrap());
-        drop(t);
+        assert!(t.check(&files, 0, &mut buf).unwrap());
+        drop((files, t, store));
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// The handle cache keeps at most its capacity open and reopens what it
+    /// evicted, so a transfer of more files than descriptors still works.
+    #[test]
+    fn handles_are_bounded_and_reopened() {
+        let dir = tempdir("handles");
+        let files: Vec<FileEntry> = (0..10)
+            .map(|j| FileEntry {
+                path: WirePath::parse([format!("f{j}").into_bytes()]).unwrap(),
+                size: u64::from(MIN_CHUNK_SIZE),
+                mtime: 1,
+            })
+            .collect();
+        let m = Manifest::new(ChunkSize::new(MIN_CHUNK_SIZE).unwrap(), files, Vec::new()).unwrap();
+        let peer = PrivateKey::generate().public_key();
+        let (mut store, targets) = prepare_targets(&dir, &m, &peer, false).unwrap();
+        store.handles = Handles::new(3);
+        let chunk = vec![5u8; MIN_CHUNK_SIZE as usize];
+        for t in &targets {
+            let files = store.handles.get(t).unwrap();
+            assert_eq!(t.land(&files, 0, &chunk).unwrap(), Landed::Written);
+            assert!(store.handles.state.lock().unwrap().open.len() <= 3);
+        }
+        let mut buf = vec![0u8; MIN_CHUNK_SIZE as usize];
+        for t in &targets {
+            let files = store.handles.get(t).unwrap();
+            assert!(t.check(&files, 0, &mut buf).unwrap(), "{}", t.file_id);
+        }
+        drop((targets, store));
         fs::remove_dir_all(dir).unwrap();
     }
 }

@@ -10,7 +10,9 @@ use anyhow::Result;
 use mjolnir::bitset::{AtomicBitset, PartState};
 use mjolnir::crypto::REJECTED;
 use mjolnir::filemap::Preserve;
-use mjolnir::manifest::mtime_of;
+use mjolnir::manifest::{ChunkSize, FileEntry, Manifest, mtime_of};
+use mjolnir::names::WirePath;
+use mjolnir::recv::{STAGING_DIR, staging_dir, testing};
 use mjolnir::{
     Cancelled, Cipher, Phase, PrivateKey, Progress, PublicKey, Receiver, RecvConfig, RecvReport,
     SendConfig, SendReport,
@@ -157,10 +159,12 @@ fn keypair() -> (PrivateKey, PublicKey) {
     (k, p)
 }
 
-/// Every file under `dir`, relative, sorted.
+/// Every file under `dir`, relative, sorted; the receiver's staging
+/// directory is left out.
 fn tree(dir: &Path) -> Vec<(String, Vec<u8>)> {
     let mut out: Vec<_> = walkdir::WalkDir::new(dir)
         .into_iter()
+        .filter_entry(|e| e.file_name() != STAGING_DIR)
         .map(|e| e.unwrap())
         .filter(|e| e.file_type().is_file())
         .map(|e| {
@@ -213,7 +217,12 @@ fn multiple_files_and_directories_both_ciphers() {
         assert!(recv.verified && report.verified);
         assert_eq!(tree(&out.path().join("data")), tree(&data), "{cipher:?}");
         assert_file_eq(&single, &out.path().join("single.txt"));
-        assert_eq!(tree(out.path()).len(), 7, "no leftover part or state files");
+        assert_eq!(tree(out.path()).len(), 7);
+        assert_eq!(
+            staging_leftovers(out.path()),
+            vec!["lock".to_string()],
+            "a finished transfer leaves only the lock file"
+        );
         let _ = rpub;
     }
 }
@@ -265,12 +274,54 @@ fn wrong_pinned_receiver_key_fails_and_receiver_keeps_waiting() {
     assert_file_eq(&file, &out.path().join("f.bin"));
 }
 
-/// Leaves `out` as an interrupted earlier session would for `file`:
-/// chunks where `present(k)` hold the right bytes and digest and are marked
-/// in the state file, and the rest hold garbage. Chunks in `rot` are marked
-/// present with a valid digest, but their bytes are then corrupted, as a
-/// disk fault would do. Returns the chunk count.
-fn seed_resume(file: &Path, out: &Path, present: impl Fn(u64) -> bool, rot: &[u64]) -> u64 {
+/// The staging directory a transfer of `file` from `sender` into `out` uses.
+fn stage_of(file: &Path, out: &Path, sender: PublicKey) -> PathBuf {
+    let meta = fs::metadata(file).unwrap();
+    let m = Manifest::new(
+        ChunkSize::new(CHUNK).unwrap(),
+        vec![FileEntry {
+            path: WirePath::parse([file.file_name().unwrap().to_str().unwrap().as_bytes()])
+                .unwrap(),
+            size: meta.len(),
+            mtime: mtime_of(&meta),
+        }],
+        Vec::new(),
+    )
+    .unwrap();
+    staging_dir(out, &m, &sender)
+}
+
+/// Names of everything under `out/.mjolnir-staging`, relative, sorted.
+fn staging_leftovers(out: &Path) -> Vec<String> {
+    let root = out.join(STAGING_DIR);
+    let mut names: Vec<String> = walkdir::WalkDir::new(&root)
+        .min_depth(1)
+        .into_iter()
+        .map(|e| e.unwrap())
+        .map(|e| {
+            e.path()
+                .strip_prefix(&root)
+                .unwrap()
+                .to_string_lossy()
+                .replace('\\', "/")
+        })
+        .collect();
+    names.sort();
+    names
+}
+
+/// Leaves `out` as an interrupted earlier session from `sender` would for
+/// `file`: chunks where `present(k)` hold the right bytes and digest and
+/// are marked in the state file, and the rest hold garbage. Chunks in
+/// `rot` are marked present with a valid digest, but their bytes are then
+/// corrupted, as a disk fault would do. Returns the chunk count.
+fn seed_resume(
+    file: &Path,
+    out: &Path,
+    sender: PublicKey,
+    present: impl Fn(u64) -> bool,
+    rot: &[u64],
+) -> u64 {
     let content = fs::read(file).unwrap();
     let chunks = (content.len() as u64).div_ceil(u64::from(CHUNK));
     let mut part = content.clone();
@@ -288,16 +339,17 @@ fn seed_resume(file: &Path, out: &Path, present: impl Fn(u64) -> bool, rot: &[u6
             part[span].iter_mut().for_each(|b| *b ^= 0x5A);
         }
     }
-    let name = file.file_name().unwrap().to_str().unwrap();
-    fs::write(out.join(format!("{name}.mjolnir-part")), &part).unwrap();
-    fs::write(out.join(format!("{name}.mjolnir-sums")), &sums).unwrap();
+    let stage = stage_of(file, out, sender);
+    fs::create_dir_all(&stage).unwrap();
+    fs::write(stage.join("0.part"), &part).unwrap();
+    fs::write(stage.join("0.sums"), &sums).unwrap();
     PartState {
         size: content.len() as u64,
         mtime: mtime_of(&fs::metadata(file).unwrap()),
         chunk_size: CHUNK,
         bitmap: have.to_bytes(),
     }
-    .save(&out.join(format!("{name}.mjolnir-state")))
+    .save(&stage.join("0.state"))
     .unwrap();
     chunks
 }
@@ -313,10 +365,10 @@ fn resume_sends_only_missing_chunks_and_rewrites_absent_bytes() {
     let src = TempDir::new().unwrap();
     let file = resume_source(&src, 32, 7);
     let out = TempDir::new().unwrap();
-    let chunks = seed_resume(&file, out.path(), |k| k % 2 == 0, &[]);
-
     let (rk, _) = keypair();
     let (sk, spub) = keypair();
+    let chunks = seed_resume(&file, out.path(), spub, |k| k % 2 == 0, &[]);
+
     let rx = start_receiver(rk, vec![spub], out.path());
     let report = Send::to(sk, rx.public).run(rx.addr, &[&file]).unwrap();
     let recv = rx.join().unwrap();
@@ -328,11 +380,10 @@ fn resume_sends_only_missing_chunks_and_rewrites_absent_bytes() {
     );
     assert_eq!(recv.chunks_received, chunks / 2);
     assert_eq!(recv.repaired_chunks, 0);
+    assert_eq!(recv.stale_chunks, 0);
     assert_eq!(recv.duplicate_chunks, 0);
     assert_file_eq(&file, &out.path().join("big.bin"));
-    for side in ["state", "part", "sums"] {
-        assert!(!out.path().join(format!("big.bin.mjolnir-{side}")).exists());
-    }
+    assert_eq!(staging_leftovers(out.path()), vec!["lock".to_string()]);
 }
 
 #[test]
@@ -341,10 +392,10 @@ fn verification_repairs_present_chunks_whose_bytes_rotted() {
     let file = resume_source(&src, 32, 12);
     let out = TempDir::new().unwrap();
     let rot = [0, 6, 30];
-    let chunks = seed_resume(&file, out.path(), |k| k % 2 == 0, &rot);
-
     let (rk, _) = keypair();
     let (sk, spub) = keypair();
+    let chunks = seed_resume(&file, out.path(), spub, |k| k % 2 == 0, &rot);
+
     let rx = start_receiver(rk, vec![spub], out.path());
     let report = Send::to(sk, rx.public).run(rx.addr, &[&file]).unwrap();
     let recv = rx.join().unwrap();
@@ -366,10 +417,10 @@ fn verification_repairs_a_fully_present_resume() {
     let src = TempDir::new().unwrap();
     let file = resume_source(&src, 16, 13);
     let out = TempDir::new().unwrap();
-    seed_resume(&file, out.path(), |_| true, &[3]);
-
     let (rk, _) = keypair();
     let (sk, spub) = keypair();
+    seed_resume(&file, out.path(), spub, |_| true, &[3]);
+
     let rx = start_receiver(rk, vec![spub], out.path());
     let report = Send::to(sk, rx.public).run(rx.addr, &[&file]).unwrap();
     let recv = rx.join().unwrap();
@@ -396,34 +447,39 @@ fn no_verify_finishes_unverified() {
     assert_file_eq(&file, &out.path().join("f.bin"));
 }
 
+/// A source whose mtime changed since the interrupted session is a
+/// different transfer: nothing of the old staging is reused.
 #[test]
-fn stale_state_is_ignored() {
+fn a_changed_source_mtime_starts_the_file_over() {
     let src = TempDir::new().unwrap();
-    let file = src.path().join("f.bin");
-    let content = noise(4 * CHUNK as usize, 8);
-    write(&file, &content);
+    let file = big_source(&src, 32);
+    let total_chunks = (32u64 << 20) / u64::from(CHUNK);
     let out = TempDir::new().unwrap();
-    fs::write(
-        out.path().join("f.bin.mjolnir-part"),
-        vec![0u8; content.len()],
-    )
-    .unwrap();
-    PartState {
-        size: content.len() as u64,
-        mtime: 12345,
-        chunk_size: CHUNK,
-        bitmap: vec![0x0F],
-    }
-    .save(&out.path().join("f.bin.mjolnir-state"))
-    .unwrap();
-
     let (rk, _) = keypair();
     let (sk, spub) = keypair();
     let rx = start_receiver(rk, vec![spub], out.path());
-    let report = Send::to(sk, rx.public).run(rx.addr, &[&file]).unwrap();
-    rx.join().unwrap();
-    assert_eq!(report.chunks_sent, 4);
-    assert_file_eq(&file, &out.path().join("f.bin"));
+    let mut send = Send::to(sk, rx.public);
+    send.connections = 2;
+    let progress = Arc::new(Progress::default());
+    cancel_when(progress.clone(), 4 << 20);
+    mjolnir::send(send.config(rx.addr, &[&file]), progress).unwrap_err();
+    rx.assert_waiting();
+    assert!(
+        stage_of(&file, out.path(), spub).join("0.part").exists(),
+        "the interrupted session left its part file"
+    );
+
+    fs::File::options()
+        .write(true)
+        .open(&file)
+        .unwrap()
+        .set_modified(SystemTime::now() + Duration::from_secs(3600))
+        .unwrap();
+    let report = send.run(rx.addr, &[&file]).unwrap();
+    let recv = rx.join().unwrap();
+    assert_eq!(report.chunks_sent, total_chunks, "nothing was resumed");
+    assert_eq!(recv.stale_chunks, 0);
+    assert_file_eq(&file, &out.path().join("big.bin"));
 }
 
 #[test]
@@ -474,6 +530,15 @@ fn cancel_when(progress: Arc<Progress>, bytes: u64) -> JoinHandle<Instant> {
     })
 }
 
+/// Overwrites one byte without changing the file's size or mtime, as an
+/// editor that restores the mtime would.
+fn edit_in_place(file: &Path, offset: u64, byte: u8) {
+    let f = fs::File::options().write(true).open(file).unwrap();
+    let mtime = f.metadata().unwrap().modified().unwrap();
+    mjolnir::posio::write_all_at(&f, &[byte], offset).unwrap();
+    f.set_modified(mtime).unwrap();
+}
+
 fn big_source(src: &TempDir, mib: usize) -> PathBuf {
     let file = src.path().join("big.bin");
     write(&file, &noise(mib << 20, 10));
@@ -508,7 +573,11 @@ fn sender_cancel_is_prompt_and_a_second_send_resumes() {
     assert_eq!(progress.phase(), Phase::Failed);
 
     rx.assert_waiting();
-    assert!(out.path().join("big.bin.mjolnir-part").exists());
+    assert!(
+        stage_of(&file, out.path(), send.key.public_key())
+            .join("0.part")
+            .exists()
+    );
 
     let report = send.run(rx.addr, &[&file]).unwrap();
     rx.join().unwrap();
@@ -938,12 +1007,17 @@ fn hash_check_reports_equal_file_hashes() {
     assert_ne!(report.file_hashes[0].1, report.file_hashes[1].1);
 }
 
+/// The resumed chunks are checked against the sender's fresh digests
+/// before round 0, so a source that changed behind its size and mtime is
+/// caught even without --hash.
 #[test]
-fn hash_check_repairs_a_source_changed_behind_size_and_mtime() {
+fn a_source_changed_behind_size_and_mtime_is_caught_at_resume() {
     let src = TempDir::new().unwrap();
     let file = resume_source(&src, 16, 18);
     let out = TempDir::new().unwrap();
-    seed_resume(&file, out.path(), |_| true, &[]);
+    let (rk, _) = keypair();
+    let (sk, spub) = keypair();
+    seed_resume(&file, out.path(), spub, |_| true, &[]);
 
     let mtime = fs::metadata(&file).unwrap().modified().unwrap();
     let mut changed = fs::read(&file).unwrap();
@@ -956,22 +1030,276 @@ fn hash_check_repairs_a_source_changed_behind_size_and_mtime() {
         .set_modified(mtime)
         .unwrap();
 
-    let (rk, _) = keypair();
-    let (sk, spub) = keypair();
     let rx = start_receiver(rk, vec![spub], out.path());
-    let mut send = Send::to(sk, rx.public);
-    send.hash = true;
+    let send = Send::to(sk, rx.public);
     let report = send.run(rx.addr, &[&file]).unwrap();
     let recv = rx.join().unwrap();
     assert_eq!(
         recv.repaired_chunks, 0,
         "the old bytes still match their digests"
     );
-    assert_eq!(recv.hash_repaired_chunks, 1);
-    assert_eq!(report.hash_repaired_chunks, 1);
+    assert_eq!(recv.stale_chunks, 1);
+    assert_eq!(recv.hash_repaired_chunks, 0);
     assert_eq!(report.chunks_sent, 1, "only the changed chunk travels");
+    assert_eq!(fs::read(out.path().join("big.bin")).unwrap(), changed);
+}
+
+/// --hash catches an edit made while the transfer runs, after the chunk
+/// went out, when size and mtime are kept.
+#[test]
+fn hash_check_repairs_a_source_changed_during_the_transfer() {
+    let src = TempDir::new().unwrap();
+    let file = big_source(&src, 32);
+    let out = TempDir::new().unwrap();
+    let (rk, _) = keypair();
+    let (sk, spub) = keypair();
+    let rx = start_receiver(rk, vec![spub], out.path());
+    let mut send = Send::to(sk, rx.public);
+    send.connections = 1;
+    send.hash = true;
+    let progress = Arc::new(Progress::default());
+    let editor = {
+        let (progress, file) = (progress.clone(), file.clone());
+        thread::spawn(move || {
+            while progress.bytes_done.load(Relaxed) < 8 << 20 {
+                thread::sleep(Duration::from_millis(1));
+            }
+            let mut changed = fs::read(&file).unwrap();
+            changed[3] ^= 0xFF;
+            edit_in_place(&file, 3, changed[3]);
+            changed
+        })
+    };
+    let report = mjolnir::send(send.config(rx.addr, &[&file]), progress).unwrap();
+    let changed = editor.join().unwrap();
+    let recv = rx.join().unwrap();
+    assert_eq!(recv.hash_repaired_chunks, 1, "{recv:?}");
+    assert_eq!(report.hash_repaired_chunks, 1);
     assert_eq!(report.file_hashes, recv.file_hashes);
     assert_eq!(fs::read(out.path().join("big.bin")).unwrap(), changed);
+}
+
+/// Bytes an earlier session received are re-checked against the source
+/// on resume: an edit that kept size and mtime is fetched again.
+#[test]
+fn resumed_chunks_are_checked_against_the_source() {
+    let src = TempDir::new().unwrap();
+    let file = big_source(&src, 32);
+    let out = TempDir::new().unwrap();
+    let (rk, _) = keypair();
+    let (sk, spub) = keypair();
+    let rx = start_receiver(rk, vec![spub], out.path());
+    let mut send = Send::to(sk, rx.public);
+    send.connections = 1;
+    let progress = Arc::new(Progress::default());
+    cancel_when(progress.clone(), 8 << 20);
+    mjolnir::send(send.config(rx.addr, &[&file]), progress).unwrap_err();
+    rx.assert_waiting();
+
+    let mut changed = fs::read(&file).unwrap();
+    changed[5] ^= 0xFF;
+    edit_in_place(&file, 5, changed[5]);
+    let report = send.run(rx.addr, &[&file]).unwrap();
+    let recv = rx.join().unwrap();
+    assert_eq!(recv.stale_chunks, 1, "{recv:?}");
+    assert!(report.chunks_sent < (32u64 << 20) / u64::from(CHUNK));
+    assert_eq!(fs::read(out.path().join("big.bin")).unwrap(), changed);
+}
+
+/// Two receivers cannot share one output directory: the second session
+/// fails at once instead of sharing staging files with the first.
+#[test]
+fn a_second_receiver_on_the_same_output_directory_is_refused() {
+    let src = TempDir::new().unwrap();
+    let file = src.path().join("f.bin");
+    write(&file, &noise(20_000, 30));
+    let out = TempDir::new().unwrap();
+    let (rk, rpub) = keypair();
+    let (sk, spub) = keypair();
+    let first = start_receiver(rk.clone(), vec![spub], out.path());
+    let held = FakeSender::open(first.addr, &sk, rpub, 4096 * 4);
+
+    let second = start_receiver(rk, vec![spub], out.path());
+    let err = Send::to(sk, second.public)
+        .run(second.addr, &[&file])
+        .unwrap_err();
+    assert!(
+        format!("{err:#}").contains("another receiver is using"),
+        "{err:#}"
+    );
+    second.assert_waiting();
+    drop(held);
+    for rx in [first, second] {
+        rx.progress.cancel();
+        assert!(rx.join().unwrap_err().is::<Cancelled>());
+    }
+}
+
+/// A failure between two files' renames leaves one published and one
+/// staged; the next session resumes without --force and re-sends nothing.
+#[test]
+fn an_interrupted_finalization_is_replayed_without_force() {
+    let src = TempDir::new().unwrap();
+    let data = src.path().join("data");
+    write(&data.join("a.bin"), &noise(3 * CHUNK as usize + 7, 31));
+    write(&data.join("b.bin"), &noise(2 * CHUNK as usize + 9, 32));
+    let out = TempDir::new().unwrap();
+    let (rk, _) = keypair();
+    let (sk, spub) = keypair();
+    let rx = start_receiver(rk, vec![spub], out.path());
+    testing::inject(out.path(), testing::Fault::FailAfterFirstPublish);
+    let err = Send::to(sk.clone(), rx.public)
+        .run(rx.addr, &[&data])
+        .unwrap_err();
+    assert!(format!("{err:#}").contains("injected failure"), "{err:#}");
+    rx.assert_waiting();
+    let published = ["data/a.bin", "data/b.bin"]
+        .iter()
+        .filter(|p| out.path().join(p).exists())
+        .count();
+    assert_eq!(published, 1, "one file renamed before the failure");
+    let leftovers = staging_leftovers(out.path());
+    assert!(
+        leftovers.iter().any(|n| n.ends_with(".part")),
+        "{leftovers:?}"
+    );
+
+    let report = Send::to(sk, rx.public).run(rx.addr, &[&data]).unwrap();
+    let recv = rx.join().unwrap();
+    assert_eq!(report.chunks_sent, 0, "every chunk was already held");
+    assert_eq!(recv.files, 2);
+    assert!(recv.verified);
+    assert_eq!(tree(&out.path().join("data")), tree(&data));
+    assert_eq!(staging_leftovers(out.path()), vec!["lock".to_string()]);
+}
+
+/// When Finished never reaches the sender, the journal stays, and the
+/// sender's retry completes without --force and without re-sending.
+#[test]
+fn a_lost_finished_is_replayed_without_force() {
+    let src = TempDir::new().unwrap();
+    let file = src.path().join("f.bin");
+    write(&file, &noise(5 * CHUNK as usize + 1, 33));
+    let out = TempDir::new().unwrap();
+    let (rk, _) = keypair();
+    let (sk, spub) = keypair();
+    let rx = start_receiver(rk.clone(), vec![spub], out.path());
+    testing::inject(out.path(), testing::Fault::LoseFinished);
+    Send::to(sk.clone(), rx.public)
+        .run(rx.addr, &[&file])
+        .unwrap();
+    rx.join().unwrap();
+    assert_file_eq(&file, &out.path().join("f.bin"));
+    let leftovers = staging_leftovers(out.path());
+    assert!(
+        leftovers.iter().any(|n| n.ends_with("0.sums")),
+        "{leftovers:?}"
+    );
+
+    let rx = start_receiver(rk, vec![spub], out.path());
+    let report = Send::to(sk, rx.public).run(rx.addr, &[&file]).unwrap();
+    let recv = rx.join().unwrap();
+    assert_eq!(report.chunks_sent, 0);
+    assert!(recv.verified);
+    assert_file_eq(&file, &out.path().join("f.bin"));
+    assert_eq!(staging_leftovers(out.path()), vec!["lock".to_string()]);
+}
+
+/// A file that appears at the destination while the transfer runs is not
+/// overwritten without --force: publication fails and the file stays.
+#[test]
+fn publishing_never_replaces_a_file_created_during_the_transfer() {
+    let src = TempDir::new().unwrap();
+    let file = big_source(&src, 32);
+    let out = TempDir::new().unwrap();
+    let (rk, _) = keypair();
+    let (sk, spub) = keypair();
+    let rx = start_receiver(rk, vec![spub], out.path());
+    let progress = Arc::new(Progress::default());
+    let intruder = {
+        let (progress, target) = (progress.clone(), out.path().join("big.bin"));
+        thread::spawn(move || {
+            while progress.bytes_done.load(Relaxed) == 0 {
+                thread::sleep(Duration::from_millis(1));
+            }
+            fs::write(&target, b"intruder").unwrap();
+        })
+    };
+    let err =
+        mjolnir::send(Send::to(sk, rx.public).config(rx.addr, &[&file]), progress).unwrap_err();
+    intruder.join().unwrap();
+    assert!(format!("{err:#}").contains("renaming into"), "{err:#}");
+    assert_eq!(fs::read(out.path().join("big.bin")).unwrap(), b"intruder");
+    rx.assert_waiting();
+    rx.progress.cancel();
+    assert!(rx.join().unwrap_err().is::<Cancelled>());
+}
+
+/// Staging lives under short internal names, so a name near the
+/// component limit gets no suffix appended.
+#[test]
+fn names_near_the_component_limit_transfer() {
+    let src = TempDir::new().unwrap();
+    let name = "n".repeat(250);
+    let file = src.path().join(&name);
+    write(&file, &noise(CHUNK as usize + 5, 34));
+    let out = TempDir::new().unwrap();
+    let (rk, _) = keypair();
+    let (sk, spub) = keypair();
+    let rx = start_receiver(rk, vec![spub], out.path());
+    Send::to(sk, rx.public).run(rx.addr, &[&file]).unwrap();
+    rx.join().unwrap();
+    assert_file_eq(&file, &out.path().join(&name));
+}
+
+/// More files than the handle cache keeps open, on both sides.
+#[test]
+fn a_tree_of_six_hundred_files_transfers() {
+    let src = TempDir::new().unwrap();
+    let data = src.path().join("many");
+    for i in 0..600 {
+        write(
+            &data.join(format!("d{}/f{i}.bin", i % 7)),
+            &noise(100 + i, i as u64),
+        );
+    }
+    let out = TempDir::new().unwrap();
+    let (rk, _) = keypair();
+    let (sk, spub) = keypair();
+    let rx = start_receiver(rk, vec![spub], out.path());
+    let report = Send::to(sk, rx.public).run(rx.addr, &[&data]).unwrap();
+    let recv = rx.join().unwrap();
+    assert_eq!(report.files, 600);
+    assert!(recv.verified);
+    assert_eq!(tree(&out.path().join("many")), tree(&data));
+}
+
+#[cfg(unix)]
+#[test]
+fn staging_is_private_and_published_files_get_their_mode() {
+    use std::os::unix::fs::PermissionsExt;
+    let src = TempDir::new().unwrap();
+    let file = big_source(&src, 32);
+    fs::set_permissions(&file, fs::Permissions::from_mode(0o640)).unwrap();
+    let out = TempDir::new().unwrap();
+    let (rk, _) = keypair();
+    let (sk, spub) = keypair();
+    let rx = start_receiver(rk, vec![spub], out.path());
+    let send = Send::to(sk, rx.public);
+    let progress = Arc::new(Progress::default());
+    cancel_when(progress.clone(), 4 << 20);
+    mjolnir::send(send.config(rx.addr, &[&file]), progress).unwrap_err();
+    rx.assert_waiting();
+    let mode = |p: &Path| fs::metadata(p).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode(&out.path().join(STAGING_DIR)), 0o700);
+    let stage = stage_of(&file, out.path(), spub);
+    assert_eq!(mode(&stage), 0o700);
+    assert_eq!(mode(&stage.join("0.part")), 0o600);
+    assert_eq!(mode(&stage.join("0.sums")), 0o600);
+
+    send.run(rx.addr, &[&file]).unwrap();
+    rx.join().unwrap();
+    assert_eq!(mode(&out.path().join("big.bin")), 0o640);
 }
 
 /// `a:b.` as the local file system can hold it: literally on Unix, with the

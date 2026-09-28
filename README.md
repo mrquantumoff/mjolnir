@@ -90,7 +90,7 @@ key.
 | `--allow KEY` | | allow one sender key; repeatable |
 | `--listen ADDR` | `0.0.0.0:7777` | address to listen on |
 | `--out DIR` | `.` | where files land |
-| `--force` | off | overwrite existing files |
+| `--force` | off | overwrite existing files; without it a file that appears at the destination during the transfer fails the transfer instead of being replaced |
 | `--no-verify` | off | skip reading every chunk back before finishing |
 | `--threads N` | `0` (one per core) | workers that decrypt, write, and verify chunks |
 | `--allow-owner` | off | apply file owners from the sender (only as root, on Unix) |
@@ -133,14 +133,17 @@ read and seals it with a key unique to its connection, and the connection
 writes the sealed frames in order. On the receiver a connection's reader
 hands each frame to the same kind of pool. A worker opens the chunk, claims
 it so a duplicate is never written twice, writes it with a positional write
-into
-`<name>.mjolnir-part`, stores a 16-byte BLAKE3 digest of it in
-`<name>.mjolnir-sums`, and marks it present. Every two seconds it syncs the
-part and sums files and saves the bitmap, so a crash or a cancel loses at
-most a few seconds of work. When every chunk is present it reads each one
-back from disk and checks it against its digest. A chunk that fails,
-including one carried over from an earlier session, goes back to missing,
-and the next round fetches only that chunk. With `send --hash`, the sender
+into a part file under `<out>/.mjolnir-staging/` (a directory only the
+receiving user can read), stores a 16-byte BLAKE3 digest of it next to the
+part, and marks it present. Every two seconds it syncs the part and sums
+files and saves the bitmap, so a crash or a cancel loses at most a few
+seconds of work. A resumed transfer first has the sender re-read the chunks
+the receiver already holds and drops any whose digest changed, so stale
+bytes from an earlier attempt are never kept. When every chunk is present
+the receiver reads each one back from disk and checks it against its
+digest. A chunk that fails, including one carried over from an earlier
+session, goes back to missing, and the next round fetches only that
+chunk. With `send --hash`, the sender
 then re-reads its files and the receiver compares those digests too, which
 catches a source that changed without its size or mtime changing. Last, the
 receiver renames the part files into place and applies the sender's file
@@ -184,7 +187,15 @@ not receive into a directory that other users can write to.
   directly.
 - One transfer per `recv` process. The receiver keeps listening through
   failed handshakes and failed sessions and exits after one transfer
-  completes.
+  completes. One session at a time may receive into an output directory;
+  a second receiver pointed at the same `--out` refuses its session.
+- The receiver keeps `<out>/.mjolnir-staging/` with a lock file, and
+  under it one directory per interrupted transfer (keyed by sender key,
+  chunk size, and the files' paths, sizes, and mtimes). Re-running the
+  same send resumes from it; a transfer that was never retried stays
+  there until you delete it. A transfer interrupted while its files were
+  being renamed into place, or whose final `Finished` was lost, resumes
+  without `--force`.
 - Only regular files and directories are sent. Symbolic links and special
   files are skipped with a warning. File names travel as raw bytes, so a
   name that the receiver's file system cannot store (a `:` or a trailing

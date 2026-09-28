@@ -121,6 +121,7 @@ impl From<SendReport> for Report {
             chunks_resent: r.chunks_resent,
             repaired_chunks: 0,
             hash_repaired_chunks: r.hash_repaired_chunks,
+            stale_chunks: 0,
             duplicate_chunks: 0,
             file_hashes: file_hashes(r.file_hashes),
             warnings: r.warnings,
@@ -141,6 +142,7 @@ impl From<RecvReport> for Report {
             chunks_resent: 0,
             repaired_chunks: r.repaired_chunks,
             hash_repaired_chunks: r.hash_repaired_chunks,
+            stale_chunks: r.stale_chunks,
             duplicate_chunks: r.duplicate_chunks,
             file_hashes: file_hashes(r.file_hashes),
             warnings: r.warnings,
@@ -372,6 +374,19 @@ fn start_receive(app: &App, req: ReceiveRequest) -> Result<Reply, ApiError> {
     let out_dir = PathBuf::from(req.out_dir.trim());
     if req.out_dir.trim().is_empty() || !out_dir.is_dir() {
         return Err(ApiError::field("out_dir", "choose an existing folder"));
+    }
+    // Two receivers whose output folders overlap, one inside the other
+    // included, could publish into each other's tree.
+    let wanted = out_dir.canonicalize().unwrap_or_else(|_| out_dir.clone());
+    for (id, running) in app.jobs.running_receivers() {
+        let running = running.canonicalize().unwrap_or(running);
+        if wanted.starts_with(&running) || running.starts_with(&wanted) {
+            return Err(ApiError::new(
+                409,
+                Some("out_dir"),
+                format!("overlaps the output folder of running transfer {id}"),
+            ));
+        }
     }
     let threads = check_threads(req.threads)?;
 

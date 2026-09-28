@@ -1,6 +1,7 @@
 //! The sender: walk the inputs, authenticate, and stream missing chunks over
 //! parallel data connections, round by round.
 
+use std::collections::HashMap;
 use std::fs::{self, File};
 use std::io::{Read, Write};
 use std::net::{Shutdown, SocketAddr};
@@ -97,7 +98,7 @@ struct Ctx<'a> {
     keys: &'a SessionKeys,
     cipher: Cipher,
     manifest: &'a Manifest,
-    files: &'a [File],
+    files: &'a Sources,
     /// Every file's bytes, when `MJOLNIR_BENCH=memory-source`.
     memory: &'a [Vec<u8>],
     paths: &'a [PathBuf],
@@ -113,6 +114,68 @@ struct Ctx<'a> {
     buffers: &'a Buffers,
     in_flight: InFlight,
     hashing: HashRun,
+}
+
+/// Open source files kept at once; a larger tree reopens files as the
+/// schedule moves through them, so descriptors are never exhausted.
+const MAX_OPEN_SOURCES: usize = 256;
+
+/// The source files, opened on demand and closed least recently used
+/// first. A reopened file must still have the size and mtime it was
+/// offered with.
+struct Sources {
+    paths: Vec<PathBuf>,
+    entries: Vec<FileEntry>,
+    state: Mutex<SourceState>,
+}
+
+struct SourceState {
+    open: HashMap<u32, (Arc<File>, u64)>,
+    tick: u64,
+}
+
+impl Sources {
+    fn new(paths: Vec<PathBuf>, entries: Vec<FileEntry>) -> Self {
+        Sources {
+            paths,
+            entries,
+            state: Mutex::new(SourceState {
+                open: HashMap::new(),
+                tick: 0,
+            }),
+        }
+    }
+
+    fn get(&self, file: u32) -> Result<Arc<File>> {
+        let mut s = self.state.lock().unwrap();
+        s.tick += 1;
+        let tick = s.tick;
+        if let Some((f, used)) = s.open.get_mut(&file) {
+            *used = tick;
+            return Ok(f.clone());
+        }
+        let path = &self.paths[file as usize];
+        let f = File::open(path).with_context(|| format!("opening {}", path.display()))?;
+        let meta = f.metadata()?;
+        let entry = &self.entries[file as usize];
+        ensure!(
+            meta.len() == entry.size && mtime_of(&meta) == entry.mtime,
+            "source file changed during transfer: {}",
+            path.display()
+        );
+        let f = Arc::new(f);
+        if s.open.len() >= MAX_OPEN_SOURCES
+            && let Some(&oldest) = s
+                .open
+                .iter()
+                .min_by_key(|(_, (_, used))| *used)
+                .map(|(k, _)| k)
+        {
+            s.open.remove(&oldest);
+        }
+        s.open.insert(file, (f.clone(), tick));
+        Ok(f)
+    }
 }
 
 /// Work for the pool.
@@ -184,11 +247,6 @@ fn run(cfg: &SendConfig, progress: &Progress) -> Result<SendReport> {
     );
     let chunk_size = ChunkSize::new(cfg.chunk_size)?;
     let captured = filemap::capture(&cfg.paths, cfg.preserve)?;
-    let files = captured
-        .files
-        .iter()
-        .map(|f| File::open(&f.source).with_context(|| format!("opening {}", f.source.display())))
-        .collect::<Result<Vec<_>>>()?;
     let paths: Vec<PathBuf> = captured.files.iter().map(|f| f.source.clone()).collect();
     let memory: Vec<Vec<u8>> = if crate::benchmode::get().memory_source {
         paths.iter().map(fs::read).collect::<std::io::Result<_>>()?
@@ -212,6 +270,7 @@ fn run(cfg: &SendConfig, progress: &Progress) -> Result<SendReport> {
         .map(|e| e.path.clone())
         .collect();
     let manifest = Manifest::new(chunk_size, entries, dirs)?;
+    let files = Sources::new(paths.clone(), manifest.files.clone());
     let skipped: Vec<String> = captured
         .skipped
         .iter()
@@ -354,6 +413,14 @@ fn transfer(ctx: &Ctx, cfg: &SendConfig, map: &FileMap, tx: &mut Tx, rx: &mut Rx
         Msg::Have { bitmaps } => parse_have(m, &bitmaps)?,
         other => return Err(unexpected(other, "Have")),
     };
+    if have.iter().any(|b| b.count_ones() > 0) {
+        send_resume_digests(ctx, tx, &have)?;
+        tx.send(&Msg::Resume)?;
+        have = match rx.recv()? {
+            Msg::Have { bitmaps } => parse_have(m, &bitmaps)?,
+            other => return Err(unexpected(other, "Have")),
+        };
+    }
     let queue = missing(&have);
     let bytes: u64 = queue.iter().map(|&c| u64::from(m.chunk_len(c))).sum();
     ctx.progress.set_totals(queue.len() as u64, bytes);
@@ -401,6 +468,8 @@ fn transfer(ctx: &Ctx, cfg: &SendConfig, map: &FileMap, tx: &mut Tx, rx: &mut Rx
                 hashed,
                 warnings,
             } => {
+                // Best effort: the receiver keeps its journal without it.
+                let _ = tx.send(&Msg::Ack);
                 return Ok(Done {
                     rounds: round + 1,
                     verified,
@@ -599,28 +668,13 @@ fn send_digests(ctx: &Ctx, tx: &mut Tx) -> Result<Vec<(String, String)>> {
     let total_chunks = (0..m.files.len() as u32).map(|j| m.chunk_count(j)).sum();
     ctx.progress
         .set_totals(total_chunks, m.files.iter().map(|f| f.size).sum());
-    let run = &ctx.hashing;
     let mut hashes = Vec::with_capacity(m.files.len());
     for (j, f) in m.files.iter().enumerate() {
         let count = chunk_count(f.size, m.chunk_size);
         let mut hasher = FileHasher::new(m.chunk_size.get());
         for first in (0..count).step_by(DIGESTS_PER_MSG) {
             let n = (count - first).min(DIGESTS_PER_MSG as u64);
-            *run.window.lock().unwrap() = (j as u32, first, n);
-            *run.out.lock().unwrap() = vec![0u8; n as usize * DIGEST_LEN];
-            run.cursor.store(0, Relaxed);
-            for _ in 0..ctx.pool.threads() {
-                ctx.in_flight.add();
-                ctx.pool.submit(SendJob::Hash);
-            }
-            ctx.in_flight.wait_idle();
-            if ctx.progress.is_cancelled() {
-                return Err(Cancelled::Local.into());
-            }
-            if let Some(e) = run.error.lock().unwrap().take() {
-                return Err(e);
-            }
-            let digests = std::mem::take(&mut *run.out.lock().unwrap());
+            let digests = hash_window(ctx, j as u32, first, n)?;
             hasher.update(&digests);
             tx.send(&Msg::Digests {
                 file: j as u32,
@@ -634,6 +688,80 @@ fn send_digests(ctx: &Ctx, tx: &mut Tx) -> Result<Vec<(String, String)>> {
     Ok(hashes)
 }
 
+/// Before round 0 of a resume: re-reads every chunk the receiver holds
+/// and sends its digest, so the receiver can drop chunks that no longer
+/// match the source, whatever left them there.
+fn send_resume_digests(ctx: &Ctx, tx: &mut Tx, have: &[AtomicBitset]) -> Result<()> {
+    let m = ctx.manifest;
+    ctx.progress.set_phase(Phase::Hashing);
+    ctx.progress.reset_counts();
+    let held: Vec<(u32, u64, u64)> = have
+        .iter()
+        .enumerate()
+        .flat_map(|(j, bits)| present_runs(bits).map(move |(first, n)| (j as u32, first, n)))
+        .collect();
+    let chunks: u64 = held.iter().map(|&(_, _, n)| n).sum();
+    let bytes: u64 = held
+        .iter()
+        .map(|&(j, first, n)| {
+            (first..first + n)
+                .map(|k| u64::from(m.chunk_len(ChunkId { file: j, index: k })))
+                .sum::<u64>()
+        })
+        .sum();
+    ctx.progress.set_totals(chunks, bytes);
+    for (file, first, n) in held {
+        for start in (first..first + n).step_by(DIGESTS_PER_MSG) {
+            let len = (first + n - start).min(DIGESTS_PER_MSG as u64);
+            let digests = hash_window(ctx, file, start, len)?;
+            tx.send(&Msg::Digests {
+                file,
+                first: start,
+                digests,
+            })?;
+        }
+    }
+    Ok(())
+}
+
+/// Maximal runs of set bits as `(first, count)`.
+fn present_runs(bits: &AtomicBitset) -> impl Iterator<Item = (u64, u64)> + '_ {
+    let mut k = 0;
+    std::iter::from_fn(move || {
+        while k < bits.len() && !bits.get(k) {
+            k += 1;
+        }
+        if k >= bits.len() {
+            return None;
+        }
+        let first = k;
+        while k < bits.len() && bits.get(k) {
+            k += 1;
+        }
+        Some((first, k - first))
+    })
+}
+
+/// Digests chunks `first..first + n` of `file` on the pool.
+fn hash_window(ctx: &Ctx, file: u32, first: u64, n: u64) -> Result<Vec<u8>> {
+    let run = &ctx.hashing;
+    *run.window.lock().unwrap() = (file, first, n);
+    *run.out.lock().unwrap() = vec![0u8; n as usize * DIGEST_LEN];
+    run.cursor.store(0, Relaxed);
+    for _ in 0..ctx.pool.threads() {
+        ctx.in_flight.add();
+        ctx.pool.submit(SendJob::Hash);
+    }
+    ctx.in_flight.wait_idle();
+    if ctx.progress.is_cancelled() {
+        return Err(Cancelled::Local.into());
+    }
+    if let Some(e) = run.error.lock().unwrap().take() {
+        return Err(e);
+    }
+    Ok(std::mem::take(&mut *run.out.lock().unwrap()))
+}
+
 /// One pool worker's share of a `HashRun` window.
 fn hash_some(ctx: &Ctx) {
     let run = &ctx.hashing;
@@ -641,13 +769,20 @@ fn hash_some(ctx: &Ctx) {
     let entry = &ctx.manifest.files[file as usize];
     let mut buf = vec![0u8; ctx.manifest.chunk_size.get() as usize];
     let mut done = Vec::new();
+    let source = match ctx.files.get(file) {
+        Ok(f) => f,
+        Err(e) => {
+            *run.error.lock().unwrap() = Some(e);
+            return;
+        }
+    };
     while let i = run.cursor.fetch_add(1, Relaxed)
         && i < n
         && !ctx.progress.is_cancelled()
     {
         let (offset, len) = chunk_span(entry.size, ctx.manifest.chunk_size, first + i);
         let data = &mut buf[..len as usize];
-        if let Err(e) = read_exact_at(&ctx.files[file as usize], data, offset) {
+        if let Err(e) = read_exact_at(&source, data, offset) {
             let e = anyhow!(e).context(format!("re-reading {}", entry.path.display()));
             *run.error.lock().unwrap() = Some(e);
             return;
@@ -679,12 +814,15 @@ fn seal(ctx: &Ctx, job: SealJob) {
             plain.copy_from_slice(&bytes[offset as usize..][..len as usize]);
             Ok(())
         }
-        None => read_exact_at(&ctx.files[chunk.file as usize], plain, offset),
+        None => ctx
+            .files
+            .get(chunk.file)
+            .and_then(|f| Ok(read_exact_at(&f, plain, offset)?)),
     };
     let sealed = read
         .map_err(|e| {
             let path = ctx.manifest.files[chunk.file as usize].path.display();
-            let e = anyhow!(e).context(format!("reading {path} at offset {offset}"));
+            let e = e.context(format!("reading {path} at offset {offset}"));
             *ctx.fatal.lock().unwrap() = Some(anyhow!("{e:#}"));
             e
         })

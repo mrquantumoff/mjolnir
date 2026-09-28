@@ -166,11 +166,12 @@ fn run(cmd: Cmd) -> Result<()> {
                 report.elapsed,
                 report.phase_times,
                 &format!(
-                    "{} files, {} chunks, {} duplicates, {} repaired, {}, {} rounds, from {}",
+                    "{} files, {} chunks, {} duplicates, {} repaired, {} stale, {}, {} rounds, from {}",
                     report.files,
                     report.chunks_received,
                     report.duplicate_chunks,
                     report.repaired_chunks,
+                    report.stale_chunks,
                     if report.verified {
                         "verified"
                     } else {

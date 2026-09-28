@@ -42,7 +42,9 @@ reported on the form. Its card shows the bound
 address with a Copy button, to paste into the sender's form. Each receiver
 takes one complete transfer, then finishes; a sender that fails the
 handshake or drops mid-session does not end it, and it goes back to waiting.
-Several receivers can wait on different ports at once.
+Several receivers can wait on different ports at once, each with its own
+output folder; a folder that is, contains, or is inside a running
+receiver's folder is refused.
 
 **Send files.** Enter the receiver's address and public key, add files and
 folders with the file browser, and optionally tune the number of connections
@@ -142,7 +144,7 @@ have the shape `{ "error": "message", "field": "name" | null }`, where
 | 403 | Bad `Host`, bad `Origin`, or a non-JSON write |
 | 404 | No such transfer or endpoint |
 | 405 | Wrong method for the endpoint |
-| 409 | Removing a transfer that is still running |
+| 409 | Removing a transfer that is still running, or a receiver whose `out_dir` overlaps a running receiver's |
 | 413 | Body over 1 MiB |
 | 431 | Request head over 16 KiB |
 
@@ -197,7 +199,7 @@ have the shape `{ "error": "message", "field": "name" | null }`, where
   {
     "files": 9, "bytes": 9170000000, "elapsed_ms": 10400,
     "verified": true, "hashed": true,
-    "chunks_resent": 0, "repaired_chunks": 0, "hash_repaired_chunks": 0, "duplicate_chunks": 0,
+    "chunks_resent": 0, "repaired_chunks": 0, "hash_repaired_chunks": 0, "stale_chunks": 0, "duplicate_chunks": 0,
     "file_hashes": [{ "path": "dataset/model.ckpt", "hash": "295b43bf..." }],
     "warnings": [], "skipped": [],
     "phase_times": { "connect_ms": 21.4, "transfer_ms": 9800.0, "verify_ms": 1100.0, "hash_ms": 1400.0, "finalize_ms": 30.2 }
@@ -258,7 +260,9 @@ path must exist. Returns the new Transfer.
 
 `listen` is an `ip:port`; port 0 picks a free one. `force`, `verify`,
 `threads`, and `apply` are optional with the defaults shown. At least one authorized
-key is required, and `out_dir` must be an existing folder. The listener binds
+key is required, and `out_dir` must be an existing folder that neither
+is, contains, nor lies inside the output folder of a receiver still
+running (409 on `out_dir` otherwise). The listener binds
 before the response is sent, so a busy port is a 400 on `listen`, and the
 returned Transfer carries `bound_addr`.
 

@@ -1,6 +1,6 @@
 //! Per-file chunk presence: a lock-free bitset and its on-disk checkpoint.
 
-use std::fs::{self, File};
+use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -93,15 +93,19 @@ impl PartState {
         postcard::from_bytes(&bytes).with_context(|| format!("parsing {}", path.display()))
     }
 
-    /// Atomically replaces `path`: write a temp file, sync it, rename over.
+    /// Atomically and durably replaces `path`: write an owner-only temp
+    /// file, sync it, rename over, sync the directory.
     pub fn save(&self, path: &Path) -> Result<()> {
         let tmp = tmp_path(path);
         let bytes = postcard::to_allocvec(self)?;
-        let mut file = File::create(&tmp).with_context(|| format!("creating {}", tmp.display()))?;
+        let mut file = crate::fsops::open_private(&tmp, true)
+            .with_context(|| format!("creating {}", tmp.display()))?;
+        file.set_len(0)?;
         file.write_all(&bytes)?;
         file.sync_data()?;
         drop(file);
-        fs::rename(&tmp, path).with_context(|| format!("replacing {}", path.display()))
+        crate::fsops::rename_durable(&tmp, path, true)
+            .with_context(|| format!("replacing {}", path.display()))
     }
 }
 

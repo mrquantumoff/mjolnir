@@ -146,6 +146,8 @@ starting at 0):
 | `Cancel`                             | both      | the user cancelled; handled like `Error`, reported as a cancel |
 | `Verifying`                          | R to S    | the receiver starts reading chunks back; for progress display only |
 | `Confirm`                            | S to R    | the first message after the handshake; empty, sealed, so it proves the sender is live |
+| `Resume`                             | S to R    | the sender's fresh `Digests` for every chunk `Have` reported present are complete; the receiver answers with a corrected `Have` |
+| `Ack`                                | S to R    | the sender received `Finished`; the receiver may drop its journal |
 
 Field encodings: `chunk_size` is a `u32`; `cipher` is an enum
 (`Aes256Gcm` = 0, `ChaCha20Poly1305` = 1); each file is
@@ -215,6 +217,13 @@ or `ChaCha20Poly1305`.
 S -> R : Confirm              (17 sealed bytes; proves the sender is live)
 S -> R : Offer
 R -> S : Have                 (resume state; all zero on a fresh transfer)
+if Have reports any chunk present:
+    S re-reads those chunks and computes their digests
+    S -> R : Digests { file, first, digests }   (repeated, present runs only)
+    S -> R : Resume
+    R drops every chunk whose stored digest differs (see "Receiver
+      storage and resume")
+    R -> S : Have             (corrected)
 loop round = 0, 1, ...:
     S -> R : RoundStart { round }
     S opens up to N data connections, sends every chunk missing from Have
@@ -239,7 +248,8 @@ loop round = 0, 1, ...:
             R -> S : Have     (repair round; loop continues)
         APPLY:
         R renames files into place and applies the file map
-        R -> S : Finished { verified, hashed, warnings }   (done)
+        R -> S : Finished { verified, hashed, warnings }
+        S -> R : Ack          (best effort; lets R drop its journal)
     else:
         R -> S : Have         (sender sends what is still missing)
 ```
@@ -639,25 +649,81 @@ is not proof that the media holds the bytes; that is the filesystem's job.
 
 ## Receiver storage and resume
 
-For a target `out/<path>` the receiver writes `out/<path>.mjolnir-part`,
-keeps chunk digests in `out/<path>.mjolnir-sums`, and keeps state in
-`out/<path>.mjolnir-state`. The state holds
-`{ size, mtime, chunk_size, bitmap }`.
+The receiver stages everything under `out/.mjolnir-staging/`, a directory
+it creates readable by its owner only (mode `0700` on Unix, a DACL naming
+only the current user and SYSTEM on Windows). That directory holds a
+`lock` file on which each session takes an exclusive lock (`flock` or
+`LockFileEx`), so only one session at a time receives into an output
+directory; a second receiver fails its session with "another receiver is
+using" and keeps waiting. The lock file stays after the transfer.
+
+Each transfer has an **identity**: `BLAKE3("mjolnir transfer v2" |
+sender public key | chunk_size | postcard(files))`, over the offered
+files' paths, sizes, and mtimes. Its staging directory is
+`out/.mjolnir-staging/<first 16 bytes of the identity, hex>/`, and file
+`j` of the offer lives there as `j.part` (the bytes), `j.sums` (16-byte
+digests, at `index * 16`), and `j.state` (`{ size, mtime, chunk_size,
+bitmap }`). Staging files are created readable by their owner only
+(`0600`), so no other user can read plaintext while it is staged or after
+a cancel, and the short internal names keep a target name of any legal
+length from growing past the file system's component limit. A transfer
+from another sender, or of a source whose size or mtime changed, has a
+different identity and shares nothing with an earlier attempt.
 
 Every 2 seconds, at the end of each round, and when a session ends early,
 the receiver checkpoints each file in this order: snapshot the `present`
-bitmap, `sync_data` the part file and the sums file, then atomically replace
-the state file with the snapshot. A crash therefore loses
-at most the chunks received since the last checkpoint, and never marks a chunk
-present whose bytes are not on disk.
+bitmap, `sync_data` the part file and the sums file, write the snapshot to
+`j.state.tmp`, sync it, rename it over `j.state`, and sync the directory.
+A crash therefore loses at most the chunks received since the last
+checkpoint, and never marks a chunk present whose bytes are not on disk.
 
-On a new session, if the part, sums, and state files all exist and the
-state's `size`, `mtime`, and `chunk_size` match the offer, the receiver
-reports that bitmap in `Have`. Otherwise it starts the file from scratch.
+On a new session under the same identity, a file whose part, sums, and
+state files exist resumes from its bitmap. Chunks reported present in
+`Have` are then checked against the source before round 0: the sender
+re-reads them and sends their digests, then `Resume`, and the receiver
+makes every chunk whose stored digest differs missing again and answers
+with the corrected `Have`. So an earlier session's bytes are trusted only
+if they still match what the sender would send now, whatever left them
+there; these count in the receiver's `stale_chunks`. The read-back
+verification alone proves the disk matches the receiver's own digests,
+not that those digests came from this source, which is why this check
+exists.
 
-After the final round and verification, the receiver renames each part file
-to its target and deletes the sums and state files. An existing target is an error
-unless the receiver was started with `--force`.
+The receiver holds at most 256 part and sums handle pairs open at once
+and reopens the rest as it works, so a tree of any number of files fits
+in an ordinary descriptor limit; the sender keeps its source files open
+the same way and re-checks size and mtime whenever it reopens one.
+
+**Publication.** After the final round and verification, the receiver
+publishes each file: it syncs the part file, sets its final mode while it
+is still private (the file map's mode under the special-bit policy, or
+what `creat` would give under the umask; on Windows the read-only bit is
+applied afterwards through the file map), renames it to its target, and
+syncs the target's directory (on Windows `MoveFileEx` with
+`MOVEFILE_WRITE_THROUGH`). Without `--force` the rename refuses to replace
+an existing target atomically (`RENAME_NOREPLACE`, `RENAME_EXCL`, or
+`MoveFileEx` without `MOVEFILE_REPLACE_EXISTING`), so a file created at
+the destination while the transfer ran fails the session instead of being
+overwritten; the existence check at session start is only an early
+error. `Finished` goes out only after every rename and directory sync has
+returned.
+
+**The journal.** The staging directory is the finalization journal. A
+file's commit is its one rename, so a crash during publication leaves
+every file either staged (its `j.part` exists) or published (its `j.part`
+is gone while `j.sums` remains). A later session under the same identity
+treats a published file whose target exists with the offered size as
+held, keeps verifying it against `j.sums` (reading the published file
+back), and repairs it in place if a chunk fails; it re-sends nothing that
+is already right and needs no `--force`. When `Finished` is answered with
+`Ack`, the receiver renames the staging directory to `<identity>.done`
+and removes it, directory syncs included. Without an `Ack` within 5
+seconds (the sender never saw `Finished`), it keeps the journal, and the
+sender's retry replays the same way. A `<identity>.done` directory found
+at startup is a cleanup that was interrupted after `Ack`; its files are
+all published, and a missing `j.sums` is regenerated from the published
+file. Journals of transfers that were never retried stay under
+`.mjolnir-staging/` until the user removes them.
 
 ## What the protocol guarantees
 

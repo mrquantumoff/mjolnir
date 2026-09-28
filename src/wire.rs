@@ -86,6 +86,11 @@ pub enum Msg {
     /// The sender's first message, before `Offer`: it carries nothing, but
     /// sealing it proves the sender is live and holds the session key.
     Confirm,
+    /// After the sender's fresh `Digests` for every chunk the receiver's
+    /// `Have` reported present: the receiver answers with a corrected `Have`.
+    Resume,
+    /// The sender got `Finished`; the receiver may drop its journal.
+    Ack,
 }
 
 pub const MAX_CONTROL_LEN: usize = 64 << 20;
@@ -159,6 +164,10 @@ impl<R: Read> ControlRx<R> {
     /// The underlying reader; bytes already buffered are dropped.
     pub fn into_inner(self) -> R {
         self.reader.into_inner()
+    }
+
+    pub fn inner_mut(&mut self) -> &mut R {
+        self.reader.get_mut()
     }
 
     /// Splits off the reader and the receive state, to continue the same
@@ -511,6 +520,8 @@ mod tests {
         assert_eq!(tag(&Msg::Cancel), 9);
         assert_eq!(tag(&Msg::Verifying), 10);
         assert_eq!(tag(&Msg::Confirm), 11);
+        assert_eq!(tag(&Msg::Resume), 12);
+        assert_eq!(tag(&Msg::Ack), 13);
     }
 
     #[test]

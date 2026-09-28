@@ -334,13 +334,14 @@ fn receiver_apply_policy_defaults_off_and_is_echoed() {
         transfer(&ui, id)["spec"]["apply"],
         json!({ "allow_special_bits": false, "allow_owner": false })
     );
+    let other = tempfile::tempdir().unwrap();
     let r = post(
         &ui,
         "/api/receive",
         json!({
             "listen": "127.0.0.1:0",
             "authorized": [ui.public_key],
-            "out_dir": out.path(),
+            "out_dir": other.path(),
             "apply": { "allow_special_bits": true, "allow_owner": false },
         }),
     );
@@ -349,6 +350,42 @@ fn receiver_apply_policy_defaults_off_and_is_echoed() {
     for id in [id, r.body["id"].as_u64().unwrap()] {
         post(&ui, &format!("/api/transfers/{id}/cancel"), json!({}));
     }
+}
+
+/// Two running receivers may not share, nest, or alias an output folder.
+#[test]
+fn overlapping_receiver_output_folders_are_409() {
+    let ui = start();
+    let out = tempfile::tempdir().unwrap();
+    let nested = out.path().join("inner");
+    std::fs::create_dir(&nested).unwrap();
+    let sibling = tempfile::tempdir().unwrap();
+    let (id, _) = start_receiver(&ui, &nested);
+    let attempt = |dir: &Path| {
+        post(
+            &ui,
+            "/api/receive",
+            json!({ "listen": "127.0.0.1:0", "authorized": [ui.public_key], "out_dir": dir }),
+        )
+    };
+    for dir in [nested.as_path(), out.path()] {
+        let r = attempt(dir);
+        assert_eq!(r.status, 409, "{}", r.body);
+        assert_eq!(r.body["field"], "out_dir");
+    }
+    let ok = attempt(sibling.path());
+    assert_eq!(ok.status, 200, "{}", ok.body);
+    for id in [id, ok.body["id"].as_u64().unwrap()] {
+        post(&ui, &format!("/api/transfers/{id}/cancel"), json!({}));
+        wait_until_ended(&ui, id);
+    }
+    let again = attempt(&nested);
+    assert_eq!(again.status, 200, "a finished receiver frees its folder");
+    post(
+        &ui,
+        &format!("/api/transfers/{}/cancel", again.body["id"]),
+        json!({}),
+    );
 }
 
 #[test]

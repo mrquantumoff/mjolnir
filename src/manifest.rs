@@ -154,6 +154,18 @@ impl Manifest {
             .collect()
     }
 
+    /// What the receiver keys its staging directory by: the sender's key,
+    /// the chunk size, and every file's path, size, and mtime. A later
+    /// session resumes only under the same identity.
+    pub fn identity(&self, peer: &crate::keys::PublicKey) -> [u8; 32] {
+        let mut h = blake3::Hasher::new();
+        h.update(b"mjolnir transfer v2");
+        h.update(&peer.0);
+        h.update(&self.chunk_size.get().to_be_bytes());
+        h.update(&postcard::to_allocvec(&self.to_offer()).expect("offer files serialize"));
+        *h.finalize().as_bytes()
+    }
+
     pub fn offer_dirs(&self) -> Vec<Vec<ByteBuf>> {
         self.dirs.iter().map(offered).collect()
     }

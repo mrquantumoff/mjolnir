@@ -248,6 +248,12 @@ impl WirePath {
     }
 }
 
+/// `base` as the receiver addresses it: absolute, and on Windows a `\\?\`
+/// verbatim path, like the paths [`WirePath::to_local_path`] builds.
+pub fn local_dir(base: &Path) -> PathBuf {
+    local_base(base)
+}
+
 fn fold_name(bytes: &[u8]) -> String {
     use unicode_normalization::UnicodeNormalization;
     String::from_utf8_lossy(&encode_utf8_escaped(bytes))

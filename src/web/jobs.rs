@@ -24,6 +24,7 @@ pub struct Report {
     pub chunks_resent: u64,
     pub repaired_chunks: u64,
     pub hash_repaired_chunks: u64,
+    pub stale_chunks: u64,
     pub duplicate_chunks: u64,
     pub file_hashes: Vec<FileHash>,
     pub warnings: Vec<String>,
@@ -152,6 +153,18 @@ impl Jobs {
 
     pub fn map_newest_first<T>(&self, f: impl FnMut(&Job) -> T) -> Vec<T> {
         self.lock().values().rev().map(f).collect()
+    }
+
+    /// `(id, out_dir)` of every receive job still running.
+    pub fn running_receivers(&self) -> Vec<(JobId, std::path::PathBuf)> {
+        self.lock()
+            .values()
+            .filter(|job| job.is_running())
+            .filter_map(|job| match &job.spec {
+                JobSpec::Receive { out_dir, .. } => Some((job.id, out_dir.clone())),
+                JobSpec::Send { .. } => None,
+            })
+            .collect()
     }
 
     pub fn cancel(&self, id: JobId) -> bool {

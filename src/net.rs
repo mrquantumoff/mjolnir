@@ -120,8 +120,12 @@ impl<'a> Io<'a> {
 
     /// Fails every operation once `after` has passed from now.
     pub(crate) fn deadline(mut self, after: Duration) -> Self {
-        self.deadline = Some(Instant::now() + after);
+        self.set_deadline(after);
         self
+    }
+
+    pub(crate) fn set_deadline(&mut self, after: Duration) {
+        self.deadline = Some(Instant::now() + after);
     }
 
     /// Fails an operation that moves no byte for `limit`.
