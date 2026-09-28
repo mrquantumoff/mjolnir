@@ -115,8 +115,11 @@ so every request is treated as hostile until it proves otherwise.
 - **Bounded input.** Request bodies are capped at 1 MiB (413 beyond that).
   Every field is parsed and range-checked in the handler before any work
   starts.
-- **The private key never leaves the process.** The API returns only the
-  public key and the key file's path.
+- **No endpoint returns the private key.** The API gives only the public
+  key and the key file's path. The key file is still a file this user can
+  read, though, so whoever holds the token can pick it, like any other
+  readable file, in a send to a receiver of their choosing. The token is
+  what guards it.
 
 ## API
 

@@ -217,7 +217,8 @@ write to.
 
 Full tables and method: [docs/BENCHMARKS.md](docs/BENCHMARKS.md). Loopback on
 one machine (Ryzen 9 9950X, Samsung 970 EVO Plus), 2 GiB of random data,
-medians of 3 runs, commit 4daa636. Every output matched the source's SHA-256.
+medians of 3 runs, commit 4daa636. Every disk-writing output matched the
+source's SHA-256; the discard rows write nothing to check.
 
 | Setup | Windows | Linux (WSL2, ext4) |
 |---|---|---|
