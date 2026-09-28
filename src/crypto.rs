@@ -15,7 +15,7 @@ use sha2::Sha256;
 use crate::keys::{PrivateKey, PublicKey};
 
 const NOISE_PARAMS: &str = "Noise_IK_25519_ChaChaPoly_SHA256";
-const PROLOGUE: &[u8] = b"mjolnir v1";
+const PROLOGUE: &[u8] = b"mjolnir v2";
 const NOISE_MAX: usize = 65535;
 /// IK message 1 with an empty payload: `e` (32), encrypted `s` (32 + 16),
 /// and the empty payload's tag (16).

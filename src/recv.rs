@@ -94,10 +94,15 @@ const CHECKPOINT_EVERY: Duration = Duration::from_secs(2);
 /// Preamble plus Noise message 1 must arrive within this, however slowly
 /// the bytes trickle in.
 const HANDSHAKE_DEADLINE: Duration = Duration::from_secs(10);
-/// After the handshake, the sender's Offer must arrive within this; until
-/// it does, the connection holds only a handshake thread, not the session.
+/// After the handshake, the sender's `Confirm` must arrive within this;
+/// until it does, the connection holds only a handshake thread and a
+/// `CONFIRM_LEN`-byte buffer, not the session.
+const CONFIRM_DEADLINE: Duration = Duration::from_secs(10);
+/// Once a connection holds the session, its `Offer` must arrive within this.
 const OFFER_DEADLINE: Duration = Duration::from_secs(10);
 /// Handshakes in progress at once; more connections are dropped at accept.
+/// Each buffers at most `CONFIRM_LEN` bytes before its peer proves it is
+/// live, so unconfirmed peers hold under 8 KiB of control buffers in all.
 const MAX_PENDING_HANDSHAKES: usize = 256;
 /// Stack for a handshake thread; the handshake keeps its buffers on the heap.
 const HANDSHAKE_STACK: usize = 256 << 10;
@@ -116,15 +121,13 @@ const MAX_VERIFY_THREADS: usize = 16;
 /// Connections the buffer pool is sized for; more still work, sharing it.
 const EXPECTED_CONNECTIONS: usize = 16;
 
-/// A control connection that finished the handshake.
 /// A control connection whose sender finished the handshake and whose
-/// Offer decrypted, so the sender is live: only these take the session.
+/// `Confirm` decrypted, so the sender is live: only these take the session.
 struct Handshaken {
     stream: TcpStream,
     keys: SessionKeys,
     peer: PublicKey,
-    offer: Msg,
-    /// The control stream's receive state after the Offer.
+    /// The control stream's receive state after `Confirm`.
     rx_cipher: CipherState,
 }
 
@@ -236,8 +239,20 @@ impl Receiver {
             &h.keys,
             Role::Receiver,
         );
-        let mut rx = ControlRx::resume(control, h.rx_cipher);
-        let result = self.receive(h.keys, h.offer, &mut rx, &mut tx, progress);
+        // The Offer may be large; only a confirmed sender gets this far,
+        // and it still has to deliver it within the deadline.
+        let mut offer_rx =
+            ControlRx::resume(control.try_clone()?.deadline(OFFER_DEADLINE), h.rx_cipher);
+        let offer = offer_rx.recv().context("waiting for the Offer");
+        let (offer, rx_cipher) = match offer.and_then(|o| Ok((o, offer_rx.into_parts()?.1))) {
+            Ok(got) => got,
+            Err(e) => {
+                net::linger(control.into_stream());
+                return Err(e);
+            }
+        };
+        let mut rx = ControlRx::resume(control, rx_cipher);
+        let result = self.receive(h.keys, offer, &mut rx, &mut tx, progress);
         if let Err(e) = &result {
             tell_peer_about(e, progress, Some(&mut tx));
             net::linger(rx.into_inner().into_stream());
@@ -428,21 +443,17 @@ fn handshake(
     }
     let (keys, peer) = handshake_responder(&mut io, key, authorized)?;
     // Message 1 can be replayed, so the handshake alone proves nothing
-    // about liveness; the Offer does, because only the real sender can
-    // seal it. Reading it here keeps unconfirmed peers out of the session.
-    let reader = Io::new(io.into_stream(), &cancelled).deadline(OFFER_DEADLINE);
+    // about liveness; the fixed-size Confirm does, because only the real
+    // sender can seal it. Reading it here keeps unconfirmed peers out of
+    // the session while buffering nothing they can size.
+    let reader = Io::new(io.into_stream(), &cancelled).deadline(CONFIRM_DEADLINE);
     let (_, mut rx) = wire::control_channel(reader, std::io::sink(), &keys, Role::Receiver);
-    let offer = rx.recv().context("waiting for the Offer")?;
-    ensure!(
-        matches!(offer, Msg::Offer { .. }),
-        "expected Offer, got {offer:?}"
-    );
+    rx.recv_confirm().context("waiting for Confirm")?;
     let (reader, rx_cipher) = rx.into_parts()?;
     Ok(Some(Handshaken {
         stream: reader.into_stream(),
         keys,
         peer,
-        offer,
         rx_cipher,
     }))
 }

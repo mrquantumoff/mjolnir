@@ -1,4 +1,4 @@
-# Mjolnir protocol, version 1
+# Mjolnir protocol, version 2
 
 Mjolnir moves large files between two hosts over N parallel TCP connections.
 Files are split into fixed-size chunks (the sender picks the size). Each chunk
@@ -24,11 +24,17 @@ once; connections beyond that are closed at once) and requires the preamble and 
 seconds, so a peer that trickles bytes cannot hold up a real sender.
 Message 1 must be exactly 96 bytes, its size in IK with an empty payload. Message 1 can be
 replayed, and the receiver answers a replay like the original, so a
-finished handshake does not prove the sender is live; its `Offer` does,
+finished handshake does not prove the sender is live; its `Confirm` does,
 because only the real sender can seal it. Each handshake thread therefore
-also waits (up to 10 seconds) for that connection's `Offer`, and only a
-connection whose `Offer` decrypted takes the session. A replay never gets
-that far, so it cannot hold the session or lock out a real sender. A
+also waits (up to 10 seconds) for that connection's `Confirm`, and only a
+connection whose `Confirm` decrypted takes the session. `Confirm` is a
+fixed 17-byte message, and the handshake thread reads exactly that many
+bytes, so a peer that only replayed message 1 can make the receiver
+buffer at most 21 bytes per connection, under 8 KiB across all 256
+handshake slots, before it is dropped. The `Offer`, which may be up to
+64 MiB, is read only by the connection that holds the session, within
+10 seconds. A replay never gets that far, so it cannot hold the session,
+lock out a real sender, or fill the receiver's memory. A
 sender whose control connection is closed during the handshake, as happens
 while another session is active, retries twice, after 1 and 3 seconds. Until then it keeps listening. A failed handshake (unknown key,
 garbage, a port scanner) drops only that connection. It is logged, and the
@@ -59,7 +65,7 @@ same form WireGuard uses.
 Every TCP connection starts with the sender writing 6 bytes:
 
 ```
-"MJLN" (4 bytes) | version u8 = 1 | kind u8 (0 = control, 1 = data)
+"MJLN" (4 bytes) | version u8 = 2 | kind u8 (0 = control, 1 = data)
 ```
 
 The first connection must be the control connection. Data connections are
@@ -68,7 +74,7 @@ accepted only after the control handshake has finished.
 ## Control handshake (Noise IK)
 
 The control connection runs `Noise_IK_25519_ChaChaPoly_SHA256` with prologue
-`mjolnir v1`. The sender is the initiator and already knows the receiver's
+`mjolnir v2`. The sender is the initiator and already knows the receiver's
 static public key. Each Noise message is framed with a length:
 
 ```
@@ -107,9 +113,10 @@ E(l) = HKDF-SHA256-Expand(PRK, info = l, 32 bytes)
 | `session_id`  | first 16 bytes of `E("session id")` | bound into every data chunk's AAD     |
 | `k_data(r,i)` | `E("data" | r u32 | i u32)`         | data connection `i` in round `r`      |
 
-The sender's first control message (`Offer`) is sealed under `k_ctrl_s2r`,
-so a successful decrypt confirms to the receiver that the sender is live and
-holds the key it authenticated with.
+The sender's first control message (`Confirm`) is sealed under
+`k_ctrl_s2r`, so a successful decrypt confirms to the receiver that the
+sender is live and holds the key it authenticated with, before the
+receiver reads anything of a size the sender chooses.
 
 ## Control channel
 
@@ -138,6 +145,7 @@ starting at 0):
 | `Error { message }`                  | both      | ends the session; the sender exits, the receiver checkpoints and waits again |
 | `Cancel`                             | both      | the user cancelled; handled like `Error`, reported as a cancel |
 | `Verifying`                          | R to S    | the receiver starts reading chunks back; for progress display only |
+| `Confirm`                            | S to R    | the first message after the handshake; empty, sealed, so it proves the sender is live |
 
 Field encodings: `chunk_size` is a `u32`; `cipher` is an enum
 (`Aes256Gcm` = 0, `ChaCha20Poly1305` = 1); each file is
@@ -181,6 +189,7 @@ or `ChaCha20Poly1305`.
 ### Session flow
 
 ```
+S -> R : Confirm              (17 sealed bytes; proves the sender is live)
 S -> R : Offer
 R -> S : Have                 (resume state; all zero on a fresh transfer)
 loop round = 0, 1, ...:

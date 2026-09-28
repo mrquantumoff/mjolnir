@@ -335,6 +335,7 @@ fn transfer(ctx: &Ctx, cfg: &SendConfig, map: &FileMap, tx: &mut Tx, rx: &mut Rx
     let mut finalized = false;
     let mut file_hashes = Vec::new();
     let mut hash_repaired = 0;
+    tx.send(&Msg::Confirm)?;
     tx.send(&Msg::Offer {
         chunk_size: m.chunk_size.get(),
         cipher: ctx.cipher,

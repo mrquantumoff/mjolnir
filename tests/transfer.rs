@@ -611,7 +611,7 @@ fn a_stalled_handshake_does_not_block_a_real_sender() {
     let rx = start_receiver(rk, vec![spub], out.path());
 
     let mut stall = std::net::TcpStream::connect(rx.addr).unwrap();
-    stall.write_all(b"MJLN\x01\x00\xff").unwrap();
+    stall.write_all(b"MJLN\x02\x00\xff").unwrap();
     thread::sleep(Duration::from_millis(100));
 
     let started = Instant::now();
@@ -643,7 +643,7 @@ fn a_second_control_connection_is_closed_during_a_session() {
     }
 
     let mut second = std::net::TcpStream::connect(rx.addr).unwrap();
-    second.write_all(b"MJLN\x01\x00").unwrap();
+    second.write_all(b"MJLN\x02\x00").unwrap();
     second
         .set_read_timeout(Some(Duration::from_secs(3)))
         .unwrap();
@@ -670,7 +670,7 @@ fn receiver_cancel_is_prompt_with_a_silent_connection_pending() {
     let (_, spub) = keypair();
     let rx = start_receiver(rk, vec![spub], out.path());
     let mut silent = std::net::TcpStream::connect(rx.addr).unwrap();
-    silent.write_all(b"MJLN\x01\x00").unwrap();
+    silent.write_all(b"MJLN\x02\x00").unwrap();
     thread::sleep(Duration::from_millis(100));
     let started = Instant::now();
     rx.progress.cancel();
@@ -765,6 +765,7 @@ fn stalled_receiver(key: PrivateKey, sender: PublicKey) -> (SocketAddr, JoinHand
             &keys,
             Role::Receiver,
         );
+        rx.recv_confirm().unwrap();
         let Msg::Offer {
             files, chunk_size, ..
         } = rx.recv().unwrap()
@@ -1050,6 +1051,57 @@ fn a_silent_replayed_handshake_does_not_hold_the_receiver() {
         waited < Duration::from_secs(5),
         "real sender waited {waited:?}"
     );
+    assert_file_eq(&file, &second.path().join("f.bin"));
+}
+
+/// A replayed handshake cannot seal `Confirm`, so the receiver must drop
+/// the connection after its fixed-size read instead of buffering the
+/// 64 MiB control message the replayer announces.
+#[test]
+fn a_replayed_handshake_cannot_make_the_receiver_buffer_a_large_message() {
+    use std::io::Write;
+    let src = TempDir::new().unwrap();
+    let file = src.path().join("f.bin");
+    write(&file, &noise(20_000, 24));
+    let (rk, rpub) = keypair();
+    let (sk, spub) = keypair();
+
+    let first = TempDir::new().unwrap();
+    let rx = start(recv_config(rk.clone(), vec![spub], first.path()));
+    let (proxy, recorded) = recording_proxy(rx.addr, 6 + 2 + 96);
+    Send::to(sk.clone(), rpub).run(proxy, &[&file]).unwrap();
+    rx.join().unwrap();
+    let msg1 = recorded.lock().unwrap().clone();
+
+    let second = TempDir::new().unwrap();
+    let rx = start(recv_config(rk, vec![spub], second.path()));
+    let garbage = vec![0x5Au8; 1 << 20];
+    for _ in 0..4 {
+        let mut replay = std::net::TcpStream::connect(rx.addr).unwrap();
+        replay.write_all(&msg1).unwrap();
+        // Read message 2, then announce a maximal control message.
+        let mut len = [0u8; 2];
+        std::io::Read::read_exact(&mut replay, &mut len).unwrap();
+        let mut msg2 = vec![0u8; u16::from_be_bytes(len) as usize];
+        std::io::Read::read_exact(&mut replay, &mut msg2).unwrap();
+        replay.write_all(&(64u32 << 20).to_be_bytes()).unwrap();
+        replay
+            .set_write_timeout(Some(Duration::from_secs(10)))
+            .unwrap();
+        // Loopback buffers a few MiB before a closed peer fails the write;
+        // the old receiver read all 64 MiB.
+        let mut accepted = 0u64;
+        while accepted < 64 << 20 && replay.write_all(&garbage).is_ok() {
+            accepted += garbage.len() as u64;
+        }
+        assert!(
+            accepted < 32 << 20,
+            "the receiver swallowed {accepted} bytes of an unauthenticated body"
+        );
+    }
+
+    Send::to(sk, rpub).run(rx.addr, &[&file]).unwrap();
+    rx.join().unwrap();
     assert_file_eq(&file, &second.path().join("f.bin"));
 }
 

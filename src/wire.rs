@@ -11,7 +11,7 @@ use crate::filemap::FileMap;
 use crate::manifest::{ChunkId, END_FILE_ID, OfferFile};
 
 pub const MAGIC: &[u8; 4] = b"MJLN";
-pub const VERSION: u8 = 1;
+pub const VERSION: u8 = 2;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ConnKind {
@@ -81,9 +81,14 @@ pub enum Msg {
     Cancel,
     /// The receiver is reading chunks back; progress reporting only.
     Verifying,
+    /// The sender's first message, before `Offer`: it carries nothing, but
+    /// sealing it proves the sender is live and holds the session key.
+    Confirm,
 }
 
 pub const MAX_CONTROL_LEN: usize = 64 << 20;
+/// The sealed length of `Confirm`: its one-byte postcard tag plus the tag.
+pub const CONFIRM_LEN: usize = 1 + TAG_LEN;
 /// A control message body is read at most this much at a time.
 const READ_STEP: usize = 1 << 20;
 /// Most digests one `Digests` message carries.
@@ -174,13 +179,49 @@ impl<R: Read> ControlRx<R> {
     }
 
     pub fn recv(&mut self) -> Result<Msg> {
+        self.recv_within(MAX_CONTROL_LEN)
+    }
+
+    /// Reads the `Confirm` that opens a session. Its length is fixed, so a
+    /// peer that only replayed the handshake, and so cannot seal anything,
+    /// gets at most `CONFIRM_LEN` bytes of buffer before it is dropped.
+    /// It reads exactly those bytes from the underlying stream, never
+    /// ahead into the `Offer` that follows, so the stream can be handed on.
+    pub fn recv_confirm(&mut self) -> Result<()> {
+        ensure!(
+            self.reader.buffer().is_empty(),
+            "unexpected bytes before Confirm"
+        );
+        let raw = self.reader.get_mut();
+        let mut len = [0u8; 4];
+        raw.read_exact(&mut len)
+            .context("control connection closed")?;
+        ensure!(
+            u32::from_be_bytes(len) as usize == CONFIRM_LEN,
+            "bad Confirm length {}",
+            u32::from_be_bytes(len)
+        );
+        let mut buf = [0u8; CONFIRM_LEN];
+        raw.read_exact(&mut buf)
+            .context("control connection closed mid-message")?;
+        self.cipher
+            .open(b"", &mut buf)
+            .context("Confirm failed to authenticate")?;
+        match postcard::from_bytes(&buf[..CONFIRM_LEN - TAG_LEN]) {
+            Ok(Msg::Confirm) => Ok(()),
+            Ok(other) => bail!("expected Confirm, got {other:?}"),
+            Err(e) => Err(e).context("malformed Confirm"),
+        }
+    }
+
+    fn recv_within(&mut self, max: usize) -> Result<Msg> {
         let mut len = [0u8; 4];
         self.reader
             .read_exact(&mut len)
             .context("control connection closed")?;
         let len = u32::from_be_bytes(len) as usize;
         ensure!(
-            (TAG_LEN..=MAX_CONTROL_LEN).contains(&len),
+            (TAG_LEN..=max).contains(&len),
             "bad control message length {len}"
         );
         // Grow the buffer as bytes arrive, so a peer that announces 64 MiB
@@ -402,9 +443,9 @@ mod tests {
     fn preamble_roundtrip_and_rejects() {
         let mut buf = Vec::new();
         write_preamble(&mut buf, ConnKind::Data).unwrap();
-        assert_eq!(buf, b"MJLN\x01\x01");
+        assert_eq!(buf, b"MJLN\x02\x01");
         assert_eq!(read_preamble(&mut &buf[..]).unwrap(), ConnKind::Data);
-        assert!(read_preamble(&mut &b"MJLN\x02\x00"[..]).is_err());
+        assert!(read_preamble(&mut &b"MJLN\x01\x00"[..]).is_err());
         assert!(read_preamble(&mut &b"HTTP/1"[..]).is_err());
     }
 
@@ -467,5 +508,40 @@ mod tests {
         );
         assert_eq!(tag(&Msg::Cancel), 9);
         assert_eq!(tag(&Msg::Verifying), 10);
+        assert_eq!(tag(&Msg::Confirm), 11);
+    }
+
+    #[test]
+    fn confirm_is_exactly_confirm_len_and_nothing_larger_is_read_for_it() {
+        let keys = SessionKeys::derive(&[1u8; 32], &[2u8; 32]);
+        let (mut tx, _) = control_channel(&[][..], Vec::new(), &keys, Role::Sender);
+        tx.send(&Msg::Confirm).unwrap();
+        assert_eq!(tx.writer.len(), 4 + CONFIRM_LEN);
+        let (_, mut rx) = control_channel(&tx.writer[..], Vec::new(), &keys, Role::Receiver);
+        rx.recv_confirm().unwrap();
+
+        let mut announced = ((CONFIRM_LEN + 1) as u32).to_be_bytes().to_vec();
+        announced.extend_from_slice(&[0u8; 64]);
+        let reader = Truncated {
+            data: announced,
+            largest_read: 0,
+        };
+        let (_, mut rx) = control_channel(reader, Vec::new(), &keys, Role::Receiver);
+        let err = rx.recv_confirm().unwrap_err();
+        assert!(format!("{err:#}").contains("bad Confirm length"), "{err:#}");
+        assert!(rx.into_inner().largest_read <= 4);
+    }
+
+    #[test]
+    fn recv_confirm_leaves_the_following_message_unread() {
+        let keys = SessionKeys::derive(&[1u8; 32], &[2u8; 32]);
+        let (mut tx, _) = control_channel(&[][..], Vec::new(), &keys, Role::Sender);
+        tx.send(&Msg::Confirm).unwrap();
+        tx.send(&Msg::Delivered).unwrap();
+        let (_, mut rx) = control_channel(&tx.writer[..], Vec::new(), &keys, Role::Receiver);
+        rx.recv_confirm().unwrap();
+        let (rest, cipher) = rx.into_parts().unwrap();
+        let mut rx = ControlRx::resume(rest, cipher);
+        assert_eq!(rx.recv().unwrap(), Msg::Delivered);
     }
 }
