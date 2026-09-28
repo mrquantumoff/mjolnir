@@ -1,8 +1,8 @@
 //! Static X25519 identities: key newtypes, key files, and authorized-keys lists.
 
 use std::fmt;
-use std::fs::OpenOptions;
-use std::io::Write;
+use std::fs::File;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
@@ -11,6 +11,8 @@ use base64::Engine;
 use base64::engine::general_purpose::STANDARD as B64;
 use curve25519_dalek::montgomery::MontgomeryPoint;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+mod private_file;
 
 /// An X25519 public key. Text form is standard base64 of the 32 raw bytes.
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
@@ -87,24 +89,24 @@ impl PrivateKey {
         decode_key(text).map(PrivateKey)
     }
 
+    /// Reads a key file, refusing one that other accounts can read or
+    /// change: mode bits beyond 0600 on Unix, or an access list that grants
+    /// anyone but this user, SYSTEM, and Administrators on Windows.
     pub fn load(path: &Path) -> Result<Self> {
-        let text = std::fs::read_to_string(path)
-            .with_context(|| format!("reading private key {}", path.display()))?;
+        let reading = || format!("reading private key {}", path.display());
+        let mut file = File::open(path).with_context(reading)?;
+        private_file::check(&file, path)?;
+        let mut text = String::new();
+        file.read_to_string(&mut text).with_context(reading)?;
         Self::from_base64(&text).with_context(|| format!("parsing private key {}", path.display()))
     }
 
     /// Writes the key as base64 plus a newline. Refuses to overwrite an
-    /// existing file; on Unix the file is created with mode 0600.
+    /// existing file. Only this user can open it: mode 0600 on Unix, and on
+    /// Windows a DACL that inherits nothing and grants only this user,
+    /// SYSTEM, and Administrators.
     pub fn save(&self, path: &Path) -> Result<()> {
-        let mut options = OpenOptions::new();
-        options.write(true).create_new(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            options.mode(0o600);
-        }
-        let mut file = options
-            .open(path)
+        let mut file = private_file::create(path)
             .with_context(|| format!("creating key file {}", path.display()))?;
         writeln!(file, "{}", B64.encode(self.0))?;
         file.sync_all()?;
@@ -229,6 +231,55 @@ mod tests {
         let short = B64.encode([1u8; 16]);
         let err = format!("{:#}", parse_authorized_keys(&short).unwrap_err());
         assert!(err.contains("line 1") && err.contains("32 bytes"), "{err}");
+    }
+
+    #[test]
+    fn saved_key_loads_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("k.key");
+        let key = PrivateKey::generate();
+        key.save(&path).unwrap();
+        assert_eq!(PrivateKey::load(&path).unwrap().0, key.0);
+        assert!(key.save(&path).is_err(), "save must not overwrite");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn key_readable_by_others_is_refused_on_unix() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("k.key");
+        PrivateKey::generate().save(&path).unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600);
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o640)).unwrap();
+        let err = format!("{:#}", PrivateKey::load(&path).unwrap_err());
+        assert!(err.contains("chmod 600"), "{err}");
+    }
+
+    /// A directory that grants Everyone read access to what is created in
+    /// it: `save` must not inherit that, and a key written without `save`
+    /// must be refused.
+    #[cfg(windows)]
+    #[test]
+    fn key_readable_by_others_is_refused_on_windows() {
+        let dir = tempfile::tempdir().unwrap();
+        let status = std::process::Command::new("icacls")
+            .arg(dir.path())
+            .args(["/grant", "*S-1-1-0:(OI)(CI)R"])
+            .stdout(std::process::Stdio::null())
+            .status()
+            .unwrap();
+        assert!(status.success());
+
+        let saved = dir.path().join("saved.key");
+        PrivateKey::generate().save(&saved).unwrap();
+        PrivateKey::load(&saved).unwrap();
+
+        let plain = dir.path().join("plain.key");
+        std::fs::write(&plain, B64.encode([7u8; 32])).unwrap();
+        let err = format!("{:#}", PrivateKey::load(&plain).unwrap_err());
+        assert!(err.contains("S-1-1-0") && err.contains("icacls"), "{err}");
     }
 
     fn hex32(s: &str) -> [u8; 32] {

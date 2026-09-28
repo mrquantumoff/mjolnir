@@ -76,7 +76,11 @@ at the end.
 
 `mjolnir keygen [--out PATH]` writes a new private key (default
 `mjolnir.key`) and prints its public key. It refuses to overwrite an
-existing file. On Unix the file has mode `0600`.
+existing file. On Unix the file has mode `0600`. On Windows it gets an
+access list of its own, inheriting nothing from its folder, that grants
+only your account, SYSTEM, and Administrators. Every command that reads a
+key refuses one that other accounts can read or change, and says how to
+restrict it (`chmod 600` or `icacls`).
 
 `mjolnir pubkey --key PATH` prints the public key of an existing private
 key.
