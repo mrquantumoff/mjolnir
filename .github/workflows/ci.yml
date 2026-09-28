@@ -65,6 +65,17 @@ jobs:
       - name: Build
         run: cargo build --release --locked --target ${{ matrix.target }}
 
+      # .cargo/config.toml turns on the ARMv8 AES and GHASH backends; without
+      # them the binary holds no AESE or PMULL instruction at all.
+      - name: Check for ARMv8 AES and PMULL code
+        if: matrix.target == 'aarch64-unknown-linux-gnu'
+        run: |
+          aarch64-linux-gnu-objdump -d target/${{ matrix.target }}/release/mjolnir > "$RUNNER_TEMP/disasm"
+          aese="$(grep -cw aese "$RUNNER_TEMP/disasm" || true)"
+          pmull="$(grep -cw pmull "$RUNNER_TEMP/disasm" || true)"
+          echo "aese: $aese, pmull: $pmull"
+          [ "$aese" -gt 0 ] && [ "$pmull" -gt 0 ]
+
       - name: Package (Linux)
         if: runner.os == 'Linux'
         run: |
