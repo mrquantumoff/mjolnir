@@ -17,6 +17,7 @@ mod pool;
 pub mod posio;
 pub mod progress;
 pub mod recv;
+mod schedule;
 pub mod send;
 pub mod web;
 pub mod wire;

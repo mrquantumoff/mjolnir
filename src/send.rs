@@ -5,7 +5,7 @@ use std::fs::{self, File};
 use std::io::{Read, Write};
 use std::net::{Shutdown, SocketAddr};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering::Relaxed};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering::Relaxed};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -25,6 +25,7 @@ use crate::net::{self, Io, tell_peer_about, unexpected};
 use crate::pool::{Buffers, InFlight, Pool, buffer_count, resolve_threads};
 use crate::posio::read_exact_at;
 use crate::progress::{ActiveConnection, Cancelled, Phase, PhaseTimes, Progress};
+use crate::schedule::Scheduler;
 use crate::wire::{
     self, ADMITTED, CHALLENGE_LEN, ConnKind, ControlRx, ControlTx, DIGESTS_PER_MSG, FrameHeader,
     HEADER_LEN, Msg, Role, chunk_header, encode_hello, seal_frame,
@@ -351,8 +352,9 @@ fn transfer(ctx: &Ctx, cfg: &SendConfig, map: &FileMap, tx: &mut Tx, rx: &mut Rx
     let mut failed_rounds = 0;
     for round in 0u32.. {
         let queue = missing(&have);
+        let sched = Scheduler::new(&have);
         tx.send(&Msg::RoundStart { round })?;
-        let admitted = run_round(ctx, round, connections, &queue);
+        let admitted = run_round(ctx, round, connections.min(queue.len()), &sched);
         if ctx.progress.is_cancelled() {
             return Err(Cancelled::Local.into());
         }
@@ -433,16 +435,15 @@ fn reply(ctx: &Ctx, rx: &mut Rx) -> Result<Msg> {
     }
 }
 
-/// Opens up to `connections` data connections that drain `queue` together.
+/// Opens `connections` data connections that drain `sched` together.
 /// Returns how many the receiver admitted.
-fn run_round(ctx: &Ctx, round: u32, connections: usize, queue: &[ChunkId]) -> u32 {
-    let cursor = AtomicUsize::new(0);
+fn run_round(ctx: &Ctx, round: u32, connections: usize, sched: &Scheduler) -> u32 {
     let admitted = AtomicU32::new(0);
     thread::scope(|s| {
-        for conn in 0..connections.min(queue.len()) as u32 {
-            let (cursor, admitted) = (&cursor, &admitted);
+        for conn in 0..connections as u32 {
+            let admitted = &admitted;
             s.spawn(move || {
-                if let Err(e) = data_connection(ctx, round, conn, queue, cursor, admitted)
+                if let Err(e) = data_connection(ctx, round, conn, sched, admitted)
                     && !ctx.progress.is_cancelled()
                 {
                     eprintln!("mjolnir: data connection {conn} of round {round}: {e:#}");
@@ -457,8 +458,7 @@ fn data_connection(
     ctx: &Ctx,
     round: u32,
     conn: u32,
-    queue: &[ChunkId],
-    cursor: &AtomicUsize,
+    sched: &Scheduler,
     admitted: &AtomicU32,
 ) -> Result<()> {
     let cancelled = || ctx.progress.is_cancelled();
@@ -474,23 +474,26 @@ fn data_connection(
     admitted.fetch_add(1, Relaxed);
     let _active = ActiveConnection::new(ctx.progress);
     let mut stream = Io::new(hello.into_stream(), &cancelled).idle(DATA_IDLE);
+    let id = conn;
     let conn = Arc::new(SendConn {
-        key: FrameKey::new(ctx.cipher, &ctx.keys.data_key(round, conn)),
+        key: FrameKey::new(ctx.cipher, &ctx.keys.data_key(round, id)),
         slots: Default::default(),
     });
-    let result = stream_frames(ctx, &conn, &mut stream, queue, cursor);
+    let result = stream_frames(ctx, &conn, &mut stream, || sched.claim(id));
+    // Whatever this connection still owned goes to the others.
+    sched.release(id);
     stream.into_stream().shutdown(Shutdown::Write)?;
     result
 }
 
 /// Keeps up to `DEPTH` frames of this connection sealing on the pool while
-/// earlier ones go out, and writes them strictly in frame order.
+/// earlier ones go out, and writes them strictly in frame order. `claim`
+/// names the next chunk to send, until it returns `None`.
 fn stream_frames(
     ctx: &Ctx,
     conn: &Arc<SendConn>,
     stream: &mut Io,
-    queue: &[ChunkId],
-    cursor: &AtomicUsize,
+    mut claim: impl FnMut() -> Option<ChunkId>,
 ) -> Result<()> {
     // Frames `written..submitted` are sealing or sealed but not yet sent;
     // frame k carries `chunks[k % DEPTH]`.
@@ -514,7 +517,7 @@ fn stream_frames(
                         None => break,
                     }
                 };
-                let Some(&chunk) = queue.get(cursor.fetch_add(1, Relaxed)) else {
+                let Some(chunk) = claim() else {
                     ctx.buffers.give(buf);
                     exhausted = true;
                     break;
@@ -718,8 +721,8 @@ fn parse_have(m: &Manifest, bitmaps: &[Vec<u8>]) -> Result<Vec<AtomicBitset>> {
         .collect()
 }
 
-/// The work queue: every absent chunk in file order, so reads stay nearly
-/// sequential while connections claim from the front.
+/// Every absent chunk in file order: what a round has to send, kept so the
+/// round can tell whether any of it landed.
 fn missing(have: &[AtomicBitset]) -> Vec<ChunkId> {
     let mut queue = Vec::new();
     for (file, bits) in have.iter().enumerate() {

@@ -125,8 +125,10 @@ replies, and its reply carries a fresh random secret that both sides feed
 through HKDF, bound to the handshake transcript, to derive every session
 key. The sender offers a manifest; the receiver answers with a bitmap of the
 chunks it already holds from an earlier attempt. The sender then opens N data
-connections that pull chunk numbers from one shared queue. Connections only
-move bytes: a pool of `--threads` workers reads each chunk with a positional
+connections. A scheduler gives each connection one file's missing chunks in
+order, so files move in parallel and each file is read sequentially; when
+files run out, connections split the largest remaining range. Connections
+only move bytes: a pool of `--threads` workers reads each chunk with a positional
 read and seals it with a key unique to its connection, and the connection
 writes the sealed frames in order. On the receiver a connection's reader
 hands each frame to the same kind of pool. A worker opens the chunk, claims

@@ -164,7 +164,7 @@ macOS names (see "File names"). The suffix rule covers directories too, because 
 ignores case because on a case-insensitive file system `a.MJOLNIR-PART` is
 that part file. Case-insensitive file systems (Windows, macOS) treat
 `README` and `readme` as one file, and APFS also treats the NFC and NFD
-spellings of a name (`café` as one code point or as `e` plus a combining
+spellings of a name (`cafï¿½` as one code point or as `e` plus a combining
 accent) as one file. The collision rule uses one key on every OS, the
 NFC-normalized, lowercased macOS name, so the same offer is valid or invalid
 everywhere, and any two names that collide on Windows also collide under
@@ -223,10 +223,12 @@ failed rounds the sender sends `Error` and gives up. A chunk that arrives
 more than once is written only the first time (see "Ordering, duplicates,
 and late data").
 
-The sender hands chunks to its connections from one shared queue. Each
-connection claims the next unsent chunk when it is ready for one. A slow
-connection therefore takes fewer chunks instead of holding up the round, and
-the disk is read in nearly sequential order.
+The sender hands chunks to its connections through one scheduler that
+keeps each file's missing chunks in order (see "Parallelism"). A connection
+claims a chunk when it is ready for one, so a slow connection takes fewer
+chunks instead of holding up the round. Each connection works through one
+file at a time, so files are read sequentially and different connections
+carry different files whenever there are enough files.
 
 Before each `RoundEnd`, the sender re-stats every file. If any size or mtime
 differs from the `Offer`, the source changed underneath the transfer: the
@@ -468,12 +470,30 @@ exact:
   the buffer to the pool. Writes go to each chunk's own offset, so workers
   never wait on each other.
 - **Sender.** Each connection has a writer thread with a small FIFO of
-  pending slots (depth 4). The writer claims the next chunk from the shared
-  cursor and assigns it the connection's next counter value `k`. It submits
-  "read and seal chunk as frame `k`" to the shared worker pool and pushes
-  the pending result onto its FIFO. It writes results to the socket strictly
-  in FIFO order, which is counter order. Up to 4 frames per connection are
-  sealed in parallel while earlier ones are on the wire.
+  pending slots (depth 4). The writer claims the next chunk from the
+  scheduler and assigns it the connection's next counter value `k`. It
+  submits "read and seal chunk as frame `k`" to the shared worker pool and
+  pushes the pending result onto its FIFO. It writes results to the socket
+  strictly in FIFO order, which is counter order. Up to 4 frames per
+  connection are sealed in parallel while earlier ones are on the wire.
+
+**File scheduling.** The sender's scheduler holds, per file, the chunks
+the round still has to send: a contiguous range on a fresh transfer, a
+sorted list on a resume or repair round. A connection owns one file's work
+and claims from it in ascending order, so its reads are sequential and the
+receiver gets that file's chunks in order on one connection. When its work
+runs out, the connection takes the unowned file with the most remaining
+chunks. When every file with work is owned (fewer files than connections,
+or one big file), it steals the second half of the largest owned range or
+list; both halves stay ascending. A range with fewer than 16 chunks left is
+not split; its owner and the idle connections share it a chunk at a time.
+A connection that ends early gives its work back. So with at least as many
+files as connections, no two connections carry chunks of one file at the
+same time; with fewer, the overlap on a file is bounded by how many times
+its range was split. Each chunk is still claimed exactly once per round,
+because the scheduler hands it out from exactly one range or list under
+one lock, and frame counters are still per connection and assigned in the
+order the connection claims, so the nonce rule is unchanged.
 
 **Backpressure.** Buffers come from a bounded pool of
 `2 * threads + connections` buffers of `chunk_size + 32` bytes. When the
