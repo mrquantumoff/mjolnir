@@ -131,8 +131,8 @@ struct Handshaken {
 impl Receiver {
     pub fn bind(cfg: RecvConfig) -> Result<Self> {
         require_nonempty(&cfg.authorized)?;
-        let listener = TcpListener::bind(cfg.listen)
-            .with_context(|| format!("listening on {}", cfg.listen))?;
+        let listener =
+            net::listen(cfg.listen).with_context(|| format!("listening on {}", cfg.listen))?;
         listener.set_nonblocking(true)?;
         Ok(Receiver { listener, cfg })
     }
@@ -165,7 +165,9 @@ impl Receiver {
             if progress.is_cancelled() {
                 return Err(Cancelled::Local.into());
             }
-            match self.listener.accept() {
+            // After a connection, more may be queued: take them before
+            // sleeping, or a burst drains one per poll and fills the backlog.
+            let wait = match self.listener.accept() {
                 Ok((stream, from)) => {
                     // Over the limit, the socket is closed right here.
                     let Some(permit) = permits.try_acquire() else {
@@ -194,11 +196,15 @@ impl Receiver {
                     if let Err(e) = spawned {
                         eprintln!("mjolnir: cannot start a handshake thread: {e}");
                     }
+                    Duration::ZERO
                 }
-                Err(e) if e.kind() == ErrorKind::WouldBlock => {}
-                Err(e) => eprintln!("mjolnir: accept failed: {e}"),
-            }
-            let h = match done_rx.recv_timeout(ACCEPT_POLL) {
+                Err(e) if e.kind() == ErrorKind::WouldBlock => ACCEPT_POLL,
+                Err(e) => {
+                    eprintln!("mjolnir: accept failed: {e}");
+                    ACCEPT_POLL
+                }
+            };
+            let h = match done_rx.recv_timeout(wait) {
                 Ok(h) => h,
                 Err(RecvTimeoutError::Timeout) => continue,
                 Err(RecvTimeoutError::Disconnected) => unreachable!("run_inner holds a sender"),

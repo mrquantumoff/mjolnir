@@ -2,11 +2,11 @@
 //! blocking I/O, connecting, and telling the peer why a session ends.
 
 use std::io::{self, ErrorKind, Read, Write};
-use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
+use std::net::{SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow};
-use socket2::{SockRef, TcpKeepalive};
+use socket2::{Domain, SockRef, Socket, TcpKeepalive, Type};
 
 use crate::progress::{Cancelled, Progress};
 use crate::wire::{ControlTx, Msg};
@@ -29,6 +29,23 @@ pub(crate) fn prepare(stream: &TcpStream) -> io::Result<()> {
         .with_time(Duration::from_secs(15))
         .with_interval(Duration::from_secs(5));
     SockRef::from(stream).set_tcp_keepalive(&keepalive)
+}
+
+/// Binds a listener the way `TcpListener::bind` does, but with the largest
+/// backlog the OS allows instead of std's 128: a burst of connections that
+/// overflows the backlog is refused outright on Windows, so a real sender
+/// arriving during a flood would be turned away before the accept loop can
+/// close the excess.
+pub(crate) fn listen(addr: SocketAddr) -> io::Result<TcpListener> {
+    let socket = Socket::new(Domain::for_address(addr), Type::STREAM, None)?;
+    // std sets SO_REUSEADDR only off Windows, where it would let another
+    // socket bind the same port while this one is listening.
+    #[cfg(not(windows))]
+    socket.set_reuse_address(true)?;
+    socket.bind(&addr.into())?;
+    // Windows reads this as SOMAXCONN; Unix kernels clamp it to their limit.
+    socket.listen(i32::MAX)?;
+    Ok(socket.into())
 }
 
 /// Waits up to `timeout` for `stream` to become readable (or writable).
