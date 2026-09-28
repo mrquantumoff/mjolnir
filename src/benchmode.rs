@@ -8,22 +8,27 @@
 //! - `memory-source`: the sender reads every file into memory before it
 //!   connects and serves chunks from there instead of from disk.
 //!
-//! `MJOLNIR_WRITERS_PER_FILE=N` caps how many pool workers may be inside
-//! one file's chunk write at once; unset means no cap.
+//! `MJOLNIR_WRITERS_PER_FILE=N` sets how many pool workers may be inside
+//! one file's chunk write at once. The default is 1; larger values
+//! reproduce the inode-lock contention measured in `docs/BENCHMARKS.md`.
 
 use std::sync::OnceLock;
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub(crate) struct BenchMode {
     pub(crate) discard: bool,
     pub(crate) memory_source: bool,
-    pub(crate) writers_per_file: Option<usize>,
+    pub(crate) writers_per_file: usize,
 }
 
 pub(crate) fn get() -> &'static BenchMode {
     static MODE: OnceLock<BenchMode> = OnceLock::new();
     MODE.get_or_init(|| {
-        let mut mode = BenchMode::default();
+        let mut mode = BenchMode {
+            discard: false,
+            memory_source: false,
+            writers_per_file: 1,
+        };
         for item in std::env::var("MJOLNIR_BENCH")
             .unwrap_or_default()
             .split(',')
@@ -37,8 +42,9 @@ pub(crate) fn get() -> &'static BenchMode {
         mode.writers_per_file = std::env::var("MJOLNIR_WRITERS_PER_FILE")
             .ok()
             .and_then(|v| v.parse().ok())
-            .filter(|&n| n > 0);
-        if mode.discard || mode.memory_source || mode.writers_per_file.is_some() {
+            .filter(|&n| n > 0)
+            .unwrap_or(1);
+        if mode.discard || mode.memory_source || mode.writers_per_file != 1 {
             eprintln!("mjolnir: benchmark mode {mode:?}");
         }
         mode

@@ -459,8 +459,14 @@ struct Target {
     claimed: AtomicBitset,
     /// Set after a chunk lands; cleared by the checkpoint that covers it.
     dirty: AtomicBool,
-    /// Bounds the workers writing this file at once (`MJOLNIR_WRITERS_PER_FILE`).
-    writers: Option<Gate>,
+    /// One worker writes this file at a time. Concurrent positional writes
+    /// into one file serialize on the inode lock anyway, and on Linux the
+    /// waiters spin: 32 workers burned about 15 cores writing 830 MiB/s
+    /// into one ext4 file where a single writer used 0.3 cores for
+    /// 1.2 GiB/s. A 1 MiB copy into the page cache takes about 200 us, so
+    /// the pool keeps opening frames while one worker writes. The
+    /// `MJOLNIR_WRITERS_PER_FILE` knob widens the gate for measurements.
+    writers: Gate,
 }
 
 /// What became of one authenticated chunk.
@@ -481,7 +487,7 @@ impl Target {
         if !self.claimed.set(index) {
             return Ok(Landed::Duplicate);
         }
-        let slot = self.writers.as_ref().map(Gate::enter);
+        let slot = self.writers.enter();
         let data = if crate::benchmode::get().discard {
             Ok(())
         } else {
@@ -592,7 +598,7 @@ fn prepare_targets(out: &Path, m: &Manifest, force: bool) -> Result<Vec<Target>>
             present,
             claimed,
             dirty: AtomicBool::new(false),
-            writers: crate::benchmode::get().writers_per_file.map(Gate::new),
+            writers: Gate::new(crate::benchmode::get().writers_per_file),
         });
     }
     Ok(targets)
