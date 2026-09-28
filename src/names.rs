@@ -194,14 +194,15 @@ impl WirePath {
         &self.0
     }
 
-    /// Lossy text for terminals, logs, and the web UI.
+    /// Lossy text for terminals, logs, and the web UI, with control
+    /// characters escaped.
     pub fn display(&self) -> String {
         let parts: Vec<_> = self
             .0
             .iter()
             .map(|n| String::from_utf8_lossy(&n.0))
             .collect();
-        parts.join("/")
+        crate::printable::escape(&parts.join("/")).into_owned()
     }
 
     /// Key for the case-insensitive duplicate check. It NFC-normalizes and

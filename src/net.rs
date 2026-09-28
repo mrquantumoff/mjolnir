@@ -3,11 +3,13 @@
 
 use std::io::{self, ErrorKind, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
+use std::path::{MAIN_SEPARATOR, Path};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow};
 use socket2::{Domain, SockRef, Socket, TcpKeepalive, Type};
 
+use crate::printable;
 use crate::progress::{Cancelled, Progress};
 use crate::wire::{ControlTx, Msg};
 
@@ -242,13 +244,18 @@ pub(crate) fn linger(mut stream: TcpStream) {
     });
 }
 
+/// Longest peer error text sent or shown.
+const MAX_PEER_ERROR: usize = 1024;
+
 /// Best effort: tell the peer why this side is leaving, `Cancel` for a local
 /// cancel and `Error` for a local failure. Errors the peer caused are not
-/// echoed back.
+/// echoed back. Every path under `local_root` is sent relative to it, so
+/// the peer does not learn where this side keeps its files.
 pub(crate) fn tell_peer_about<W: Write>(
     e: &anyhow::Error,
     progress: &Progress,
     tx: Option<&mut ControlTx<W>>,
+    local_root: Option<&Path>,
 ) {
     let msg = if progress.is_cancelled() {
         Msg::Cancel
@@ -256,7 +263,7 @@ pub(crate) fn tell_peer_about<W: Write>(
         return;
     } else {
         Msg::Error {
-            message: format!("{e:#}"),
+            message: printable::truncate(&for_peer(e, local_root), MAX_PEER_ERROR).into_owned(),
         }
     };
     if let Some(tx) = tx {
@@ -264,13 +271,30 @@ pub(crate) fn tell_peer_about<W: Write>(
     }
 }
 
-/// An `Error` message the peer sent; not echoed back.
+/// The error chain with an absolute `local_root` and the separator after
+/// it removed, and the root itself shown as `.`.
+fn for_peer(e: &anyhow::Error, local_root: Option<&Path>) -> String {
+    let text = format!("{e:#}");
+    let Some(root) = local_root.filter(|root| root.is_absolute()) else {
+        return text;
+    };
+    let root = root.display().to_string();
+    let root = root.trim_end_matches(MAIN_SEPARATOR);
+    if root.is_empty() {
+        return text;
+    }
+    text.replace(&format!("{root}{MAIN_SEPARATOR}"), "")
+        .replace(root, ".")
+}
+
+/// An `Error` message the peer sent, at most `MAX_PEER_ERROR` bytes; not
+/// echoed back. Shown with control characters escaped.
 #[derive(Debug)]
-pub(crate) struct PeerError(pub String);
+pub(crate) struct PeerError(String);
 
 impl std::fmt::Display for PeerError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "peer reported an error: {}", self.0)
+        write!(f, "peer reported an error: {}", printable::escape(&self.0))
     }
 }
 
@@ -279,9 +303,17 @@ impl std::error::Error for PeerError {}
 /// Maps the peer's terminal messages to errors.
 pub(crate) fn unexpected(msg: Msg, waiting_for: &str) -> anyhow::Error {
     match msg {
-        Msg::Error { message } => PeerError(message).into(),
+        Msg::Error { message } => {
+            PeerError(printable::truncate(&message, MAX_PEER_ERROR).into_owned()).into()
+        }
         Msg::Cancel => Cancelled::Peer.into(),
-        other => anyhow!("protocol error: expected {waiting_for}, got {other:?}"),
+        other => {
+            let shown = format!("{other:?}");
+            anyhow!(
+                "protocol error: expected {waiting_for}, got {}",
+                printable::truncate(&shown, 200)
+            )
+        }
     }
 }
 
@@ -290,6 +322,27 @@ mod tests {
     use super::*;
     use std::net::TcpListener;
     use std::thread;
+
+    #[test]
+    fn peer_errors_are_bounded_and_shown_escaped() {
+        let message = format!("disk full\x1b[2J\nmjolnir: forged{}", "x".repeat(4000));
+        let shown = format!("{:#}", unexpected(Msg::Error { message }, "Offer"));
+        assert!(shown.starts_with("peer reported an error: disk full\\u{1b}[2J\\nmjolnir"));
+        assert!(!shown.contains('\x1b') && !shown.contains('\n'), "{shown}");
+        assert!(shown.len() < 1100, "{} bytes", shown.len());
+    }
+
+    #[test]
+    fn errors_for_the_peer_name_paths_relative_to_the_local_root() {
+        let root = std::env::temp_dir().join("mjolnir-out");
+        let file = root.join("dir").join("a.bin");
+        let e = anyhow!("{} already exists", file.display())
+            .context(format!("creating {}", root.display()));
+        let sent = for_peer(&e, Some(&root));
+        let sep = MAIN_SEPARATOR;
+        assert_eq!(sent, format!("creating .: dir{sep}a.bin already exists"));
+        assert_eq!(for_peer(&e, Some(Path::new("."))), format!("{e:#}"));
+    }
 
     /// A reader that pauses for longer than `POLL` makes the writer block.
     /// Every byte must still arrive exactly once and in order.

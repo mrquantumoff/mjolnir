@@ -15,6 +15,7 @@ pub mod names;
 mod net;
 mod pool;
 pub mod posio;
+pub mod printable;
 pub mod progress;
 pub mod recv;
 mod schedule;

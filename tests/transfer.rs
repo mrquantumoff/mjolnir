@@ -477,6 +477,8 @@ fn existing_target_fails_the_session_without_force() {
     let rx = start_receiver(rk, vec![spub], out.path());
     let err = Send::to(sk, rx.public).run(rx.addr, &[&file]).unwrap_err();
     assert!(format!("{err:#}").contains("already exists"), "{err:#}");
+    let receiver_dir = out.path().display().to_string();
+    assert!(!format!("{err:#}").contains(&receiver_dir), "{err:#}");
     rx.assert_waiting();
     assert_eq!(fs::read(out.path().join("f.bin")).unwrap(), b"old");
     rx.progress.cancel();

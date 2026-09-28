@@ -211,7 +211,10 @@ fn run(cfg: &SendConfig, progress: &Progress) -> Result<SendReport> {
         .map(|p| p.display().to_string())
         .collect();
     for p in &skipped {
-        eprintln!("mjolnir: skipping {p}: not a regular file or directory");
+        eprintln!(
+            "mjolnir: skipping {}: not a regular file or directory",
+            crate::printable::escape(p)
+        );
     }
 
     let addrs = net::resolve(&cfg.addr)?;
@@ -255,7 +258,7 @@ fn run(cfg: &SendConfig, progress: &Progress) -> Result<SendReport> {
         result
     });
     if let Err(e) = &result {
-        tell_peer_about(e, progress, Some(&mut tx));
+        tell_peer_about(e, progress, Some(&mut tx), None);
         net::linger(rx.into_inner().into_stream());
     }
     let done = result?;
