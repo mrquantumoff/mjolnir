@@ -93,6 +93,10 @@ enum Cmd {
         /// Metadata to send: `none`, or a list of perms, times, owner.
         #[arg(long, default_value = "perms")]
         preserve: Preserve,
+        /// Skip symbolic links, including ones given as paths, instead of
+        /// sending what they point to.
+        #[arg(long)]
+        no_follow_symlinks: bool,
         #[arg(required = true)]
         paths: Vec<PathBuf>,
     },
@@ -194,6 +198,7 @@ fn run(cmd: Cmd) -> Result<()> {
             threads,
             hash,
             preserve,
+            no_follow_symlinks,
             paths,
         } => {
             let cfg = SendConfig {
@@ -207,6 +212,7 @@ fn run(cmd: Cmd) -> Result<()> {
                 paths,
                 hash,
                 preserve,
+                follow_symlinks: !no_follow_symlinks,
             };
             let progress = Arc::new(Progress::default());
             let report = with_progress("sent", &progress, || mjolnir::send(cfg, progress.clone()))?;

@@ -305,6 +305,7 @@ mod tests {
             threads: 1,
             hash: false,
             preserve: Default::default(),
+            follow_symlinks: true,
         }
     }
 

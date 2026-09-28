@@ -314,6 +314,19 @@ fn out_of_range_send_options_are_400() {
 }
 
 #[test]
+fn send_can_turn_off_following_links() {
+    let ui = start();
+    let dir = tempfile::tempdir().unwrap();
+    let r = post(
+        &ui,
+        "/api/send",
+        json!({ "addr": "127.0.0.1:9", "peer": ui.public_key, "paths": [dir.path()], "follow_symlinks": false }),
+    );
+    assert_eq!(r.status, 200, "{}", r.body);
+    assert_eq!(r.body["spec"]["follow_symlinks"], false);
+}
+
+#[test]
 fn malformed_preserve_is_400() {
     let ui = start();
     let dir = tempfile::tempdir().unwrap();
@@ -512,6 +525,7 @@ fn send_a_directory_end_to_end() {
     assert_eq!(r.body["kind"], "send");
     assert_eq!(r.body["spec"]["threads"], 2);
     assert_eq!(r.body["spec"]["preserve"]["times"], true);
+    assert_eq!(r.body["spec"]["follow_symlinks"], true, "on by default");
     let send_id = r.body["id"].as_u64().unwrap();
 
     let sent = wait_until_ended(&ui, send_id);

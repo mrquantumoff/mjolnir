@@ -53,7 +53,10 @@ seal chunks (empty means one per core). "Verify with hash after delivery"
 re-reads every file on this side once it is delivered; the receiver compares
 the chunk digests and fetches any mismatch again. "Preserve" chooses what
 the file map carries: permissions (on by default), modification times, and
-owner. Recent peers are remembered in the browser.
+owner. "Follow symbolic links" (on by default) sends what links point to,
+even outside the chosen folders; unchecked, every link is skipped, including
+a chosen one.
+Recent peers are remembered in the browser.
 
 ![The send form](web-ui/send-form.png)
 
@@ -67,8 +70,9 @@ number of active connections. Running transfers have a Cancel button;
 finished ones have Remove. Failed transfers show the error. Finished ones show
 a summary: files, bytes, time, average speed, whether every chunk was
 verified and hash checked, and any repaired, hash-repaired, duplicate, or
-resent chunks. Warnings (metadata the receiver could not apply) and skipped
-files (symbolic links and special files the sender left out) are listed when
+resent chunks. Warnings (metadata the receiver could not apply, and why each
+skipped file was left out) and skipped files (special files, and links the
+sender did not or could not follow) are listed when
 there are any, and the per-file hashes sit in a collapsible section. A line
 below the summary gives the time per stage (connect, transfer with its
 MiB/s, verify, hash, finalize), leaving out stages that took no time.
@@ -183,7 +187,8 @@ once when a transfer ends.
     "cipher": "Aes256Gcm",
     "threads": 0,
     "hash": true,
-    "preserve": { "perms": true, "times": false, "owner": false }
+    "preserve": { "perms": true, "times": false, "owner": false },
+    "follow_symlinks": true
   },
   "created_at_ms": 1790000000000,
   "state": "running",
@@ -245,14 +250,17 @@ once when a transfer ends.
   "cipher": "Aes256Gcm",
   "threads": 0,
   "hash": false,
-  "preserve": { "perms": true, "times": false, "owner": false }
+  "preserve": { "perms": true, "times": false, "owner": false },
+  "follow_symlinks": true
 }
 ```
 
 `connections` (1 to 64), `chunk_size` (4 KiB to 64 MiB), `cipher`
 (`Aes256Gcm` or `ChaCha20Poly1305`), `threads` (0 to 256, 0 meaning one
-per core), `hash`, and `preserve` are optional with the defaults shown.
-`preserve` must name all three flags when given.
+per core), `hash`, `preserve`, and `follow_symlinks` are optional with the
+defaults shown. `preserve` must name all three flags when given.
+`follow_symlinks: false` is `send --no-follow-symlinks`: links, in `paths`
+or under them, are skipped instead of sent as what they point to.
 `addr` may be a host name; it is resolved when the transfer starts. Every
 path must exist. Returns the new Transfer.
 

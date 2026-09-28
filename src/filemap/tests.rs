@@ -2,6 +2,11 @@ use std::fs;
 
 use super::*;
 
+/// Shadows [`super::capture`] with the sender's default, links followed.
+fn capture(roots: &[PathBuf], preserve: Preserve) -> Result<Captured> {
+    super::capture(roots, preserve, true)
+}
+
 fn wp(parts: &[&str]) -> WirePath {
     WirePath::parse(parts.iter().copied()).unwrap()
 }
@@ -201,21 +206,243 @@ fn file_time_handles_times_before_the_epoch() {
     assert_eq!(unix_nanos(before), Some(-100));
 }
 
+/// Makes the links, or returns false where this system cannot.
+fn made_links(links: &[(&Path, &Path, bool)]) -> bool {
+    for &(target, link, dir) in links {
+        let made = if dir {
+            link_dir(target, link)
+        } else {
+            link_file(target, link)
+        };
+        if let Err(e) = made {
+            eprintln!("skipping: cannot create a symlink here: {e}");
+            return false;
+        }
+    }
+    true
+}
+
+fn skipped(captured: &Captured) -> Vec<(PathBuf, SkipReason)> {
+    captured
+        .skipped
+        .iter()
+        .map(|s| (s.path.clone(), s.reason.clone()))
+        .collect()
+}
+
 #[test]
-fn symlinks_are_skipped() {
+fn not_following_skips_links_and_does_not_descend() {
     let (_tmp, roots) = sample_tree();
-    let link = roots[0].join("link");
+    let (dir_link, file_link) = (roots[0].join("dlink"), roots[0].join("flink"));
+    let a = roots[0].join("a");
+    let top = a.join("top.txt");
+    if !made_links(&[(&a, &dir_link, true), (&top, &file_link, false)]) {
+        return;
+    }
+    let captured = super::capture(&roots, Preserve::default(), false).unwrap();
+    assert_eq!(
+        skipped(&captured),
+        [
+            (dir_link, SkipReason::NotFollowed),
+            (file_link, SkipReason::NotFollowed)
+        ]
+    );
+    assert!(paths(&captured).iter().all(|(p, _)| !p.contains("link")));
+    let shown = captured.skipped[0].reason.to_string();
+    assert_eq!(shown, "symbolic link, not followed");
+}
+
+#[test]
+fn a_followed_file_link_is_its_target() {
+    let (tmp, roots) = sample_tree();
+    let target = tmp.path().join("outside.bin");
+    fs::write(&target, vec![7; 1000]).unwrap();
+    let mtime = FileTime::from_unix_time(1_600_000_000, 0);
+    filetime::set_file_mtime(&target, mtime).unwrap();
     #[cfg(unix)]
-    let made = std::os::unix::fs::symlink(roots[0].join("a"), &link);
-    #[cfg(windows)]
-    let made = std::os::windows::fs::symlink_dir(roots[0].join("a"), &link);
-    if let Err(e) = made {
-        eprintln!("skipping: cannot create a symlink here: {e}");
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o600)).unwrap();
+    }
+    let (one, two) = (roots[0].join("one"), roots[0].join("two"));
+    if !made_links(&[(&target, &one, false), (&target, &two, false)]) {
+        return;
+    }
+    let preserve = Preserve {
+        times: true,
+        ..Preserve::default()
+    };
+    let captured = capture(&roots, preserve).unwrap();
+    assert!(captured.skipped.is_empty());
+    for (name, link) in [("tree/one", &one), ("tree/two", &two)] {
+        let file = captured
+            .files
+            .iter()
+            .find(|f| f.path.display() == name)
+            .unwrap_or_else(|| panic!("{name} not sent"));
+        assert_eq!((&file.source, file.size), (link, 1000));
+        assert_eq!(file.mtime, 1_600_000_000 * 1_000_000_000);
+        let entry = captured.map.entries.iter().find(|e| e.path == file.path);
+        let entry = entry.unwrap();
+        assert_eq!(entry.mtime, Some(1_600_000_000 * 1_000_000_000));
+        #[cfg(unix)]
+        assert_eq!(entry.mode, Some(0o600));
+    }
+}
+
+#[test]
+fn a_followed_dir_link_is_walked_like_a_dir() {
+    let (tmp, roots) = sample_tree();
+    let target = tmp.path().join("elsewhere");
+    fs::create_dir_all(target.join("void")).unwrap();
+    fs::write(target.join("f.txt"), b"f").unwrap();
+    if !made_links(&[(&target, &roots[0].join("link"), true)]) {
         return;
     }
     let captured = capture(&roots, Preserve::default()).unwrap();
-    assert_eq!(captured.skipped, [link]);
-    assert!(paths(&captured).iter().all(|(p, _)| !p.contains("link")));
+    assert!(captured.skipped.is_empty());
+    let under_link: Vec<_> = paths(&captured)
+        .into_iter()
+        .filter(|(p, _)| p.starts_with("tree/link"))
+        .map(|(p, kind)| (p, kind == EntryKind::Dir))
+        .collect();
+    assert_eq!(
+        under_link,
+        [
+            ("tree/link".to_string(), true),
+            ("tree/link/f.txt".to_string(), false),
+            ("tree/link/void".to_string(), true),
+        ]
+    );
+}
+
+#[test]
+fn an_empty_dir_behind_a_link_is_recreated() {
+    let (tmp, roots) = sample_tree();
+    let target = tmp.path().join("hollow");
+    fs::create_dir(&target).unwrap();
+    if !made_links(&[(&target, &roots[0].join("link"), true)]) {
+        return;
+    }
+    let captured = capture(&roots, Preserve::default()).unwrap();
+    let out = tmp.path().join("out");
+    fs::create_dir(&out).unwrap();
+    deliver(&captured, &out);
+    assert!(apply(&captured.map, &out, ApplyPolicy::default()).is_empty());
+    let made = fs::symlink_metadata(out.join("tree/link")).unwrap();
+    assert!(made.is_dir(), "{made:?}");
+}
+
+#[test]
+fn symlinked_roots_are_followed_or_skipped_like_any_link() {
+    let (tmp, roots) = sample_tree();
+    let (dir_root, file_root) = (tmp.path().join("rootlink"), tmp.path().join("filelink"));
+    if !made_links(&[(&roots[0], &dir_root, true), (&roots[1], &file_root, false)]) {
+        return;
+    }
+    let linked_roots = [dir_root.clone(), file_root.clone()];
+    let direct = paths(&capture(&roots, Preserve::default()).unwrap());
+    let under_link_names: Vec<_> = direct
+        .iter()
+        .map(|(p, kind)| {
+            let p = p.replacen("tree", "rootlink", 1);
+            (p.replace("single.bin", "filelink"), *kind)
+        })
+        .collect();
+    let followed = capture(&linked_roots, Preserve::default()).unwrap();
+    assert_eq!(paths(&followed), under_link_names);
+    assert!(followed.skipped.is_empty());
+
+    let unfollowed = super::capture(&linked_roots, Preserve::default(), false).unwrap();
+    assert!(unfollowed.files.is_empty() && unfollowed.map.entries.is_empty());
+    assert_eq!(
+        skipped(&unfollowed),
+        [
+            (dir_root, SkipReason::NotFollowed),
+            (file_root, SkipReason::NotFollowed)
+        ]
+    );
+}
+
+#[test]
+fn two_root_links_to_one_target_are_both_sent() {
+    let (tmp, roots) = sample_tree();
+    let (one, two) = (tmp.path().join("one"), tmp.path().join("two"));
+    if !made_links(&[(&roots[0], &one, true), (&roots[0], &two, true)]) {
+        return;
+    }
+    let captured = capture(&[one, two], Preserve::default()).unwrap();
+    let files: Vec<_> = captured.files.iter().map(|f| f.path.display()).collect();
+    assert_eq!(
+        files,
+        [
+            "one/a/b/c/deep.txt",
+            "one/a/top.txt",
+            "two/a/b/c/deep.txt",
+            "two/a/top.txt"
+        ]
+    );
+    let files = captured.files.iter().map(|f| f.path.clone()).collect();
+    let dirs = captured
+        .map
+        .entries
+        .iter()
+        .filter(|e| e.kind == EntryKind::Dir)
+        .map(|e| e.path.clone())
+        .collect();
+    captured.map.check(&offer(files, dirs)).unwrap();
+}
+
+#[test]
+fn a_link_back_to_an_ancestor_is_a_skipped_loop() {
+    let (_tmp, roots) = sample_tree();
+    let back = roots[0].join("a/b/back");
+    if !made_links(&[(&roots[0], &back, true)]) {
+        return;
+    }
+    let captured = capture(&roots, Preserve::default()).unwrap();
+    let ancestor = Some(roots[0].clone());
+    assert_eq!(skipped(&captured), [(back, SkipReason::Loop { ancestor })]);
+    assert!(paths(&captured).iter().all(|(p, _)| !p.contains("back")));
+    let shown = captured.skipped[0].reason.to_string();
+    assert!(shown.starts_with("symlink loop"), "{shown}");
+}
+
+#[test]
+fn a_chain_of_links_to_itself_is_a_skipped_loop() {
+    let (_tmp, roots) = sample_tree();
+    let (x, y) = (roots[0].join("x"), roots[0].join("y"));
+    if !made_links(&[(&y, &x, false), (&x, &y, false)]) {
+        return;
+    }
+    let captured = capture(&roots, Preserve::default()).unwrap();
+    let looped = SkipReason::Loop { ancestor: None };
+    assert_eq!(skipped(&captured), [(x, looped.clone()), (y, looped)]);
+}
+
+#[test]
+fn a_dangling_link_is_skipped() {
+    let (tmp, roots) = sample_tree();
+    let gone = roots[0].join("gone");
+    if !made_links(&[(&tmp.path().join("nothing"), &gone, false)]) {
+        return;
+    }
+    let captured = capture(&roots, Preserve::default()).unwrap();
+    assert_eq!(skipped(&captured), [(gone, SkipReason::Dangling)]);
+}
+
+#[cfg(unix)]
+#[test]
+fn a_link_to_a_fifo_is_skipped() {
+    use std::os::unix::ffi::OsStrExt;
+    let (tmp, roots) = sample_tree();
+    let fifo = tmp.path().join("fifo");
+    let name = std::ffi::CString::new(fifo.as_os_str().as_bytes()).unwrap();
+    assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+    let link = roots[0].join("pipe");
+    link_file(&fifo, &link).unwrap();
+    let captured = capture(&roots, Preserve::default()).unwrap();
+    assert_eq!(skipped(&captured), [(link, SkipReason::NotRegular)]);
 }
 
 #[test]

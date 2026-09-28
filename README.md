@@ -118,6 +118,7 @@ as `incoming/photos/...`.
 | `--threads N` | `0` (one per core) | workers that read and encrypt chunks, at most 1024 |
 | `--hash` | off | after delivery, re-read every file and have the receiver compare chunk digests; mismatched chunks are sent again |
 | `--preserve LIST` | `perms` | metadata to copy: `none`, or any of `perms`, `times`, `owner` |
+| `--no-follow-symlinks` | off (links followed) | skip symbolic links, including ones given as paths, instead of sending what they point to |
 
 `mjolnir serve [--listen 127.0.0.1:7878] [--key PATH] [--no-open]` starts a
 local web UI; see [docs/WEB.md](docs/WEB.md).
@@ -201,8 +202,14 @@ not receive into a directory that other users can write to.
   there until you delete it. A transfer interrupted while its files were
   being renamed into place, or whose final `Finished` was lost, resumes
   without `--force`.
-- Only regular files and directories are sent. Symbolic links and special
-  files are skipped with a warning. File names travel as raw bytes, so a
+- Only regular files and directories are sent. Symbolic links are followed
+  by default and arrive as the files and directories they point to, even
+  when the target is outside the sent folder, so check what a tree links to
+  before sending it. Two links to one target send it twice. Special files,
+  dangling links, and link loops are skipped with a warning, and so is
+  every link with `--no-follow-symlinks`, including a link given as a path.
+  A followed link given as a path arrives under the link's own name. File
+  names travel as raw bytes, so a
   name that the receiver's file system cannot store (a `:` or a trailing
   `.` on Windows, invalid UTF-8 on macOS) is stored with the affected
   characters escaped as U+F000 plus the byte, the Cygwin and WSL

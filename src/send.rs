@@ -53,6 +53,9 @@ pub struct SendConfig {
     pub hash: bool,
     /// Metadata to put in the file map (`send --preserve`).
     pub preserve: Preserve,
+    /// Send what links, in `paths` or under them, point to, instead of
+    /// skipping them (on unless `send --no-follow-symlinks`).
+    pub follow_symlinks: bool,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -74,7 +77,7 @@ pub struct SendReport {
     pub file_hashes: Vec<(String, String)>,
     /// Metadata the receiver could not apply, and skipped sources.
     pub warnings: Vec<String>,
-    /// Symbolic links and special files that were not sent.
+    /// Links and special files that were not sent; `warnings` says why.
     pub skipped: Vec<String>,
     pub phase_times: PhaseTimes,
     pub elapsed: Duration,
@@ -247,7 +250,7 @@ fn run(cfg: &SendConfig, progress: &Progress) -> Result<SendReport> {
     );
     check_threads(cfg.threads)?;
     let chunk_size = ChunkSize::new(cfg.chunk_size)?;
-    let captured = filemap::capture(&cfg.paths, cfg.preserve)?;
+    let captured = filemap::capture(&cfg.paths, cfg.preserve, cfg.follow_symlinks)?;
     let paths: Vec<PathBuf> = captured.files.iter().map(|f| f.source.clone()).collect();
     let memory: Vec<Vec<u8>> = if crate::benchmode::get().memory_source {
         paths.iter().map(fs::read).collect::<std::io::Result<_>>()?
@@ -272,17 +275,25 @@ fn run(cfg: &SendConfig, progress: &Progress) -> Result<SendReport> {
         .collect();
     let manifest = Manifest::new(chunk_size, entries, dirs)?;
     let files = Sources::new(paths.clone(), manifest.files.clone());
+    let skip_warnings: Vec<String> = captured
+        .skipped
+        .iter()
+        .map(|s| {
+            format!(
+                "skipped {}: {}",
+                crate::printable::escape(&s.path.display().to_string()),
+                s.reason
+            )
+        })
+        .collect();
+    for w in &skip_warnings {
+        eprintln!("mjolnir: {w}");
+    }
     let skipped: Vec<String> = captured
         .skipped
         .iter()
-        .map(|p| p.display().to_string())
+        .map(|s| s.path.display().to_string())
         .collect();
-    for p in &skipped {
-        eprintln!(
-            "mjolnir: skipping {}: not a regular file or directory",
-            crate::printable::escape(p)
-        );
-    }
 
     let addrs = net::resolve(&cfg.addr)?;
     let cancelled = || progress.is_cancelled();
@@ -334,7 +345,7 @@ fn run(cfg: &SendConfig, progress: &Progress) -> Result<SendReport> {
     }
     let done = result?;
     let mut warnings = done.warnings;
-    warnings.extend(skipped.iter().map(|p| format!("skipped {p}")));
+    warnings.extend(skip_warnings);
     Ok(SendReport {
         files: manifest.files.len(),
         bytes_sent: ctx.bytes_sent.load(Relaxed),
