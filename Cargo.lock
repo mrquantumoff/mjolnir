@@ -21,6 +21,7 @@ dependencies = [
  "cfg-if",
  "cipher",
  "cpufeatures 0.2.17",
+ "zeroize",
 ]
 
 [[package]]
@@ -35,6 +36,7 @@ dependencies = [
  "ctr",
  "ghash",
  "subtle",
+ "zeroize",
 ]
 
 [[package]]
@@ -565,10 +567,12 @@ checksum = "cf8baf1c55e62ffcace7a9f06f4bd9cd3f0c4beb022d3b367256b91b87513d98"
 name = "mjolnir"
 version = "0.1.0"
 dependencies = [
+ "aes",
  "aes-gcm",
  "anyhow",
  "base64",
  "blake3",
+ "chacha20",
  "chacha20poly1305",
  "clap",
  "curve25519-dalek",
@@ -577,6 +581,8 @@ dependencies = [
  "hkdf",
  "hmac",
  "libc",
+ "poly1305",
+ "polyval",
  "postcard",
  "serde",
  "serde_bytes",
@@ -589,6 +595,7 @@ dependencies = [
  "unicode-normalization",
  "walkdir",
  "windows-sys 0.61.2",
+ "zeroize",
 ]
 
 [[package]]
@@ -618,6 +625,7 @@ dependencies = [
  "cpufeatures 0.2.17",
  "opaque-debug",
  "universal-hash",
+ "zeroize",
 ]
 
 [[package]]
@@ -630,6 +638,7 @@ dependencies = [
  "cpufeatures 0.2.17",
  "opaque-debug",
  "universal-hash",
+ "zeroize",
 ]
 
 [[package]]

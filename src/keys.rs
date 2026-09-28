@@ -11,30 +11,47 @@ use base64::Engine;
 use base64::engine::general_purpose::STANDARD as B64;
 use curve25519_dalek::montgomery::MontgomeryPoint;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use zeroize::{Zeroize, Zeroizing};
 
 mod private_file;
+
+/// A key file is one line of base64; anything past this is not a key.
+const KEY_FILE_MAX: usize = 1024;
 
 /// An X25519 public key. Text form is standard base64 of the 32 raw bytes.
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub struct PublicKey(pub [u8; 32]);
 
-/// An X25519 private key. `Debug` never prints the bytes.
+/// An X25519 private key. `Debug` never prints the bytes, and each copy
+/// zeroes them when dropped.
 #[derive(Clone)]
 pub struct PrivateKey([u8; 32]);
 
-fn decode_key(text: &str) -> Result<[u8; 32]> {
-    let bytes = B64
-        .decode(text.trim())
-        .map_err(|e| anyhow!("invalid base64 key: {e}"))?;
-    bytes
-        .try_into()
-        .map_err(|b: Vec<u8>| anyhow!("key must be 32 bytes, got {}", b.len()))
+impl Drop for PrivateKey {
+    fn drop(&mut self) {
+        self.0.zeroize();
+    }
+}
+
+/// Decodes into buffers that are zeroed afterwards, since the text may be
+/// a private key.
+fn decode_key(text: &str) -> Result<Zeroizing<[u8; 32]>> {
+    let bytes = Zeroizing::new(
+        B64.decode(text.trim())
+            .map_err(|e| anyhow!("invalid base64 key: {e}"))?,
+    );
+    if bytes.len() != 32 {
+        bail!("key must be 32 bytes, got {}", bytes.len());
+    }
+    let mut key = Zeroizing::new([0u8; 32]);
+    key.copy_from_slice(&bytes);
+    Ok(key)
 }
 
 impl FromStr for PublicKey {
     type Err = anyhow::Error;
     fn from_str(s: &str) -> Result<Self> {
-        decode_key(s).map(PublicKey)
+        decode_key(s).map(|k| PublicKey(*k))
     }
 }
 
@@ -71,9 +88,9 @@ impl fmt::Debug for PrivateKey {
 
 impl PrivateKey {
     pub fn generate() -> Self {
-        let mut bytes = [0u8; 32];
-        getrandom::fill(&mut bytes).expect("OS random number generator failed");
-        PrivateKey(bytes)
+        let mut key = PrivateKey([0u8; 32]);
+        getrandom::fill(&mut key.0).expect("OS random number generator failed");
+        key
     }
 
     pub fn public_key(&self) -> PublicKey {
@@ -86,7 +103,7 @@ impl PrivateKey {
 
     /// Parses the key-file text form (base64, surrounding whitespace ignored).
     pub fn from_base64(text: &str) -> Result<Self> {
-        decode_key(text).map(PrivateKey)
+        decode_key(text).map(|k| PrivateKey(*k))
     }
 
     /// Reads a key file, refusing one that other accounts can read or
@@ -94,10 +111,13 @@ impl PrivateKey {
     /// anyone but this user, SYSTEM, and Administrators on Windows.
     pub fn load(path: &Path) -> Result<Self> {
         let reading = || format!("reading private key {}", path.display());
-        let mut file = File::open(path).with_context(reading)?;
+        let file = File::open(path).with_context(reading)?;
         private_file::check(&file, path)?;
-        let mut text = String::new();
-        file.read_to_string(&mut text).with_context(reading)?;
+        // Sized up front so reading never reallocates and leaves a copy behind.
+        let mut text = Zeroizing::new(String::with_capacity(KEY_FILE_MAX + 1));
+        file.take(KEY_FILE_MAX as u64)
+            .read_to_string(&mut text)
+            .with_context(reading)?;
         Self::from_base64(&text).with_context(|| format!("parsing private key {}", path.display()))
     }
 
@@ -108,7 +128,8 @@ impl PrivateKey {
     pub fn save(&self, path: &Path) -> Result<()> {
         let mut file = private_file::create(path)
             .with_context(|| format!("creating key file {}", path.display()))?;
-        writeln!(file, "{}", B64.encode(self.0))?;
+        let text = Zeroizing::new(B64.encode(self.0.as_slice()));
+        writeln!(file, "{}", text.as_str())?;
         file.sync_all()?;
         Ok(())
     }
@@ -231,6 +252,15 @@ mod tests {
         let short = B64.encode([1u8; 16]);
         let err = format!("{:#}", parse_authorized_keys(&short).unwrap_err());
         assert!(err.contains("line 1") && err.contains("32 bytes"), "{err}");
+    }
+
+    #[test]
+    fn private_key_is_zeroed_on_drop() {
+        let mut slot = std::mem::MaybeUninit::new(PrivateKey::generate());
+        assert_ne!(unsafe { slot.assume_init_ref() }.0, [0u8; 32]);
+        unsafe { slot.assume_init_drop() };
+        let left: [u8; 32] = unsafe { std::ptr::read(slot.as_ptr().cast()) };
+        assert_eq!(left, [0u8; 32]);
     }
 
     #[test]

@@ -11,6 +11,7 @@ use hkdf::Hkdf;
 use hmac::{Hmac, Mac};
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
+use zeroize::{Zeroize, Zeroizing};
 
 use crate::keys::{PrivateKey, PublicKey};
 
@@ -152,45 +153,61 @@ impl CipherState {
     }
 }
 
-/// Everything both peers derive from `master` and the handshake hash.
+/// Everything both peers derive from `master` and the handshake hash. The
+/// keys are zeroed when it is dropped.
 pub struct SessionKeys {
     pub ctrl_s2r: [u8; 32],
     pub ctrl_r2s: [u8; 32],
     pub hello: [u8; 32],
     pub session_id: [u8; 16],
-    prk: Hkdf<Sha256>,
+    /// HKDF-Extract output, kept as bytes so it can be zeroed.
+    prk: [u8; 32],
+}
+
+impl Drop for SessionKeys {
+    fn drop(&mut self) {
+        self.ctrl_s2r.zeroize();
+        self.ctrl_r2s.zeroize();
+        self.hello.zeroize();
+        self.prk.zeroize();
+    }
 }
 
 impl SessionKeys {
     pub fn derive(handshake_hash: &[u8], master: &[u8; 32]) -> Self {
-        let prk = Hkdf::<Sha256>::new(Some(handshake_hash), master);
-        let expand = |info: &[u8]| {
-            let mut okm = [0u8; 32];
-            prk.expand(info, &mut okm)
-                .expect("32 bytes is a valid HKDF length");
-            okm
+        let (mut prk, _) = Hkdf::<Sha256>::extract(Some(handshake_hash), master);
+        let mut keys = SessionKeys {
+            ctrl_s2r: [0; 32],
+            ctrl_r2s: [0; 32],
+            hello: [0; 32],
+            session_id: [0; 16],
+            prk: prk.into(),
         };
-        let sid = expand(b"session id");
-        SessionKeys {
-            ctrl_s2r: expand(b"ctrl s2r"),
-            ctrl_r2s: expand(b"ctrl r2s"),
-            hello: expand(b"hello"),
-            session_id: sid[..16].try_into().unwrap(),
-            prk,
-        }
+        prk.as_mut_slice().zeroize();
+        keys.ctrl_s2r = *keys.okm(b"ctrl s2r");
+        keys.ctrl_r2s = *keys.okm(b"ctrl r2s");
+        keys.hello = *keys.okm(b"hello");
+        let sid = keys.okm(b"session id");
+        keys.session_id.copy_from_slice(&sid[..16]);
+        keys
+    }
+
+    fn okm(&self, info: &[u8]) -> Zeroizing<[u8; 32]> {
+        let mut okm = Zeroizing::new([0u8; 32]);
+        Hkdf::<Sha256>::from_prk(&self.prk)
+            .expect("the PRK is one hash long")
+            .expand(info, &mut *okm)
+            .expect("32 bytes is a valid HKDF length");
+        okm
     }
 
     /// `k_data(round, conn) = E("data" | round u32 | conn u32)`.
-    pub fn data_key(&self, round: u32, conn: u32) -> [u8; 32] {
+    pub fn data_key(&self, round: u32, conn: u32) -> Zeroizing<[u8; 32]> {
         let mut info = [0u8; 12];
         info[..4].copy_from_slice(b"data");
         info[4..8].copy_from_slice(&round.to_be_bytes());
         info[8..].copy_from_slice(&conn.to_be_bytes());
-        let mut okm = [0u8; 32];
-        self.prk
-            .expand(&info, &mut okm)
-            .expect("32 bytes is a valid HKDF length");
-        okm
+        self.okm(&info)
     }
 
     fn hello_hmac(&self, challenge: &[u8; 32], round: u32, conn: u32) -> Hmac<Sha256> {
@@ -251,16 +268,17 @@ pub fn handshake_initiator(
         .remote_public_key(&remote.0)?
         .prologue(PROLOGUE)?
         .build_initiator()?;
-    let mut buf = vec![0u8; NOISE_MAX];
+    // Message 2's payload, the master secret, is decrypted into `buf`.
+    let mut buf = Zeroizing::new(vec![0u8; NOISE_MAX]);
     let n = hs.write_message(&[], &mut buf)?;
     write_noise(stream, &buf[..n]).context("sending Noise message 1")?;
     let msg = read_noise(stream, NOISE_MAX).map_err(|_| anyhow!(REJECTED))?;
     let n = hs
         .read_message(&msg, &mut buf)
         .context("Noise message 2 did not authenticate")?;
-    let master: [u8; 32] = buf[..n]
-        .try_into()
-        .map_err(|_| anyhow!("Noise message 2 payload is {n} bytes, expected 32"))?;
+    ensure!(n == 32, "Noise message 2 payload is {n} bytes, expected 32");
+    let mut master = Zeroizing::new([0u8; 32]);
+    master.copy_from_slice(&buf[..32]);
     Ok(SessionKeys::derive(hs.get_handshake_hash(), &master))
 }
 
@@ -290,9 +308,9 @@ pub fn handshake_responder(
         bail!("sender key {peer} is not authorized");
     }
     ensure!(n == 0, "Noise message 1 payload must be empty");
-    let mut master = [0u8; 32];
-    getrandom::fill(&mut master).map_err(|e| anyhow!("OS random number generator: {e}"))?;
-    let n = hs.write_message(&master, &mut buf)?;
+    let mut master = Zeroizing::new([0u8; 32]);
+    getrandom::fill(&mut *master).map_err(|e| anyhow!("OS random number generator: {e}"))?;
+    let n = hs.write_message(&*master, &mut buf)?;
     write_noise(stream, &buf[..n]).context("sending Noise message 2")?;
     Ok((SessionKeys::derive(hs.get_handshake_hash(), &master), peer))
 }
@@ -364,6 +382,28 @@ mod tests {
                 .to_string()
                 .contains("did not decrypt")
         );
+    }
+
+    /// The schedule must stay `HKDF(salt = handshake hash, ikm = master)`
+    /// expanded per label, or peers on different builds disagree.
+    #[test]
+    fn derive_matches_one_shot_hkdf() {
+        let (hh, master) = ([1u8; 32], [2u8; 32]);
+        let keys = SessionKeys::derive(&hh, &master);
+        let hkdf = Hkdf::<Sha256>::new(Some(&hh), &master);
+        let expand = |info: &[u8]| {
+            let mut okm = [0u8; 32];
+            hkdf.expand(info, &mut okm).unwrap();
+            okm
+        };
+        assert_eq!(keys.ctrl_s2r, expand(b"ctrl s2r"));
+        assert_eq!(keys.ctrl_r2s, expand(b"ctrl r2s"));
+        assert_eq!(keys.hello, expand(b"hello"));
+        assert_eq!(keys.session_id, expand(b"session id")[..16]);
+        let mut info = *b"data\0\0\0\x03\0\0\0\x07";
+        assert_eq!(*keys.data_key(3, 7), expand(&info));
+        info[7] = 4;
+        assert_ne!(*keys.data_key(3, 7), expand(&info));
     }
 
     #[test]
