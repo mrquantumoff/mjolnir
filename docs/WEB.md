@@ -143,7 +143,15 @@ have the shape `{ "error": "message", "field": "name" | null }`, where
 ### `GET /api/transfers`
 
 `{ "transfers": [Transfer, ...] }`, newest first. The 100 most recently
-ended transfers are kept; older ones drop off the list.
+ended transfers are kept; older ones drop off the list. In the list, a
+`report` is a summary: the totals below, with `file_hash_count`,
+`warning_count`, and `skipped_count` in place of the three lists, so a poll
+stays small however many files the finished transfers held.
+
+### `GET /api/transfers/{id}`
+
+One Transfer with its whole `report`, lists included. The UI fetches it
+once when a transfer ends.
 
 ```json
 {

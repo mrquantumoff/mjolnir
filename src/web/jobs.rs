@@ -16,8 +16,19 @@ use crate::{Cancelled, Progress};
 
 pub type JobId = u64;
 
-#[derive(Clone, Serialize)]
+/// A finished transfer's report: fixed-size totals, then lists that grow
+/// with the number of files.
+#[derive(Serialize)]
 pub struct Report {
+    #[serde(flatten)]
+    pub totals: Totals,
+    pub file_hashes: Vec<FileHash>,
+    pub warnings: Vec<String>,
+    pub skipped: Vec<String>,
+}
+
+#[derive(Clone, Copy, Serialize)]
+pub struct Totals {
     pub files: u64,
     pub bytes: u64,
     pub elapsed_ms: u64,
@@ -27,10 +38,29 @@ pub struct Report {
     pub repaired_chunks: u64,
     pub hash_repaired_chunks: u64,
     pub duplicate_chunks: u64,
-    pub file_hashes: Vec<FileHash>,
-    pub warnings: Vec<String>,
-    pub skipped: Vec<String>,
     pub phase_times: PhaseMs,
+}
+
+/// What the transfer list carries of a report: its totals and how long
+/// each list is. The lists come from the transfer's own endpoint.
+#[derive(Serialize)]
+pub struct Summary {
+    #[serde(flatten)]
+    totals: Totals,
+    file_hash_count: usize,
+    warning_count: usize,
+    skipped_count: usize,
+}
+
+impl From<&Report> for Summary {
+    fn from(r: &Report) -> Summary {
+        Summary {
+            totals: r.totals,
+            file_hash_count: r.file_hashes.len(),
+            warning_count: r.warnings.len(),
+            skipped_count: r.skipped.len(),
+        }
+    }
 }
 
 /// Milliseconds per stage, fractional so short phases stay visible.
@@ -68,7 +98,8 @@ pub enum JobState {
 }
 
 pub enum Outcome {
-    Done(Report),
+    /// Shared so a view can take it out of the registry lock cheaply.
+    Done(Arc<Report>),
     Failed(String),
     Cancelled,
 }
@@ -169,7 +200,7 @@ impl Jobs {
             .name(format!("mjolnir-job-{id}"))
             .spawn(move || {
                 let outcome = match catch_unwind(AssertUnwindSafe(|| work(progress))) {
-                    Ok(Ok(report)) => Outcome::Done(report),
+                    Ok(Ok(report)) => Outcome::Done(Arc::new(report)),
                     Ok(Err(e)) if e.downcast_ref() == Some(&Cancelled::Local) => Outcome::Cancelled,
                     Ok(Err(e)) => Outcome::Failed(format!("{e:#}")),
                     Err(panic) => Outcome::Failed(format!(
@@ -266,19 +297,21 @@ mod tests {
 
     fn report() -> Report {
         Report {
-            files: 0,
-            bytes: 0,
-            elapsed_ms: 0,
-            verified: true,
-            hashed: false,
-            chunks_resent: 0,
-            repaired_chunks: 0,
-            hash_repaired_chunks: 0,
-            duplicate_chunks: 0,
+            totals: Totals {
+                files: 0,
+                bytes: 0,
+                elapsed_ms: 0,
+                verified: true,
+                hashed: false,
+                chunks_resent: 0,
+                repaired_chunks: 0,
+                hash_repaired_chunks: 0,
+                duplicate_chunks: 0,
+                phase_times: PhaseTimes::default().into(),
+            },
             file_hashes: Vec::new(),
             warnings: Vec::new(),
             skipped: Vec::new(),
-            phase_times: PhaseTimes::default().into(),
         }
     }
 

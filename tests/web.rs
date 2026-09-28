@@ -404,6 +404,12 @@ fn send_a_directory_end_to_end() {
     assert_eq!(sent["state"], "done", "{sent}");
     let received = wait_until_ended(&ui, recv_id);
     assert_eq!(received["state"], "done", "{received}");
+    let summary = &sent["report"];
+    assert_eq!(summary["file_hash_count"], files.len(), "{summary}");
+    assert_eq!(summary["files"], files.len(), "{summary}");
+    assert!(summary.get("file_hashes").is_none(), "{summary}");
+    let sent = get(&ui, &format!("/api/transfers/{send_id}")).body;
+    let received = get(&ui, &format!("/api/transfers/{recv_id}")).body;
     assert_eq!(received["report"]["files"], files.len());
     assert_eq!(received["report"]["verified"], true);
     assert_eq!(received["report"]["hashed"], true);
