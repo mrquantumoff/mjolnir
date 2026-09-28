@@ -1,15 +1,35 @@
-//! Request admission (token, Host, Origin, body limits), static assets, and
-//! response headers. Everything that reaches `api::route` has passed `admit`.
+//! A strict HTTP/1.1 server for the API, and request admission (token,
+//! Host, Origin, body limits), static assets, and response headers.
+//! Everything that reaches `api::route` has passed `admit`.
+//!
+//! The server is hand-rolled on `std` so that every limit is enforced at
+//! the transport: the request head is capped at `MAX_HEAD` bytes, a body is
+//! read only after the request is admitted and only up to `MAX_BODY`, each
+//! phase has an absolute deadline, and a rejected request is answered and
+//! closed without draining the body its `Content-Length` announced. One
+//! request per connection: every response carries `Connection: close`.
 
-use std::io::Read;
-use std::net::{IpAddr, SocketAddr};
+use std::io::{self, ErrorKind, Read, Write};
+use std::net::{IpAddr, Shutdown, SocketAddr, TcpStream};
+use std::time::{Duration, Instant};
 
 use serde_json::Value;
-use tiny_http::{Header, Method, Request, Response};
 
 use super::api::{self, ApiError, App, Reply};
 
 pub const MAX_BODY: usize = 1024 * 1024;
+/// Request line plus headers, CRLFs included.
+const MAX_HEAD: usize = 16 * 1024;
+/// The whole head must arrive within this, however slowly it trickles.
+const HEAD_DEADLINE: Duration = Duration::from_secs(10);
+/// An admitted body must arrive within this.
+const BODY_DEADLINE: Duration = Duration::from_secs(30);
+const WRITE_TIMEOUT: Duration = Duration::from_secs(10);
+/// After the response, unread request bytes are discarded for at most this
+/// long and this many bytes, so a client still sending its body sees the
+/// response instead of a reset.
+const LINGER: Duration = Duration::from_millis(500);
+const LINGER_BYTES: usize = 2 * MAX_BODY;
 
 const CSP: &str = "default-src 'self'; connect-src 'self'; img-src 'self' data:; \
     style-src 'self'; script-src 'self'; base-uri 'none'; form-action 'none'; \
@@ -32,6 +52,56 @@ const ASSETS: &[(&str, &str, &str)] = &[
         include_str!("assets/app.css"),
     ),
 ];
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Method {
+    Get,
+    Head,
+    Post,
+    Delete,
+    Other,
+}
+
+impl Method {
+    fn parse(s: &str) -> Method {
+        match s {
+            "GET" => Method::Get,
+            "HEAD" => Method::Head,
+            "POST" => Method::Post,
+            "DELETE" => Method::Delete,
+            _ => Method::Other,
+        }
+    }
+}
+
+/// A parsed request head. The body is read later, by [`Request::body`],
+/// and only when the request has been admitted.
+struct Request {
+    method: Method,
+    url: String,
+    headers: Vec<(String, String)>,
+    /// Bytes read past the head, the start of the body.
+    buffered: Vec<u8>,
+    /// `Content-Length`, already checked to be a number.
+    content_length: u64,
+}
+
+impl Request {
+    fn header(&self, name: &str) -> Option<&str> {
+        self.headers
+            .iter()
+            .find(|(n, _)| n.eq_ignore_ascii_case(name))
+            .map(|(_, v)| v.as_str())
+    }
+}
+
+/// Why a request could not be read; each maps to a status.
+enum ReadError {
+    Io(io::Error),
+    Malformed(&'static str),
+    HeadTooLarge,
+    BodyTooLarge,
+}
 
 /// Who may talk to the server: the per-run token, and the Host values that
 /// name this server (anything else is a DNS-rebinding attempt).
@@ -79,41 +149,249 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     a.len() == b.len() && a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
 }
 
-fn header<'r>(req: &'r Request, name: &'static str) -> Option<&'r str> {
-    req.headers()
+/// Serves one request on `stream`, then closes it.
+pub fn serve(guard: &Guard, app: &App, mut stream: TcpStream) {
+    let _ = stream.set_nodelay(true);
+    let _ = stream.set_write_timeout(Some(WRITE_TIMEOUT));
+    let started = Instant::now();
+    let (reply, unread, head_only) = match read_head(&mut stream, started + HEAD_DEADLINE) {
+        Ok(mut req) => {
+            let reply = admit_and_route(guard, app, &mut stream, &mut req);
+            let unread = req.content_length.saturating_sub(req.buffered.len() as u64);
+            (reply, unread, req.method == Method::Head)
+        }
+        Err(e) => (Err(status_of(e)), 0, false),
+    };
+    let (head, body) = render(reply);
+    let written = stream.write_all(&head).and_then(|()| {
+        if head_only {
+            Ok(())
+        } else {
+            stream.write_all(&body)
+        }
+    });
+    if written.is_err() {
+        return;
+    }
+    let _ = stream.shutdown(Shutdown::Write);
+    if unread > 0 {
+        linger(&mut stream);
+    }
+}
+
+fn status_of(e: ReadError) -> ApiError {
+    match e {
+        ReadError::Io(e) => ApiError::new(400, None, format!("reading the request: {e}")),
+        ReadError::Malformed(what) => {
+            ApiError::new(400, None, format!("malformed request: {what}"))
+        }
+        ReadError::HeadTooLarge => ApiError::new(431, None, "request head exceeds 16 KiB"),
+        ReadError::BodyTooLarge => too_large(),
+    }
+}
+
+/// Reads and discards what the client is still sending, briefly and up to
+/// `LINGER_BYTES`, then drops the socket.
+fn linger(stream: &mut TcpStream) {
+    let deadline = Instant::now() + LINGER;
+    let mut scratch = [0u8; 8192];
+    let mut total = 0;
+    while total < LINGER_BYTES {
+        let Some(left) = deadline.checked_duration_since(Instant::now()) else {
+            return;
+        };
+        if left.is_zero() || stream.set_read_timeout(Some(left)).is_err() {
+            return;
+        }
+        match stream.read(&mut scratch) {
+            Ok(0) | Err(_) => return,
+            Ok(n) => total += n,
+        }
+    }
+}
+
+/// Reads until the blank line that ends the head, never past `MAX_HEAD`
+/// bytes and never past `deadline`.
+fn read_head(stream: &mut TcpStream, deadline: Instant) -> Result<Request, ReadError> {
+    let mut buf = Vec::with_capacity(1024);
+    let mut chunk = [0u8; 1024];
+    let end = loop {
+        if let Some(end) = find_head_end(&buf) {
+            break end;
+        }
+        // One byte past the limit is read, so a head of exactly MAX_HEAD
+        // bytes is still accepted, and anything longer is refused.
+        let want = chunk.len().min(MAX_HEAD + 1 - buf.len());
+        if want == 0 {
+            return Err(ReadError::HeadTooLarge);
+        }
+        let n = read_before(stream, &mut chunk[..want], deadline)?;
+        if n == 0 {
+            return Err(ReadError::Malformed(
+                "connection closed before the head ended",
+            ));
+        }
+        buf.extend_from_slice(&chunk[..n]);
+    };
+    let rest = buf.split_off(end + 4);
+    buf.truncate(end);
+    let head = std::str::from_utf8(&buf).map_err(|_| ReadError::Malformed("non-ASCII head"))?;
+    if !head.is_ascii() {
+        return Err(ReadError::Malformed("non-ASCII head"));
+    }
+    let mut lines = head.split("\r\n");
+    let request_line = lines.next().unwrap_or("");
+    let mut parts = request_line.split(' ');
+    let (Some(method), Some(url), Some(version), None) =
+        (parts.next(), parts.next(), parts.next(), parts.next())
+    else {
+        return Err(ReadError::Malformed("request line"));
+    };
+    if !matches!(version, "HTTP/1.1" | "HTTP/1.0") {
+        return Err(ReadError::Malformed("HTTP version"));
+    }
+    if !url.starts_with('/') || url.contains(|c: char| c.is_ascii_control() || c == ' ') {
+        return Err(ReadError::Malformed("request target"));
+    }
+    let mut headers = Vec::new();
+    for line in lines {
+        if line.contains('\r') || line.contains('\n') {
+            return Err(ReadError::Malformed("bare CR in a header line"));
+        }
+        let Some((name, value)) = line.split_once(':') else {
+            return Err(ReadError::Malformed("header line"));
+        };
+        if name.is_empty() || !name.bytes().all(is_token_byte) {
+            return Err(ReadError::Malformed("header name"));
+        }
+        headers.push((name.to_string(), value.trim().to_string()));
+    }
+    let content_length = content_length(&headers)?.unwrap_or_default();
+    if headers
         .iter()
-        .find(|h| h.field.equiv(name))
-        .map(|h| h.value.as_str())
+        .any(|(n, _)| n.eq_ignore_ascii_case("Transfer-Encoding"))
+    {
+        return Err(ReadError::Malformed("Transfer-Encoding is not supported"));
+    }
+    Ok(Request {
+        method: Method::parse(method),
+        url: url.to_string(),
+        headers,
+        buffered: rest,
+        content_length,
+    })
 }
 
-pub fn handle(guard: &Guard, app: &App, mut req: Request) {
-    let reply = admit_and_route(guard, app, &mut req);
-    let _ = req.respond(render(reply));
+fn is_token_byte(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&b)
 }
 
-fn admit_and_route(guard: &Guard, app: &App, req: &mut Request) -> Result<Reply, ApiError> {
-    let host = header(req, "Host").unwrap_or("");
-    if !guard.host_allowed(host) {
+/// One `Content-Length`, a plain decimal; two that disagree, or one that
+/// is not a number, are request smuggling shapes and are rejected.
+fn content_length(headers: &[(String, String)]) -> Result<Option<u64>, ReadError> {
+    let mut found = None;
+    for (_, value) in headers
+        .iter()
+        .filter(|(n, _)| n.eq_ignore_ascii_case("Content-Length"))
+    {
+        let n = value
+            .parse::<u64>()
+            .ok()
+            .filter(|_| value.bytes().all(|b| b.is_ascii_digit()))
+            .ok_or(ReadError::Malformed("Content-Length"))?;
+        if found.is_some_and(|f| f != n) {
+            return Err(ReadError::Malformed("conflicting Content-Length"));
+        }
+        found = Some(n);
+    }
+    Ok(found)
+}
+
+fn find_head_end(buf: &[u8]) -> Option<usize> {
+    buf.windows(4).position(|w| w == b"\r\n\r\n")
+}
+
+/// One read that gives up at `deadline`.
+fn read_before(
+    stream: &mut TcpStream,
+    buf: &mut [u8],
+    deadline: Instant,
+) -> Result<usize, ReadError> {
+    let left = deadline
+        .checked_duration_since(Instant::now())
+        .filter(|d| !d.is_zero())
+        .ok_or_else(|| ReadError::Io(io::Error::new(ErrorKind::TimedOut, "deadline passed")))?;
+    stream.set_read_timeout(Some(left)).map_err(ReadError::Io)?;
+    loop {
+        match stream.read(buf) {
+            Err(e) if e.kind() == ErrorKind::Interrupted => continue,
+            Err(e) if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {
+                return Err(ReadError::Io(io::Error::new(
+                    ErrorKind::TimedOut,
+                    "deadline passed",
+                )));
+            }
+            other => return other.map_err(ReadError::Io),
+        }
+    }
+}
+
+/// Reads the admitted body: exactly `Content-Length` bytes, at most
+/// `MAX_BODY`, within `BODY_DEADLINE`. Nothing is read for a body over the
+/// limit.
+fn read_body(stream: &mut TcpStream, req: &mut Request) -> Result<Vec<u8>, ReadError> {
+    if req.content_length > MAX_BODY as u64 {
+        return Err(ReadError::BodyTooLarge);
+    }
+    let len = req.content_length as usize;
+    let mut body = std::mem::take(&mut req.buffered);
+    if body.len() > len {
+        return Err(ReadError::Malformed("bytes past the body"));
+    }
+    let deadline = Instant::now() + BODY_DEADLINE;
+    let mut chunk = [0u8; 8192];
+    while body.len() < len {
+        let want = (len - body.len()).min(chunk.len());
+        let n = read_before(stream, &mut chunk[..want], deadline)?;
+        if n == 0 {
+            return Err(ReadError::Malformed("connection closed mid-body"));
+        }
+        body.extend_from_slice(&chunk[..n]);
+    }
+    // The body has been consumed; `serve` must not linger on it.
+    req.content_length = 0;
+    Ok(body)
+}
+
+fn admit_and_route(
+    guard: &Guard,
+    app: &App,
+    stream: &mut TcpStream,
+    req: &mut Request,
+) -> Result<Reply, ApiError> {
+    let host = req.header("Host").unwrap_or("").to_string();
+    if !guard.host_allowed(&host) {
         return Err(ApiError::new(403, None, "unrecognized Host header"));
     }
-    let (path, query) = split_url(req.url());
-    let method = req.method().clone();
+    let (path, query) = split_url(&req.url);
+    let method = req.method;
 
     if !path.starts_with("/api/") {
-        return match (&method, ASSETS.iter().find(|(p, _, _)| *p == path)) {
+        return match (method, ASSETS.iter().find(|(p, _, _)| *p == path)) {
             (Method::Get | Method::Head, Some(&(_, mime, body))) => Ok(Reply::Asset { mime, body }),
             _ => Err(ApiError::not_found()),
         };
     }
 
-    if !guard.token_ok(header(req, "Authorization")) {
+    if !guard.token_ok(req.header("Authorization")) {
         return Err(ApiError::new(401, None, "missing or wrong access token"));
     }
 
     let body = if method == Method::Get {
         Value::Null
     } else {
-        let json = header(req, "Content-Type")
+        let json = req
+            .header("Content-Type")
             .is_some_and(|ct| ct.split(';').next().unwrap_or("").trim() == "application/json");
         if !json {
             return Err(ApiError::new(
@@ -122,31 +400,24 @@ fn admit_and_route(guard: &Guard, app: &App, req: &mut Request) -> Result<Reply,
                 "Content-Type must be application/json",
             ));
         }
-        if header(req, "Origin").is_some_and(|o| o != format!("http://{host}")) {
+        if req
+            .header("Origin")
+            .is_some_and(|o| o != format!("http://{host}"))
+        {
             return Err(ApiError::new(403, None, "cross-origin request rejected"));
         }
-        read_json(req)?
+        let bytes = read_body(stream, req).map_err(status_of)?;
+        parse_json(&bytes)?
     };
 
-    api::route(app, &method, &path, &query, body)
+    api::route(app, method, &path, &query, body)
 }
 
-fn read_json(req: &mut Request) -> Result<Value, ApiError> {
-    if req.body_length().is_some_and(|n| n > MAX_BODY) {
-        return Err(too_large());
-    }
-    let mut buf = Vec::new();
-    req.as_reader()
-        .take(MAX_BODY as u64 + 1)
-        .read_to_end(&mut buf)
-        .map_err(|e| ApiError::new(400, None, format!("reading body: {e}")))?;
-    if buf.len() > MAX_BODY {
-        return Err(too_large());
-    }
+fn parse_json(buf: &[u8]) -> Result<Value, ApiError> {
     if buf.iter().all(u8::is_ascii_whitespace) {
         return Ok(Value::Null);
     }
-    serde_json::from_slice(&buf).map_err(|e| ApiError::new(400, None, format!("invalid JSON: {e}")))
+    serde_json::from_slice(buf).map_err(|e| ApiError::new(400, None, format!("invalid JSON: {e}")))
 }
 
 fn too_large() -> ApiError {
@@ -191,7 +462,24 @@ fn percent_decode(s: &str) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
-fn render(reply: Result<Reply, ApiError>) -> Response<std::io::Cursor<Vec<u8>>> {
+fn reason(status: u16) -> &'static str {
+    match status {
+        200 => "OK",
+        204 => "No Content",
+        400 => "Bad Request",
+        401 => "Unauthorized",
+        403 => "Forbidden",
+        404 => "Not Found",
+        405 => "Method Not Allowed",
+        409 => "Conflict",
+        413 => "Payload Too Large",
+        431 => "Request Header Fields Too Large",
+        _ => "Error",
+    }
+}
+
+/// The response as `(head, body)` bytes; the head names the body's length.
+fn render(reply: Result<Reply, ApiError>) -> (Vec<u8>, Vec<u8>) {
     let (status, mime, body, is_html) = match reply {
         Ok(Reply::Asset { mime, body }) => (
             200,
@@ -213,22 +501,21 @@ fn render(reply: Result<Reply, ApiError>) -> Response<std::io::Cursor<Vec<u8>>> 
             false,
         ),
     };
-    let mut resp = Response::from_data(body)
-        .with_status_code(status)
-        .with_header(h("Content-Type", mime))
-        .with_header(h("X-Content-Type-Options", "nosniff"))
-        .with_header(h("Referrer-Policy", "no-referrer"))
-        .with_header(h("Cache-Control", "no-store"));
+    let mut out = format!(
+        "HTTP/1.1 {status} {}\r\nContent-Type: {mime}\r\nContent-Length: {}\r\n\
+         Connection: close\r\nX-Content-Type-Options: nosniff\r\n\
+         Referrer-Policy: no-referrer\r\nCache-Control: no-store\r\n",
+        reason(status),
+        body.len()
+    )
+    .into_bytes();
     if is_html {
-        resp = resp
-            .with_header(h("Content-Security-Policy", CSP))
-            .with_header(h("X-Frame-Options", "DENY"));
+        out.extend_from_slice(
+            format!("Content-Security-Policy: {CSP}\r\nX-Frame-Options: DENY\r\n").as_bytes(),
+        );
     }
-    resp
-}
-
-fn h(name: &str, value: &str) -> Header {
-    Header::from_bytes(name.as_bytes(), value.as_bytes()).expect("static header is valid")
+    out.extend_from_slice(b"\r\n");
+    (out, body)
 }
 
 #[cfg(test)]
@@ -275,5 +562,21 @@ mod tests {
         assert_eq!(percent_decode("a+b%2"), "a+b%2");
         assert_eq!(percent_decode("%zz%4"), "%zz%4");
         assert_eq!(percent_decode("%E2%9C%93"), "\u{2713}");
+    }
+
+    #[test]
+    fn content_length_must_be_one_plain_number() {
+        let h = |values: &[&str]| -> Vec<(String, String)> {
+            values
+                .iter()
+                .map(|v| ("Content-Length".to_string(), v.to_string()))
+                .collect()
+        };
+        assert_eq!(content_length(&h(&["12"])).ok().flatten(), Some(12));
+        assert_eq!(content_length(&h(&["12", "12"])).ok().flatten(), Some(12));
+        assert_eq!(content_length(&h(&[])).ok().flatten(), None);
+        for bad in [&["12", "13"][..], &["+12"], &["0x10"], &["-1"], &[""]] {
+            assert!(content_length(&h(bad)).is_err(), "{bad:?}");
+        }
     }
 }

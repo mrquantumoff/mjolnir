@@ -8,9 +8,9 @@ use std::time::UNIX_EPOCH;
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use tiny_http::Method;
 
 use super::fs;
+use super::http::Method;
 use super::jobs::{FileHash, Job, JobId, JobState, Jobs, Outcome, RemoveError, Report};
 use crate::filemap::{ApplyPolicy, Preserve};
 use crate::keys::{PrivateKey, PublicKey};
@@ -152,7 +152,7 @@ impl From<RecvReport> for Report {
 
 pub fn route(
     app: &App,
-    method: &Method,
+    method: Method,
     path: &str,
     query: &[(String, String)],
     body: Value,

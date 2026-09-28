@@ -112,9 +112,20 @@ so every request is treated as hostile until it proves otherwise.
   `Cache-Control: no-store`. Scripts and styles are separate embedded files,
   so no inline script is needed. The page builds the DOM with `textContent`,
   never `innerHTML`, so file names and error text cannot inject markup.
-- **Bounded input.** Request bodies are capped at 1 MiB (413 beyond that).
-  Every field is parsed and range-checked in the handler before any work
-  starts.
+- **Bounded input, enforced at the transport.** The server is a small
+  strict HTTP/1.1 reader on `std`, not a general web framework, so every
+  limit is applied before any allocation the client controls. The request
+  head (request line plus headers) is capped at 16 KiB (431 beyond that)
+  and must arrive within 10 s. A body is read only after the request has
+  passed the Host, token, Content-Type, and Origin checks, only up to
+  1 MiB (413 beyond that, without reading it), and within 30 s. A rejected
+  request is answered and its connection closed; the body its
+  `Content-Length` announced is never read or reserved. `Transfer-Encoding`
+  and requests with two disagreeing `Content-Length` values are refused
+  (400). Each connection carries one request, gets its own thread, and at
+  most 64 connections are served at once; further ones are closed at
+  accept. Every field is parsed and range-checked in the handler before any
+  work starts.
 - **The private key never leaves the process.** The API returns only the
   public key and the key file's path.
 
@@ -133,6 +144,7 @@ have the shape `{ "error": "message", "field": "name" | null }`, where
 | 405 | Wrong method for the endpoint |
 | 409 | Removing a transfer that is still running |
 | 413 | Body over 1 MiB |
+| 431 | Request head over 16 KiB |
 
 ### `GET /api/identity`
 
@@ -292,8 +304,8 @@ saying so.
 
 | File | Role |
 |------|------|
-| `src/web/mod.rs` | `ServeConfig`, `WebServer` (bind, URL, worker threads), `serve` |
-| `src/web/http.rs` | Admission checks, static assets, response headers |
+| `src/web/mod.rs` | `ServeConfig`, `WebServer` (bind, URL, the accept loop and its connection cap), `serve` |
+| `src/web/http.rs` | The HTTP/1.1 reader and its limits, admission checks, static assets, response headers |
 | `src/web/api.rs` | Routing, request validation, handlers, response DTOs |
 | `src/web/jobs.rs` | The transfer registry and each job's thread |
 | `src/web/fs.rs` | Directory listing for the picker |

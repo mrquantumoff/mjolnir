@@ -209,6 +209,78 @@ fn oversized_body_is_413() {
     assert_eq!(r.status, 413);
 }
 
+/// A rejected request must not be drained by its Content-Length: four
+/// withheld bodies with a bad token would otherwise park every worker.
+#[test]
+fn withheld_bodies_of_rejected_requests_do_not_block_the_server() {
+    let ui = start();
+    let held: Vec<TcpStream> = (0..8)
+        .map(|_| {
+            let mut s = TcpStream::connect(ui.addr).unwrap();
+            let req = format!(
+                "POST /api/send HTTP/1.1\r\nHost: {}\r\nAuthorization: Bearer nope\r\n\
+                 Content-Type: application/json\r\nContent-Length: 2000\r\n\r\n",
+                ui.addr
+            );
+            s.write_all(req.as_bytes()).unwrap();
+            s
+        })
+        .collect();
+    let (tx, rx) = std::sync::mpsc::channel();
+    let addr = ui.addr;
+    let token = ui.token.clone();
+    std::thread::spawn(move || {
+        let ui = Ui {
+            addr,
+            token,
+            public_key: String::new(),
+        };
+        tx.send(get(&ui, "/api/identity").status).unwrap();
+    });
+    let status = rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("a fresh request must be answered while bodies are withheld");
+    assert_eq!(status, 200);
+    drop(held);
+}
+
+/// An unauthenticated request announcing a huge body must be refused
+/// without the server reserving memory for that body.
+#[test]
+fn huge_announced_body_without_token_is_refused_cheaply() {
+    let ui = start();
+    for _ in 0..4 {
+        let mut s = TcpStream::connect(ui.addr).unwrap();
+        let req = format!(
+            "POST /api/send HTTP/1.1\r\nHost: {}\r\nContent-Type: application/json\r\n\
+             Content-Length: 1099511627776\r\n\r\n",
+            ui.addr
+        );
+        s.write_all(req.as_bytes()).unwrap();
+        s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let mut out = Vec::new();
+        s.read_to_end(&mut out).unwrap();
+        let text = String::from_utf8_lossy(&out);
+        assert!(text.starts_with("HTTP/1.1 401"), "{text}");
+    }
+    assert_eq!(get(&ui, "/api/identity").status, 200);
+}
+
+#[test]
+fn oversized_head_is_431_and_a_bare_lf_head_is_400() {
+    let ui = start();
+    let padding = "x".repeat(20 * 1024);
+    let r = raw(&ui, "GET", "/api/identity", &[("X-Pad", &padding)], b"");
+    assert_eq!(r.status, 431);
+    let mut s = TcpStream::connect(ui.addr).unwrap();
+    s.write_all(b"GET / HTTP/1.1\nHost: x\n\n").unwrap();
+    s.shutdown(std::net::Shutdown::Write).unwrap();
+    s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    let mut out = String::new();
+    s.read_to_string(&mut out).unwrap();
+    assert!(out.starts_with("HTTP/1.1 400"), "{out}");
+}
+
 #[test]
 fn bad_peer_key_in_send_is_400_on_that_field() {
     let ui = start();

@@ -6,15 +6,17 @@ mod fs;
 mod http;
 mod jobs;
 
-use std::net::SocketAddr;
+use std::net::{SocketAddr, TcpListener};
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use anyhow::{Result, anyhow};
+use anyhow::{Context, Result};
 
 use crate::keys::PrivateKey;
+use crate::pool::Permits;
 
-const WORKERS: usize = 4;
+/// Connections being served at once; more are closed at accept.
+const MAX_CONNECTIONS: usize = 64;
 
 pub struct ServeConfig {
     pub listen: SocketAddr,
@@ -24,7 +26,7 @@ pub struct ServeConfig {
 }
 
 pub struct WebServer {
-    server: tiny_http::Server,
+    listener: TcpListener,
     guard: http::Guard,
     app: api::App,
     addr: SocketAddr,
@@ -33,15 +35,12 @@ pub struct WebServer {
 
 impl WebServer {
     pub fn bind(cfg: ServeConfig) -> Result<WebServer> {
-        let server = tiny_http::Server::http(cfg.listen)
-            .map_err(|e| anyhow!("binding the web UI to {}: {e}", cfg.listen))?;
-        let addr = server
-            .server_addr()
-            .to_ip()
-            .ok_or_else(|| anyhow!("web UI is not bound to an IP address"))?;
+        let listener = crate::net::listen(cfg.listen)
+            .with_context(|| format!("binding the web UI to {}", cfg.listen))?;
+        let addr = listener.local_addr()?;
         let token = new_token();
         Ok(WebServer {
-            server,
+            listener,
             guard: http::Guard::new(token.clone(), addr),
             app: api::App::new(cfg.key, cfg.key_path),
             addr,
@@ -61,23 +60,35 @@ impl WebServer {
         browser_url(self.addr, &self.token)
     }
 
-    /// Serves requests on a few worker threads until the process exits.
+    /// Serves one request per connection, each on its own thread, at most
+    /// `MAX_CONNECTIONS` at once, until the process exits.
     pub fn run(self) -> Result<()> {
         let shared = Arc::new(self);
-        let workers: Vec<_> = (0..WORKERS)
-            .map(|_| {
-                let s = Arc::clone(&shared);
-                std::thread::spawn(move || {
-                    while let Ok(req) = s.server.recv() {
-                        http::handle(&s.guard, &s.app, req);
-                    }
-                })
-            })
-            .collect();
-        for w in workers {
-            w.join().map_err(|_| anyhow!("web worker panicked"))?;
+        let permits = Permits::new(MAX_CONNECTIONS);
+        loop {
+            let (stream, _) = match shared.listener.accept() {
+                Ok(accepted) => accepted,
+                Err(e) => {
+                    eprintln!("mjolnir: web accept failed: {e}");
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                    continue;
+                }
+            };
+            // Over the limit, the socket is closed right here.
+            let Some(permit) = permits.try_acquire() else {
+                continue;
+            };
+            let s = Arc::clone(&shared);
+            let spawned = std::thread::Builder::new()
+                .name("mjolnir-web".into())
+                .spawn(move || {
+                    let _permit = permit;
+                    http::serve(&s.guard, &s.app, stream);
+                });
+            if let Err(e) = spawned {
+                eprintln!("mjolnir: cannot start a web thread: {e}");
+            }
         }
-        Ok(())
     }
 }
 
