@@ -14,8 +14,9 @@ def one_writer():
     return time.perf_counter() - t
 
 def eight_writers():
+    # Not pre-sized: Python's ftruncate zero-fills on Windows, and 2 GiB of
+    # zeros would still be flushing while the timed writes run.
     fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, "O_BINARY", 0))
-    os.ftruncate(fd, size)
     os.close(fd)
     n = 8
     def work(k):

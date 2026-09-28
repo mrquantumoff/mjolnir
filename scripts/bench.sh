@@ -16,6 +16,8 @@
 #   SIZE_MIB  file size in MiB (default 2048)
 #   REPEAT    runs per configuration; rates show median and range (default 3)
 #   PORT      listen port (default 7799)
+#   PAUSE     seconds to idle before each disk-writing run, so the drive can
+#             finish flushing and cool down between runs (default 0)
 #   ROWS      only run rows whose "connections threads chunk cipher verify
 #             hash mode files" matches this extended regex, e.g. ROWS='^8 0 1MiB'
 set -euo pipefail
@@ -31,6 +33,7 @@ command -v cygpath > /dev/null 2>&1 && work="$(cygpath -m "$work")"
 size_mib="${SIZE_MIB:-2048}"
 repeat="${REPEAT:-3}"
 port="${PORT:-7799}"
+pause="${PAUSE:-0}"
 
 cargo build --release --quiet --manifest-path "$root/Cargo.toml"
 bin="$root/target/release/mjolnir"
@@ -84,6 +87,7 @@ run_once() {
     memory+discard) recv_env=discard send_env=memory-source ;;
   esac
   rm -rf "$out" && mkdir -p "$out"
+  case "$mode" in *discard) ;; *) sleep "$pause" ;; esac
   MJOLNIR_BENCH="$recv_env" "$bin" recv --key "$work/r.key" --allow "$spub" \
     --listen "127.0.0.1:$port" --out "$out" --threads "$threads" "${recv_flags[@]}" \
     2> "$work/recv.log" &
