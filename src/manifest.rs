@@ -302,5 +302,7 @@ mod tests {
         assert!(err.to_string().contains("duplicate"));
         let err = Manifest::new(cs(4096), vec![f("caf\u{e9}"), f("cafe\u{301}")]).unwrap_err();
         assert!(err.to_string().contains("duplicate"));
+        let err = Manifest::new(cs(4096), vec![f("A\u{3A3}"), f("a\u{3C3}")]).unwrap_err();
+        assert!(err.to_string().contains("duplicate"));
     }
 }

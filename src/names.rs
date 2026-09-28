@@ -14,13 +14,17 @@ pub const MAX_COMPONENTS: usize = 256;
 /// Limit on the `/`-joined length of a path.
 pub const MAX_PATH_BYTES: usize = 4096;
 
-/// Suffixes of the receiver's side files. No component may end in one, in
-/// any ASCII case.
-pub const RESERVED_SUFFIXES: [&str; 4] = [
+/// Suffixes of the receiver's side files. No component may end in one after
+/// folding (see [`WirePath::fold_key`]), since a case-insensitive file
+/// system would take such a name for the side file.
+pub const RESERVED_SUFFIXES: [&str; 7] = [
     ".mjolnir-part",
     ".mjolnir-state",
     ".mjolnir-state.tmp",
     ".mjolnir-sums",
+    ".mjolnir-journal",
+    ".mjolnir-journal.tmp",
+    ".mjolnir-staging",
 ];
 
 /// Byte `b` is escaped as `U+F000 + b`.
@@ -145,10 +149,8 @@ fn check_component(c: &[u8]) -> Result<(), NameReason> {
     if c.contains(&b'/') {
         return Err(NameReason::Slash);
     }
-    let reserved = RESERVED_SUFFIXES
-        .iter()
-        .find(|s| c.len() >= s.len() && c[c.len() - s.len()..].eq_ignore_ascii_case(s.as_bytes()));
-    match reserved {
+    let folded = fold_name(c);
+    match RESERVED_SUFFIXES.iter().find(|s| folded.ends_with(*s)) {
         Some(s) => Err(NameReason::ReservedSuffix(s)),
         None => Ok(()),
     }
@@ -204,23 +206,14 @@ impl WirePath {
         parts.join("/")
     }
 
-    /// Key for the case-insensitive duplicate check. It NFC-normalizes and
-    /// then lowercases the macOS mapping on every platform, so an offer is
-    /// valid or invalid everywhere alike: names that collide on Windows or
-    /// macOS always share a key. APFS treats the NFC and NFD spellings of a
-    /// name as one file, hence the normalization.
+    /// Key for the case-insensitive duplicate check. It NFC-normalizes the
+    /// macOS mapping and folds it one character at a time (see
+    /// [`fold_char`]) on every platform, so an offer is valid or invalid
+    /// everywhere alike: names that collide on Windows or macOS always share
+    /// a key. APFS treats the NFC and NFD spellings of a name as one file,
+    /// hence the normalization.
     pub fn fold_key(&self) -> String {
-        use unicode_normalization::UnicodeNormalization;
-        let parts: Vec<_> = self
-            .0
-            .iter()
-            .map(|n| {
-                String::from_utf8_lossy(&encode_utf8_escaped(&n.0))
-                    .nfc()
-                    .collect::<String>()
-                    .to_lowercase()
-            })
-            .collect();
+        let parts: Vec<_> = self.0.iter().map(|n| fold_name(&n.0)).collect();
         parts.join("/")
     }
 
@@ -248,6 +241,29 @@ impl WirePath {
         path.extend(self.0.iter().map(wire_to_os));
         path
     }
+}
+
+fn fold_name(bytes: &[u8]) -> String {
+    use unicode_normalization::UnicodeNormalization;
+    String::from_utf8_lossy(&encode_utf8_escaped(bytes))
+        .nfc()
+        .map(fold_char)
+        .collect()
+}
+
+/// The character's uppercase, then that one's lowercase, each step skipped
+/// when it would expand to several characters. NTFS compares
+/// names through a per-character upcase table, so `str::to_lowercase`,
+/// which lowers a word-final capital sigma to final `ς` and any other to
+/// `σ`, would let `AΣ` and `aσ` through as two names for one file.
+fn fold_char(c: char) -> char {
+    let upper = single(c.to_uppercase()).unwrap_or(c);
+    single(upper.to_lowercase()).unwrap_or(upper)
+}
+
+fn single(mut chars: impl Iterator<Item = char>) -> Option<char> {
+    let first = chars.next()?;
+    chars.next().is_none().then_some(first)
 }
 
 /// Maps wire bytes to what `platform`'s file system can store.

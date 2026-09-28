@@ -164,19 +164,31 @@ list of strings.
 not necessarily UTF-8 (see "File names"). The receiver rejects empty paths,
 empty components, `.` and `..` components, components containing NUL or
 `/`, paths deeper than 256 components or longer than 4096 bytes (the
-components joined with `/`), components ending in `.mjolnir-part`,
-`.mjolnir-state`, `.mjolnir-state.tmp`, or `.mjolnir-sums` in any ASCII
-case, and paths that are equal after NFC-normalizing and lowercasing their
-macOS names (see "File names"). The suffix rule covers directories too, because a directory
-`a.mjolnir-part` would collide with the part file of a sibling `a`, and it
-ignores case because on a case-insensitive file system `a.MJOLNIR-PART` is
-that part file. Case-insensitive file systems (Windows, macOS) treat
-`README` and `readme` as one file, and APFS also treats the NFC and NFD
-spellings of a name (`caf�` as one code point or as `e` plus a combining
-accent) as one file. The collision rule uses one key on every OS, the
-NFC-normalized, lowercased macOS name, so the same offer is valid or invalid
+components joined with `/`), components whose folded name (below) ends in
+`.mjolnir-part`, `.mjolnir-state`, `.mjolnir-state.tmp`, `.mjolnir-sums`,
+`.mjolnir-journal`, `.mjolnir-journal.tmp`, or `.mjolnir-staging`, and
+paths whose folded names are equal. The suffix rule covers directories
+too, because a directory `a.mjolnir-part` would collide with the part file
+of a sibling `a`, and it compares folded names because on a
+case-insensitive file system `a.MJOLNIR-PART` and `a.mjolnir-ſums` (with a
+long s) are those side files. Case-insensitive file systems (Windows,
+macOS) treat `README` and `readme` as one file, and APFS also treats the
+NFC and NFD spellings of a name (`café` as one code point or as `e` plus a
+combining accent) as one file.
+
+A component's folded name is its macOS name (see "File names"),
+NFC-normalized, with each character `c` then replaced on its own: `u` is
+the uppercase of `c` if that is a single character, else `c`, and the
+result is the lowercase of `u` if that is a single character, else `u`.
+The mapping ignores context, as the NTFS upcase table does, so `ς`, `σ`,
+and `Σ` all fold to `σ`, the Kelvin sign to `k`, `ı` to `i`, `ſ` to `s`,
+and `ẞ` to `ß`, while `ß` and `İ`, whose case mappings expand, stay as
+they are. (Context-sensitive lowercasing would turn `AΣ` into `aς` but
+`aσ` into `aσ`, two keys for what Windows stores as one file.) The rule
+uses one key on every OS, so the same offer is valid or invalid
 everywhere, and any two names that collide on Windows also collide under
-it. `file_id` is the index into `files`.
+it; it may reject a few pairs Windows would keep apart. `file_id` is the
+index into `files`.
 
 `chunk_size` is between 4 KiB and 64 MiB. File `j` has
 `ceil(size / chunk_size)` chunks. Chunk `k` covers bytes

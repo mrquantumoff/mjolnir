@@ -221,6 +221,96 @@ fn fold_key_joins_nfc_and_nfd_spellings() {
     assert_eq!(key("CAF\u{c9}"), key(nfd));
 }
 
+fn fold(name: &str) -> String {
+    WirePath::parse([name.as_bytes()]).unwrap().fold_key()
+}
+
+#[test]
+fn fold_key_folds_each_character_without_context() {
+    assert_eq!(fold("A\u{3A3}"), fold("a\u{3C3}"));
+    assert_eq!(fold("\u{3C2}"), fold("\u{3C3}"));
+    assert_eq!(fold("\u{3A3}"), fold("\u{3C3}"));
+    assert_eq!(fold("x\u{3A3}"), "x\u{3C3}");
+    assert_eq!(fold("\u{212A}"), fold("k"));
+    assert_eq!(fold("\u{1C4}"), fold("\u{1C6}"));
+    assert_eq!(fold("\u{1C5}"), fold("\u{1C6}"));
+    assert_eq!(fold("\u{131}"), fold("i"));
+    assert_eq!(fold("\u{17F}"), fold("s"));
+}
+
+#[test]
+fn fold_key_keeps_multi_character_mappings_apart() {
+    assert_eq!(fold("\u{1E9E}"), fold("\u{DF}"));
+    assert_ne!(fold("\u{DF}"), fold("ss"));
+    assert_ne!(fold("\u{130}"), fold("i"));
+    assert_ne!(fold("\u{130}"), fold("I"));
+}
+
+/// Every pair of characters that the Windows upcase table maps to one
+/// character, among those a Windows receiver stores unescaped, shares a
+/// fold key. Each follows a capital so a contextual fold (a final sigma)
+/// would show.
+#[cfg(windows)]
+#[test]
+fn windows_upcase_pairs_share_a_fold_key() {
+    #[link(name = "ntdll")]
+    unsafe extern "system" {
+        fn RtlUpcaseUnicodeChar(c: u16) -> u16;
+    }
+    let mut by_upcase: std::collections::HashMap<u16, (char, String)> = Default::default();
+    let mut compared = 0;
+    for c in (1..=0xFFFF).filter_map(char::from_u32) {
+        let text = format!("A{c}");
+        let Ok(wire) = WireName::new(text.clone().into_bytes()) else {
+            continue;
+        };
+        if *wide(&encode_local(&wire, Platform::Windows))
+            != *text.encode_utf16().collect::<Vec<_>>()
+        {
+            continue;
+        }
+        let key = WirePath::parse([wire.as_bytes()]).unwrap().fold_key();
+        // SAFETY: a pure table lookup.
+        let upcase = unsafe { RtlUpcaseUnicodeChar(c as u16) };
+        match by_upcase.get(&upcase) {
+            Some((first, first_key)) => {
+                assert_eq!(*first_key, key, "{first:?} and {c:?}");
+                compared += 1;
+            }
+            None => {
+                by_upcase.insert(upcase, (c, key));
+            }
+        }
+    }
+    assert!(compared > 900, "{compared}");
+}
+
+#[test]
+fn reserved_suffixes_match_after_folding() {
+    let reason = |name: &str| WireName::new(name.as_bytes().to_vec()).unwrap_err();
+    assert_eq!(
+        reason("x.mjolnir-\u{17F}ums"),
+        NameReason::ReservedSuffix(".mjolnir-sums")
+    );
+    assert_eq!(
+        reason("x.mjoln\u{131}r-part"),
+        NameReason::ReservedSuffix(".mjolnir-part")
+    );
+    assert_eq!(
+        reason("x.MJOLNIR-JOURNAL"),
+        NameReason::ReservedSuffix(".mjolnir-journal")
+    );
+    assert_eq!(
+        reason("x.mjolnir-journal.tmp"),
+        NameReason::ReservedSuffix(".mjolnir-journal.tmp")
+    );
+    assert_eq!(
+        reason("x.mjolnir-staging"),
+        NameReason::ReservedSuffix(".mjolnir-staging")
+    );
+    assert!(WireName::new("x.mjolnir-\u{DF}ums".as_bytes().to_vec()).is_ok());
+}
+
 #[test]
 fn display_is_lossy() {
     let p = WirePath::parse([b"d".as_slice(), b"\xffx"]).unwrap();
