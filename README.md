@@ -22,11 +22,12 @@ gh api repos/mrquantumoff/mjolnir/contents/scripts/install.sh \
     -H "Accept: application/vnd.github.raw" | bash
 ```
 
-With a token and no GitHub CLI:
+With a token and no GitHub CLI (the header reaches curl as a config on
+stdin, so the token does not show up in the process list):
 
 ```sh
-curl -fsSL -H "Authorization: Bearer $GH_TOKEN" \
-    -H "Accept: application/vnd.github.raw" \
+printf 'header = "Authorization: Bearer %s"\n' "$GH_TOKEN" |
+    curl -fsSL --config - -H "Accept: application/vnd.github.raw" \
     https://api.github.com/repos/mrquantumoff/mjolnir/contents/scripts/install.sh | bash
 ```
 
