@@ -115,6 +115,7 @@ struct Send {
     threads: usize,
     hash: bool,
     preserve: Preserve,
+    follow_symlinks: bool,
 }
 
 impl Send {
@@ -128,6 +129,7 @@ impl Send {
             threads: *THREADS,
             hash: false,
             preserve: Preserve::default(),
+            follow_symlinks: true,
         }
     }
 
@@ -143,6 +145,7 @@ impl Send {
             paths: paths.iter().map(|p| p.to_path_buf()).collect(),
             hash: self.hash,
             preserve: self.preserve,
+            follow_symlinks: self.follow_symlinks,
         }
     }
 
@@ -925,6 +928,72 @@ fn awkward_names_round_trip() {
         "the wire name is the raw name"
     );
     assert_file_eq(&file, &out.path().join(awkward_name()));
+}
+
+/// `data/{real.bin, flink, dlink}`, where `flink` and `dlink` link to a file
+/// and a directory (holding `deep.bin` and an empty `void/`) outside `data`.
+/// None when this system cannot make links.
+fn linked_tree(src: &Path) -> Option<PathBuf> {
+    let data = src.join("data");
+    let outside = src.join("outside");
+    write(&data.join("real.bin"), &noise(10_000, 20));
+    write(
+        &outside.join("target.bin"),
+        &noise(3 * CHUNK as usize + 5, 21),
+    );
+    write(&outside.join("dir/deep.bin"), &noise(20_000, 22));
+    fs::create_dir(outside.join("dir/void")).unwrap();
+    #[cfg(unix)]
+    let made = std::os::unix::fs::symlink(outside.join("target.bin"), data.join("flink"))
+        .and_then(|()| std::os::unix::fs::symlink(outside.join("dir"), data.join("dlink")));
+    #[cfg(windows)]
+    let made = std::os::windows::fs::symlink_file(outside.join("target.bin"), data.join("flink"))
+        .and_then(|()| std::os::windows::fs::symlink_dir(outside.join("dir"), data.join("dlink")));
+    match made {
+        Ok(()) => Some(data),
+        Err(e) => {
+            eprintln!("skipping: cannot create a symlink here: {e}");
+            None
+        }
+    }
+}
+
+#[test]
+fn links_arrive_as_regular_content_unless_not_followed() {
+    let src = TempDir::new().unwrap();
+    let Some(data) = linked_tree(src.path()) else {
+        return;
+    };
+    let outside = src.path().join("outside");
+    for follow in [true, false] {
+        let out = TempDir::new().unwrap();
+        let (rk, _) = keypair();
+        let (sk, spub) = keypair();
+        let rx = start_receiver(rk, vec![spub], out.path());
+        let mut send = Send::to(sk, rx.public);
+        send.follow_symlinks = follow;
+        let report = send.run(rx.addr, &[&data]).unwrap();
+        rx.join().unwrap();
+        let got = out.path().join("data");
+        assert_file_eq(&data.join("real.bin"), &got.join("real.bin"));
+        if follow {
+            assert!(report.skipped.is_empty(), "{:?}", report.skipped);
+            assert_eq!(report.files, 3);
+            assert_file_eq(&outside.join("target.bin"), &got.join("flink"));
+            assert_file_eq(&outside.join("dir/deep.bin"), &got.join("dlink/deep.bin"));
+            for (name, dir) in [("flink", false), ("dlink", true), ("dlink/void", true)] {
+                let meta = fs::symlink_metadata(got.join(name)).unwrap();
+                assert_eq!((meta.is_dir(), meta.is_file()), (dir, !dir), "{name}");
+            }
+        } else {
+            let links = [data.join("dlink"), data.join("flink")];
+            let listed: Vec<String> = links.iter().map(|p| p.display().to_string()).collect();
+            assert_eq!(report.skipped, listed);
+            assert_eq!(report.files, 1);
+            assert_eq!(tree(&got).len(), 1);
+            assert!(!got.join("flink").exists() && !got.join("dlink").exists());
+        }
+    }
 }
 
 #[cfg(unix)]

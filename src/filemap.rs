@@ -111,8 +111,39 @@ pub struct CapturedFile {
 pub struct Captured {
     pub files: Vec<CapturedFile>,
     pub map: FileMap,
-    /// Symbolic links and special files, which are not sent.
-    pub skipped: Vec<PathBuf>,
+    /// Sources that are not sent, each with why.
+    pub skipped: Vec<Skipped>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Skipped {
+    pub path: PathBuf,
+    pub reason: SkipReason,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SkipReason {
+    /// A special file, a link to one, or any link when links are not
+    /// followed.
+    NotRegular,
+    /// A link whose target does not exist.
+    Dangling,
+    /// A directory link back to `ancestor`, which is already being walked,
+    /// or, without one, a chain of links that never reaches a target.
+    Loop { ancestor: Option<PathBuf> },
+}
+
+impl std::fmt::Display for SkipReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SkipReason::NotRegular => f.write_str("not a regular file or directory"),
+            SkipReason::Dangling => f.write_str("dangling symbolic link"),
+            SkipReason::Loop { ancestor: None } => f.write_str("symlink loop"),
+            SkipReason::Loop {
+                ancestor: Some(ancestor),
+            } => write!(f, "symlink loop back to {}", ancestor.display()),
+        }
+    }
 }
 
 impl FileMap {
@@ -141,11 +172,18 @@ impl FileMap {
 
 /// Walks the sender's roots, naming them the way the sender does: a file
 /// root is its own name, and a directory root's name prefixes everything
-/// under it. Links are not followed.
-pub fn capture(roots: &[PathBuf], preserve: Preserve) -> Result<Captured> {
+/// under it. With `follow_symlinks`, links, roots included, are sent as
+/// their targets, contents and metadata; without it, they are skipped.
+pub fn capture(roots: &[PathBuf], preserve: Preserve, follow_symlinks: bool) -> Result<Captured> {
     ensure!(!roots.is_empty(), "nothing to send");
     let mut out = Captured::default();
     for root in roots {
+        let own = fs::symlink_metadata(root);
+        let own = own.with_context(|| format!("reading {}", root.display()))?;
+        if own.is_symlink() && !follow_symlinks {
+            out.skip(root.clone(), SkipReason::NotRegular);
+            continue;
+        }
         let meta = fs::metadata(root).with_context(|| format!("reading {}", root.display()))?;
         let base = root
             .canonicalize()
@@ -158,11 +196,24 @@ pub fn capture(roots: &[PathBuf], preserve: Preserve) -> Result<Captured> {
             continue;
         }
         if !meta.is_dir() {
-            out.skipped.push(root.clone());
+            out.skip(root.clone(), SkipReason::NotRegular);
             continue;
         }
-        for entry in WalkDir::new(root).sort_by_file_name() {
-            let entry = entry.with_context(|| format!("walking {}", root.display()))?;
+        let walk = WalkDir::new(root)
+            .follow_links(follow_symlinks)
+            .follow_root_links(follow_symlinks)
+            .sort_by_file_name();
+        for entry in walk {
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(e) => match unfollowable(&e) {
+                    Some((path, reason)) => {
+                        out.skip(path, reason);
+                        continue;
+                    }
+                    None => return Err(e).with_context(|| format!("walking {}", root.display())),
+                },
+            };
             let inner = entry.path().strip_prefix(root)?;
             let named = match &base {
                 Some(base) => base.join(inner),
@@ -187,14 +238,50 @@ pub fn capture(roots: &[PathBuf], preserve: Preserve) -> Result<Captured> {
             } else if file_type.is_file() {
                 out.push_file(entry.into_path(), &named, &meta, preserve)?;
             } else {
-                out.skipped.push(entry.into_path());
+                out.skip(entry.into_path(), SkipReason::NotRegular);
             }
         }
     }
     Ok(out)
 }
 
+/// A walk error that only means one followed link cannot be sent.
+fn unfollowable(e: &walkdir::Error) -> Option<(PathBuf, SkipReason)> {
+    let path = e.path()?.to_path_buf();
+    if let Some(ancestor) = e.loop_ancestor() {
+        let ancestor = Some(ancestor.to_path_buf());
+        return Some((path, SkipReason::Loop { ancestor }));
+    }
+    let io = e.io_error()?;
+    if !fs::symlink_metadata(&path).is_ok_and(|m| m.is_symlink()) {
+        return None;
+    }
+    let reason = if io.kind() == io::ErrorKind::NotFound {
+        SkipReason::Dangling
+    } else if is_link_cycle(io) {
+        SkipReason::Loop { ancestor: None }
+    } else {
+        return None;
+    };
+    Some((path, reason))
+}
+
+#[cfg(unix)]
+fn is_link_cycle(e: &io::Error) -> bool {
+    e.raw_os_error() == Some(libc::ELOOP)
+}
+
+#[cfg(windows)]
+fn is_link_cycle(e: &io::Error) -> bool {
+    const ERROR_CANT_RESOLVE_FILENAME: i32 = 1921;
+    e.raw_os_error() == Some(ERROR_CANT_RESOLVE_FILENAME)
+}
+
 impl Captured {
+    fn skip(&mut self, path: PathBuf, reason: SkipReason) {
+        self.skipped.push(Skipped { path, reason });
+    }
+
     fn push_file(
         &mut self,
         source: PathBuf,

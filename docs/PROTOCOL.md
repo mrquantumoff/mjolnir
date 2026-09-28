@@ -295,9 +295,20 @@ escaped byte when sent. Cygwin and WSL have the same limitation.
 Terminal output, logs, and the web UI show names lossily (invalid bytes as
 U+FFFD). Only the display changes; the file itself gets the exact name.
 
-Symbolic links and other special files are not transferred. The sender
-skips them, lists them in a warning, and does not follow links into
-directories.
+Only regular files and directories go on the wire; links are resolved on
+the sender. By default it follows symbolic links: a link to a file is sent
+as a regular file with the target's contents, and a link to a directory is
+walked as a directory, both under the link's own name and with the
+target's size, mtime, and mode. Links are followed wherever they point,
+including outside the sent root, and two links to one target send it
+twice, once under each name. A link given as a root is followed the same
+way, but is named after its target, not the link. The
+sender skips, and lists in a warning, special files (FIFOs, sockets,
+devices) and links to them, dangling links, and links that loop: a
+directory link back to one of its ancestors, or a chain of links that
+never reaches a target. With `send --no-follow-symlinks`, it skips every
+link the same way, roots included, and does not descend into directory
+links.
 
 ## File map
 

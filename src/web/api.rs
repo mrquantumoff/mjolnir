@@ -89,6 +89,7 @@ pub enum JobSpec {
         threads: usize,
         hash: bool,
         preserve: Preserve,
+        follow_symlinks: bool,
     },
     Receive {
         listen: SocketAddr,
@@ -233,8 +234,13 @@ struct SendRequest {
     hash: bool,
     #[serde(default)]
     preserve: Preserve,
+    #[serde(default = "default_follow_symlinks")]
+    follow_symlinks: bool,
 }
 
+fn default_follow_symlinks() -> bool {
+    true
+}
 fn default_connections() -> usize {
     8
 }
@@ -332,6 +338,7 @@ fn start_send(app: &App, req: SendRequest) -> Result<Reply, ApiError> {
         threads,
         hash: req.hash,
         preserve: req.preserve,
+        follow_symlinks: req.follow_symlinks,
     };
     let cfg = SendConfig {
         addr,
@@ -344,6 +351,7 @@ fn start_send(app: &App, req: SendRequest) -> Result<Reply, ApiError> {
         paths,
         hash: req.hash,
         preserve: req.preserve,
+        follow_symlinks: req.follow_symlinks,
     };
     let id = app.jobs.spawn(spec, move |progress| {
         crate::send(cfg, progress).map(Report::from)

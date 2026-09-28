@@ -304,6 +304,7 @@ function readSendForm() {
     cipher: $('send-cipher').value,
     threads: readThreads('send-threads'),
     hash: $('send-hash').checked,
+    follow_symlinks: $('send-follow-symlinks').checked,
     preserve: {
       perms: $('send-preserve-perms').checked,
       times: $('send-preserve-times').checked,
@@ -381,6 +382,7 @@ function saveForms() {
       cipher: $('send-cipher').value,
       threads: $('send-threads').value,
       hash: $('send-hash').checked,
+      follow_symlinks: $('send-follow-symlinks').checked,
       preserve_perms: $('send-preserve-perms').checked,
       preserve_times: $('send-preserve-times').checked,
       preserve_owner: $('send-preserve-owner').checked,
@@ -419,6 +421,7 @@ function restoreForms() {
   restoreValue('send-cipher', send.cipher);
   restoreValue('send-threads', send.threads);
   restoreChecked('send-hash', send.hash);
+  restoreChecked('send-follow-symlinks', send.follow_symlinks);
   restoreChecked('send-preserve-perms', send.preserve_perms);
   restoreChecked('send-preserve-times', send.preserve_times);
   restoreChecked('send-preserve-owner', send.preserve_owner);
@@ -653,7 +656,8 @@ function buildSendDetails(spec) {
       ' \u00b7 ' + (CIPHER_LABELS[spec.cipher] || spec.cipher),
       ' \u00b7 ' + threadsText(spec.threads),
       preserveText(spec.preserve),
-      spec.hash ? ' \u00b7 hash check' : ''),
+      spec.hash ? ' \u00b7 hash check' : '',
+      spec.follow_symlinks ? ' \u00b7 follows links' : ' \u00b7 skips links'),
     h('ul', { class: 'card-files' },
       shown.map((path) => h('li', null, h('code', { class: 'mono' }, path))),
       hidden > 0 ? h('li', { class: 'muted' }, '+' + hidden + ' more') : null),

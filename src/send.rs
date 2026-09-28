@@ -51,6 +51,9 @@ pub struct SendConfig {
     pub hash: bool,
     /// Metadata to put in the file map (`send --preserve`).
     pub preserve: Preserve,
+    /// Send what links, in `paths` or under them, point to, instead of
+    /// skipping them (on unless `send --no-follow-symlinks`).
+    pub follow_symlinks: bool,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -72,7 +75,7 @@ pub struct SendReport {
     pub file_hashes: Vec<(String, String)>,
     /// Metadata the receiver could not apply, and skipped sources.
     pub warnings: Vec<String>,
-    /// Symbolic links and special files that were not sent.
+    /// Links and special files that were not sent; `warnings` says why.
     pub skipped: Vec<String>,
     pub phase_times: PhaseTimes,
     pub elapsed: Duration,
@@ -182,7 +185,7 @@ fn run(cfg: &SendConfig, progress: &Progress) -> Result<SendReport> {
         "connections must be between 1 and 1024"
     );
     let chunk_size = ChunkSize::new(cfg.chunk_size)?;
-    let captured = filemap::capture(&cfg.paths, cfg.preserve)?;
+    let captured = filemap::capture(&cfg.paths, cfg.preserve, cfg.follow_symlinks)?;
     let files = captured
         .files
         .iter()
@@ -204,14 +207,19 @@ fn run(cfg: &SendConfig, progress: &Progress) -> Result<SendReport> {
         })
         .collect();
     let manifest = Manifest::new(chunk_size, entries)?;
+    let skip_warnings: Vec<String> = captured
+        .skipped
+        .iter()
+        .map(|s| format!("skipped {}: {}", s.path.display(), s.reason))
+        .collect();
+    for w in &skip_warnings {
+        eprintln!("mjolnir: {w}");
+    }
     let skipped: Vec<String> = captured
         .skipped
         .iter()
-        .map(|p| p.display().to_string())
+        .map(|s| s.path.display().to_string())
         .collect();
-    for p in &skipped {
-        eprintln!("mjolnir: skipping {p}: not a regular file or directory");
-    }
 
     let addrs = net::resolve(&cfg.addr)?;
     let cancelled = || progress.is_cancelled();
@@ -259,7 +267,7 @@ fn run(cfg: &SendConfig, progress: &Progress) -> Result<SendReport> {
     }
     let done = result?;
     let mut warnings = done.warnings;
-    warnings.extend(skipped.iter().map(|p| format!("skipped {p}")));
+    warnings.extend(skip_warnings);
     Ok(SendReport {
         files: manifest.files.len(),
         bytes_sent: ctx.bytes_sent.load(Relaxed),

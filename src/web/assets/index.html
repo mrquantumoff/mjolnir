@@ -105,6 +105,15 @@
             <p class="field-error" data-field-error="hash" hidden></p>
           </div>
 
+          <div class="field">
+            <label class="check">
+              <input id="send-follow-symlinks" name="follow_symlinks" type="checkbox" checked>
+              <span>Follow symbolic links</span>
+            </label>
+            <p class="muted tiny">Sends what links point to, even outside the chosen folders. Unchecked, every link is skipped.</p>
+            <p class="field-error" data-field-error="follow_symlinks" hidden></p>
+          </div>
+
           <fieldset class="field plain">
             <legend class="label">Preserve</legend>
             <div class="check-row">
