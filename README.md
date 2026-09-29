@@ -95,7 +95,7 @@ key.
 | Flag | Default | Meaning |
 |---|---|---|
 | `--key PATH` | required | this host's private key |
-| `--authorized FILE` | | allowed sender keys, one `<base64> [comment]` per line; `#` comments and blank lines are ignored |
+| `--authorized FILE` | | allowed sender keys, one `[options] <base64> [comment]` per line; `#` comments and blank lines are ignored. A line with tunnel options (see [Tunnels](#tunnels)) sends files only if it also says `transfer` |
 | `--allow KEY` | | allow one sender key; repeatable |
 | `--listen ADDR` | `0.0.0.0:7777` | address to listen on |
 | `--out DIR` | `.` | where files land |
@@ -157,10 +157,12 @@ so streams never stall each other. With `-n N`, each stream is striped
 across N connections and put back in order on the other side, which helps
 on high-latency links and on paths that throttle each connection. `-W
 HOST:PORT` carries one stream over stdin and stdout, for use as an ssh
-`ProxyCommand`. A stream that breaks resets the application's connection
+`ProxyCommand`; it exits 0 only once the server has written everything to
+the target. A stream that breaks resets the application's connection
 instead of ending it, so a cut-off download never looks complete.
-Permissions, per-key `permitopen` and `permitlisten` options, and the wire
-format are in [docs/TUNNEL.md](docs/TUNNEL.md).
+Permissions, per-key `permitopen`, `permitlisten`, and `transfer` options,
+the server's limits, and the wire format are in
+[docs/TUNNEL.md](docs/TUNNEL.md).
 
 ## How it works
 

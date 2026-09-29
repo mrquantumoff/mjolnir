@@ -53,7 +53,7 @@ ssh -o ProxyCommand="mjolnir tunnel relay:7778 --key client.key --peer <KEY> -W 
 | `--peer KEY` | required | the server's public key |
 | `-L, --local SPEC` | | `[BIND:]PORT:HOST:HOSTPORT`: listen on `BIND:PORT` here; each connection reaches `HOST:HOSTPORT` from the server; repeatable |
 | `-R, --remote SPEC` | | `[BIND:]PORT:HOST:HOSTPORT`: the server listens on `BIND:PORT`; each connection reaches `HOST:HOSTPORT` from here; repeatable |
-| `-W, --stdio HOST:PORT` | | carry one stream over stdin and stdout to `HOST:PORT` from the server, then exit |
+| `-W, --stdio HOST:PORT` | | carry one stream over stdin and stdout to `HOST:PORT` from the server; exits 0 once both directions have ended and the server has written everything to the target, and closes stdout as soon as the target's end arrives |
 | `-n, --connections N` | `1` | connections per stream, 1 to 32 |
 | `--cipher NAME` | `aes256gcm` | `aes256gcm` or `chacha20poly1305`, for stream frames |
 | `-v, --verbose` | off | log every stream |
@@ -77,7 +77,11 @@ loop) to reconnect.
 | `--permit-listen HOST:PORT` | none | addresses clients may listen on with `-R`; repeatable |
 | `-v, --verbose` | off | log every stream |
 
-The server serves any number of clients at once and runs until stopped.
+The server runs until stopped and serves up to 256 sessions at once, at
+most 8 per client key; a session's place is freed once it and its streams
+are gone. On Windows a `-R` listener is refused when any socket already
+holds its port, even on another address, since Windows would otherwise let
+`127.0.0.1:P` take the loopback traffic of a service on `0.0.0.0:P`.
 
 ## Permissions
 
@@ -98,16 +102,20 @@ line in the `--authorized` file can carry its own options, as in SSH's
 the defaults:
 
 ```
-# Can reach the database, nothing else.
+# Can reach the database, nothing else, and cannot send files.
 permitopen="db.internal:5432" AAAA...= laptop
-# Can publish one port on the server's loopback, and reach nothing.
-permitlisten="127.0.0.1:8080" BBBB...= ci-runner
-# Gets the --permit-* defaults.
+# Can publish one port on the server's loopback, reach nothing, and send files.
+permitlisten="127.0.0.1:8080",transfer BBBB...= ci-runner
+# Gets the --permit-* defaults, and can send files.
 CCCC...= admin
 ```
 
 Options are comma-separated `name=value` pairs with no spaces outside double
-quotes. `mjolnir recv` reads the same file format and ignores the options.
+quotes; `transfer` stands alone. A line with options grants only what they
+name, so one authorized-keys file can serve both `mjolnir recv` and
+`mjolnir tunnel-server`: `recv` takes files only from lines without options
+and from lines that say `transfer`, and at startup names each key it leaves
+out for being tunnel-only. The tunnel server ignores `transfer`.
 
 Which side may start streams follows from the forward's direction. For
 `-L`, the client asks and the server checks `permitopen`. For `-R`, the
@@ -134,9 +142,17 @@ kind 0 or 1, logs the mistake and closes the connection.
 The control connection runs `Noise_IK_25519_ChaChaPoly_SHA256` exactly as a
 transfer does, with the client as initiator, but with the prologue
 `mjolnir tunnel v1`. A handshake made for a transfer therefore never opens a
-tunnel session, nor the reverse. The server rejects unknown keys silently,
-with at most 256 connections in the handshake at once and 10 seconds for
-the preamble and message 1.
+tunnel session, nor the reverse. The server rejects unknown keys silently.
+
+A connection's whole handshake has one deadline: 10 seconds from accept to
+the client's `Hello`, or to a stream connection's hello and MAC check. At
+most 256 connections may be in their handshake at once. When one more
+arrives, the server does not refuse it: it closes the oldest connection of
+the address that holds the most of them, so idle connections cannot lock
+out new sessions or new streams, one source cannot push everyone else's
+handshakes out, and a burst from one client is never refused while the
+pool has room. A stream connection leaves the pool as soon as its MAC
+verifies.
 
 Keys come from the same `PRK` as a transfer's (`E(l)` is HKDF-Expand of the
 label `l`), plus:
@@ -168,13 +184,29 @@ ChaCha20-Poly1305(k, nonce = 0u32 | counter u64, postcard(msg))`), at most
 | 8 | `Error { message }` | both | the sender is ending the session |
 
 Noise message 1 can be replayed, so the server keeps a connection out of
-the session until its `Hello` decrypts (within 10 seconds). Only then does
-it register the session under its `route` and answer `Welcome`.
+the session until its `Hello` decrypts, within the handshake deadline.
+`Hello` seals to a fixed 18 bytes, and the server reads exactly that many
+straight from the socket, so a peer that only replayed message 1 can make
+it buffer at most 22 bytes, the same standard as a transfer's `Confirm`.
+Only then does it register the session under its `route` and answer
+`Welcome`; the session is registered before `Welcome` goes out, so a
+stream connection opened on seeing it always finds the session. A session
+that would exceed the server's or its key's limit is answered with `Error`
+instead.
+
+The server queues at most 64 control messages for a client. A client that
+stops reading its control connection is not read either once that queue
+fills, and a control write that stalls for 10 seconds ends the session.
+Host names in `Open` and `Listen` are at most 255 bytes, the DNS limit;
+longer ones are a protocol error.
 
 Client stream ids are 1, 2, 3, ... in the order of their `Open`s; server
-stream ids (for `-R`) have the top bit set. The server refuses an `Open`
-whose id is not above every earlier one, which lets it tell a stream that
-is still to come from one that is over.
+stream ids (for `-R`) have the top bit set and grow the same way. Each
+side refuses an id from the other that is not above every earlier one,
+which lets the server tell a stream that is still to come from one that
+is over, and keeps an id, and so its keys and frame counters, from being
+used twice. A session that has used all 2^31 server ids takes no further
+`-R` connections; a new session starts the ids afresh.
 
 ### Stream connections
 
@@ -214,31 +246,46 @@ frame  = header | AEAD(k_stream(s, i, d), nonce = 0u32 | k u64,
 `k` counts frames per connection and direction from 0, so a frame cannot
 be replayed, dropped, or reordered within a connection without failing to
 open. `seq` numbers the frames of one direction of the stream across all
-its connections, and each connection carries increasing `seq`s. A data
-frame holds 1 to 65536 plaintext bytes; a fin frame holds none and ends
-that direction, like a TCP half-close.
+its connections, and each connection carries increasing `seq`s, which the
+receiver enforces. A data frame holds 1 to 65536 plaintext bytes; a fin
+frame holds none and ends that direction, like a TCP half-close.
 
 The sender reads its local socket, numbers each read as a frame, and hands
 frames to whichever connection's writer is free, in order. The receiver
 puts frames back in `seq` order in a buffer of at most `(K + 1) * 2` MiB (up
-to 64 MiB), but always accepts the frame it needs next; since each
-connection's `seq`s increase, the connection carrying that frame is never
-stuck behind a later one, so a full buffer cannot deadlock. It stops reading
-the connections that are ahead, and TCP flow control slows the sender.
+to 64 MiB) per stream, and all streams of one process (a server or a
+client) share 256 MiB for out-of-order frames on top of that; the frame
+the receiver needs next is always accepted, whatever the buffers hold.
+The receiver stops reading the connections that are ahead, and TCP flow
+control slows the sender. Because each connection's `seq`s increase, the
+receiver knows which connections can still deliver the frame it needs
+next; once none can, because they have all passed it or closed, the stream
+aborts rather than waiting. A peer that sends frames out of order on one
+connection, or that skips a frame, therefore aborts its own stream and
+nothing else.
 
-A stream ends cleanly when both directions have delivered their fin. It
-aborts on any error: a frame that fails to open, a connection that fails,
-or every connection closing before the peer's fin. An aborted stream closes
-its connections, which the peer sees as the connections ending without a
-fin, and resets its local TCP connection (`SO_LINGER` 0), so an application
-sees a failure rather than an end of stream that would pass a cut-off
-download as complete. One failed connection aborts its whole stream:
-frames on it are lost, and there is no retransmission above TCP.
+Each side shuts down its connections' write halves only once it has
+written everything the peer sent to its local socket, and a stream ends
+cleanly once both directions have delivered their fin and every connection
+has been shut down by its peer. A clean end on one side therefore means
+the other side wrote all of its data out to its socket; what happens to
+those bytes afterwards is the application's TCP connection, as ever. A
+stream aborts on any error: a frame that fails to open, a connection that
+fails, or every connection closing before the peer's fin. An aborted
+stream closes its connections, which the peer sees as the connections
+ending without a fin, and resets its local TCP connection (`SO_LINGER` 0),
+so an application sees a failure rather than an end of stream that would
+pass a cut-off download as complete. A stream whose setup fails resets the
+application's connection the same way. One failed connection aborts its
+whole stream: frames on it are lost, and there is no retransmission above
+TCP.
 
-When the control connection ends, every stream and listener of the session
-ends with it, and so do its streams' local connections, with a reset. The
-same happens on Ctrl-C, on either side: the client or server resets the
-connections its streams carried before it exits.
+When the control connection closes cleanly, the session takes no new
+streams and drops its listeners, but its running streams finish on their
+own terms. When it ends any other way, with an error, an `Error` message,
+or the server stopping, every stream of the session ends with it, and so
+do its streams' local connections, with a reset. Ctrl-C on either side
+resets the connections that side's streams carried before it exits.
 
 ### Limits
 
@@ -246,6 +293,14 @@ connections its streams carried before it exits.
 |---|---|
 | Connections per stream | 32 |
 | Streams per session, starting or running | 256 |
+| Stream connections per session, over all its streams | 512 |
 | `-R` listeners per session | 64 |
-| Unauthenticated connections at once | 256 |
+| Sessions on the server | 256, at most 8 per key |
+| `-L` streams per client, starting or running | 256; the listener accepts only while one is free |
+| Connections in their handshake at once | 256; a full pool closes the oldest connection of the address with the most |
+| A connection's handshake, from accept | 10 s |
+| Control messages queued for a client | 64; a write that stalls 10 s ends the session |
+| Host name in `Open` and `Listen` | 255 bytes |
+| Out-of-order frames buffered | `(K + 1) * 2` MiB per stream, up to 64 MiB; 256 MiB per process over all streams, plus one frame per stream |
 | Connecting to a target | 10 s |
+| Gathering a stream's connections | 15 s |
