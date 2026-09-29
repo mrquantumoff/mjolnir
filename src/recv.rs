@@ -475,6 +475,9 @@ fn handshake(
     match wire::read_preamble(&mut io)? {
         ConnKind::Control => {}
         ConnKind::Data => return Ok(None),
+        ConnKind::TunnelControl | ConnKind::TunnelData => {
+            bail!("a tunnel client connected, but this port runs `mjolnir recv`")
+        }
     }
     let (keys, peer) = handshake_responder(&mut io, key, authorized)?;
     // Message 1 can be replayed, so the handshake alone proves nothing
