@@ -2,8 +2,8 @@
 //! targets when the client's key permits it, listens for `-R` forwards, and
 //! gathers each stream's connections.
 
-use std::collections::{HashMap, HashSet};
-use std::net::SocketAddr;
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering::Relaxed};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -12,7 +12,7 @@ use anyhow::{Context, Result, anyhow, bail, ensure};
 use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore, mpsc, oneshot, watch};
+use tokio::sync::{Notify, mpsc, oneshot, watch};
 use tokio::task::JoinSet;
 use tokio::time::{Instant, timeout, timeout_at};
 
@@ -20,8 +20,8 @@ use super::proto::{self, ADMITTED, CHALLENGE_LEN, CtrlRx, CtrlTx, HELLO_LEN, PRO
 use super::pump::{StreamCrypto, pump_tcp};
 use super::spec::{HostPort, Permits, Policy};
 use super::{
-    GATHER_WAIT, HANDSHAKE_DEADLINE, HELLO_DEADLINE, MAX_CONNS, SERVER_STREAM, connect_target,
-    connections, human, prepare,
+    GATHER_WAIT, HANDSHAKE_DEADLINE, MAX_CONNS, SERVER_STREAM, connect_target, connections, human,
+    prepare,
 };
 use crate::crypto::{self, Cipher, NOISE_MSG1_MAX, SessionKeys};
 use crate::keys::{PrivateKey, PublicKey};
@@ -36,7 +36,7 @@ pub struct ServerConfig {
     pub verbose: bool,
 }
 
-/// Connections not yet authenticated at once; more are closed at accept.
+/// Connections in their handshake at once. One more evicts one of them.
 const MAX_PENDING: usize = 256;
 /// Streams one session may have at once, counting ones still starting.
 const MAX_STREAMS: usize = 256;
@@ -55,9 +55,93 @@ struct Shared {
     verbose: bool,
     /// Live sessions by route, for stream connections to find theirs.
     sessions: Mutex<HashMap<[u8; 16], Arc<Session>>>,
-    pending: Arc<Semaphore>,
+    pending: Mutex<Pending>,
     /// Becomes true when the server stops.
     stop: watch::Sender<bool>,
+}
+
+/// Connections in their handshake, oldest first. A full pool evicts a
+/// connection rather than refusing the newest, so idle connections cannot
+/// lock out a live client. The victim is the oldest connection of the
+/// address holding the most of them: one source cannot push everyone
+/// else's handshakes out, and a burst from one client is never refused
+/// while the pool has room.
+#[derive(Default)]
+struct Pending {
+    by_age: BTreeMap<u64, (IpAddr, Arc<Notify>)>,
+    per_ip: HashMap<IpAddr, usize>,
+    next: u64,
+}
+
+/// A connection's place in [`Pending`]; dropping it frees the place.
+struct PendingSlot {
+    shared: Arc<Shared>,
+    id: u64,
+    ip: IpAddr,
+    /// Signalled when the pool evicts this connection.
+    evicted: Arc<Notify>,
+}
+
+impl Pending {
+    /// Takes a place for a connection from `ip`, evicting one first when
+    /// the pool is full.
+    fn admit(&mut self, ip: IpAddr) -> (u64, Arc<Notify>) {
+        *self.per_ip.entry(ip).or_insert(0) += 1;
+        if self.by_age.len() >= MAX_PENDING {
+            self.evict();
+        }
+        let id = self.next;
+        self.next += 1;
+        let evicted = Arc::new(Notify::new());
+        self.by_age.insert(id, (ip, evicted.clone()));
+        (id, evicted)
+    }
+
+    /// Closes the oldest connection among those of the addresses with the
+    /// most.
+    fn evict(&mut self) {
+        let most = self.per_ip.values().copied().max().unwrap_or(0);
+        let &id = self
+            .by_age
+            .iter()
+            .find(|(_, (ip, _))| self.per_ip[ip] == most)
+            .map(|(id, _)| id)
+            .expect("a full pool has a connection from a heaviest address");
+        let (ip, evicted) = self.by_age.remove(&id).expect("just found");
+        evicted.notify_one();
+        self.forget(ip);
+    }
+
+    /// Frees a place; a no-op for one the pool already evicted.
+    fn release(&mut self, id: u64, ip: IpAddr) {
+        if self.by_age.remove(&id).is_some() {
+            self.forget(ip);
+        }
+    }
+
+    fn forget(&mut self, ip: IpAddr) {
+        if let Some(n) = self.per_ip.get_mut(&ip) {
+            *n -= 1;
+            if *n == 0 {
+                self.per_ip.remove(&ip);
+            }
+        }
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.by_age.len()
+    }
+}
+
+impl Drop for PendingSlot {
+    fn drop(&mut self) {
+        self.shared
+            .pending
+            .lock()
+            .unwrap()
+            .release(self.id, self.ip);
+    }
 }
 
 impl TunnelServer {
@@ -76,7 +160,7 @@ impl TunnelServer {
                 policy: cfg.policy,
                 verbose: cfg.verbose,
                 sessions: Mutex::new(HashMap::new()),
-                pending: Arc::new(Semaphore::new(MAX_PENDING)),
+                pending: Mutex::new(Pending::default()),
                 stop: watch::Sender::new(false),
             }),
         })
@@ -119,13 +203,16 @@ impl TunnelServer {
                     }
                 },
             };
-            // Over the limit, the socket is closed right here.
-            let Ok(permit) = self.shared.pending.clone().try_acquire_owned() else {
-                continue;
+            let (id, evicted) = self.shared.pending.lock().unwrap().admit(from.ip());
+            let slot = PendingSlot {
+                shared: self.shared.clone(),
+                id,
+                ip: from.ip(),
+                evicted,
             };
             let (shared, alive) = (self.shared.clone(), alive.clone());
             tokio::spawn(async move {
-                if let Err(e) = serve(&shared, stream, from, permit).await {
+                if let Err(e) = serve(&shared, stream, from, slot).await {
                     eprintln!("mjolnir: tunnel connection from {from}: {e:#}");
                 }
                 drop(alive);
@@ -147,62 +234,126 @@ impl Drop for StopOnDrop {
     }
 }
 
+/// What a connection turned out to be once it authenticated.
+enum Admitted {
+    Control {
+        keys: SessionKeys,
+        peer: PublicKey,
+        cipher: Cipher,
+        rx: CtrlRx<()>,
+    },
+    Stream {
+        session: Arc<Session>,
+        stream: u32,
+        conn: u32,
+    },
+}
+
+/// Runs a connection's handshake within `HANDSHAKE_DEADLINE` of its accept,
+/// holding its pending place only until it has authenticated, then serves
+/// it.
 async fn serve(
     shared: &Arc<Shared>,
     mut stream: TcpStream,
     from: SocketAddr,
-    permit: OwnedSemaphorePermit,
+    slot: PendingSlot,
 ) -> Result<()> {
     prepare(&stream);
+    let deadline = Instant::now() + HANDSHAKE_DEADLINE;
+    let evicted = slot.evicted.clone();
+    let admitted = tokio::select! {
+        r = timeout_at(deadline, admit(shared, &mut stream)) => {
+            r.map_err(|_| anyhow!("no handshake within {HANDSHAKE_DEADLINE:?}"))??
+        }
+        () = evicted.notified() => bail!("closed to make room for a newer connection"),
+    };
+    drop(slot);
+    match admitted {
+        Admitted::Control {
+            keys,
+            peer,
+            cipher,
+            rx,
+        } => control(shared, stream, from, keys, peer, cipher, rx).await,
+        Admitted::Stream {
+            session,
+            stream: id,
+            conn,
+        } => session.attach(id, conn, stream).await,
+    }
+}
+
+/// The preamble and then, by kind, the Noise handshake and the `Hello`, or
+/// the stream challenge and its MAC. Nothing here buffers more than a
+/// fixed few bytes for a peer that has not proven itself.
+async fn admit(shared: &Arc<Shared>, stream: &mut TcpStream) -> Result<Admitted> {
     let mut preamble = [0u8; 6];
-    timeout(HANDSHAKE_DEADLINE, stream.read_exact(&mut preamble))
-        .await
-        .map_err(|_| anyhow!("no preamble within {HANDSHAKE_DEADLINE:?}"))??;
+    stream.read_exact(&mut preamble).await?;
     match ConnKind::from_preamble(&preamble)? {
-        ConnKind::TunnelControl => control(shared, stream, from, permit).await,
-        ConnKind::TunnelData => stream_conn(shared, stream, permit).await,
+        ConnKind::TunnelControl => {
+            let msg1 = proto::read_noise(stream, NOISE_MSG1_MAX)
+                .await
+                .context("reading Noise message 1")?;
+            let (msg2, keys, peer) =
+                crypto::respond(&msg1, &shared.key, shared.policy.keys(), PROLOGUE)?;
+            proto::write_noise(stream, &msg2).await?;
+            // Message 1 can be replayed; only the live client can seal
+            // `Hello`, which is read unbuffered and at its fixed length.
+            let mut rx = CtrlRx::new(&mut *stream, &keys, false);
+            let cipher = rx.recv_hello().await?;
+            let rx = rx.with_reader(|_| ());
+            Ok(Admitted::Control {
+                keys,
+                peer,
+                cipher,
+                rx,
+            })
+        }
+        ConnKind::TunnelData => {
+            let mut challenge = [0u8; CHALLENGE_LEN];
+            getrandom::fill(&mut challenge)
+                .map_err(|e| anyhow!("OS random number generator: {e}"))?;
+            stream.write_all(&challenge).await?;
+            let mut hello = [0u8; HELLO_LEN];
+            stream.read_exact(&mut hello).await?;
+            let (route, id, conn, mac) = proto::decode_hello(&hello);
+            let session = shared
+                .sessions
+                .lock()
+                .unwrap()
+                .get(&route)
+                .cloned()
+                .context("stream connection for an unknown session")?;
+            ensure!(
+                proto::check_hello(&session.keys, &challenge, id, conn, &mac),
+                "stream connection hello failed to authenticate"
+            );
+            Ok(Admitted::Stream {
+                session,
+                stream: id,
+                conn,
+            })
+        }
         ConnKind::Control | ConnKind::Data => {
             bail!("a file sender connected, but this port runs `mjolnir tunnel-server`")
         }
     }
 }
 
-/// Runs the handshake, waits for the client's `Hello`, and serves the
-/// session until its control connection ends.
+/// Registers the session, answers `Welcome`, and serves the session until
+/// its control connection ends.
 async fn control(
     shared: &Arc<Shared>,
-    mut stream: TcpStream,
+    stream: TcpStream,
     from: SocketAddr,
-    permit: OwnedSemaphorePermit,
+    keys: SessionKeys,
+    peer: PublicKey,
+    cipher: Cipher,
+    rx: CtrlRx<()>,
 ) -> Result<()> {
-    let handshake = async {
-        let msg1 = proto::read_noise(&mut stream, NOISE_MSG1_MAX)
-            .await
-            .context("reading Noise message 1")?;
-        let (msg2, keys, peer) =
-            crypto::respond(&msg1, &shared.key, shared.policy.keys(), PROLOGUE)?;
-        proto::write_noise(&mut stream, &msg2).await?;
-        anyhow::Ok((keys, peer))
-    };
-    let (keys, peer) = timeout(HANDSHAKE_DEADLINE, handshake)
-        .await
-        .map_err(|_| anyhow!("handshake did not finish within {HANDSHAKE_DEADLINE:?}"))??;
     let (r, w) = stream.into_split();
-    let (mut tx, mut rx) = proto::control(BufReader::new(r), w, &keys, false);
-    // Message 1 can be replayed; only the live client can seal `Hello`.
-    let cipher = match timeout(HELLO_DEADLINE, rx.recv()).await {
-        Ok(Ok(Some(TunnelMsg::Hello { cipher }))) => cipher,
-        Ok(Ok(None)) => bail!("closed before Hello"),
-        Ok(Ok(other)) => bail!("expected Hello, got {other:?}"),
-        Ok(Err(e)) => return Err(e.context("waiting for Hello")),
-        Err(_) => bail!("no Hello within {HELLO_DEADLINE:?}"),
-    };
-    tx.send(&TunnelMsg::Welcome {
-        max_conns: MAX_CONNS,
-    })
-    .await?;
-    drop(permit);
-
+    let mut tx = CtrlTx::new(w, &keys, false);
+    let rx = rx.with_reader(|()| BufReader::new(r));
     let (ctrl, ctrl_rx) = mpsc::unbounded_channel();
     let route = proto::route(&keys);
     let session = Arc::new(Session {
@@ -217,53 +368,27 @@ async fn control(
         streams: AtomicUsize::new(0),
         next_server_stream: AtomicU32::new(0),
     });
+    // Registered before `Welcome` goes out, so a stream connection the
+    // client opens on seeing it always finds the session.
     shared
         .sessions
         .lock()
         .unwrap()
         .insert(route, session.clone());
     eprintln!("mjolnir: tunnel session from {from} (key {peer})");
-    let result = session.run(tx, rx, ctrl_rx, shared.stop.subscribe()).await;
+    let result = async {
+        tx.send(&TunnelMsg::Welcome {
+            max_conns: MAX_CONNS,
+        })
+        .await?;
+        session.run(tx, rx, ctrl_rx, shared.stop.subscribe()).await
+    }
+    .await;
     shared.sessions.lock().unwrap().remove(&route);
     match result {
         Ok(()) => eprintln!("mjolnir: tunnel session from {from} closed"),
         Err(e) => eprintln!("mjolnir: tunnel session from {from} ended: {e:#}"),
     }
-    Ok(())
-}
-
-/// A stream connection: answer the challenge, find the session by route,
-/// check the MAC, and hand the socket to its stream.
-async fn stream_conn(
-    shared: &Arc<Shared>,
-    mut stream: TcpStream,
-    permit: OwnedSemaphorePermit,
-) -> Result<()> {
-    let mut challenge = [0u8; CHALLENGE_LEN];
-    getrandom::fill(&mut challenge).map_err(|e| anyhow!("OS random number generator: {e}"))?;
-    let mut hello = [0u8; HELLO_LEN];
-    let exchange = async {
-        stream.write_all(&challenge).await?;
-        stream.read_exact(&mut hello).await?;
-        anyhow::Ok(())
-    };
-    timeout(HANDSHAKE_DEADLINE, exchange)
-        .await
-        .map_err(|_| anyhow!("no stream hello within {HANDSHAKE_DEADLINE:?}"))??;
-    let (route, id, conn, mac) = proto::decode_hello(&hello);
-    let session = shared
-        .sessions
-        .lock()
-        .unwrap()
-        .get(&route)
-        .cloned()
-        .context("stream connection for an unknown session")?;
-    ensure!(
-        proto::check_hello(&session.keys, &challenge, id, conn, &mac),
-        "stream connection hello failed to authenticate"
-    );
-    session.attach(id, conn, stream).await?;
-    drop(permit);
     Ok(())
 }
 
@@ -659,5 +784,62 @@ impl Session {
                 Some(_) = streams.join_next(), if !streams.is_empty() => {}
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::time::timeout;
+
+    fn told(evicted: &Notify) -> bool {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            timeout(Duration::from_millis(100), evicted.notified())
+                .await
+                .is_ok()
+        })
+    }
+
+    #[test]
+    fn a_full_pool_evicts_the_oldest_of_the_heaviest_address() {
+        let ip = |n: u8| IpAddr::from([10, 0, 0, n]);
+        let mut pool = Pending::default();
+        // One address floods; two others each hold one older connection.
+        let (victim_id, victim) = pool.admit(ip(1));
+        let (_, bystander) = pool.admit(ip(2));
+        let mut flood = Vec::new();
+        for _ in 2..MAX_PENDING {
+            flood.push(pool.admit(ip(9)));
+        }
+        assert_eq!(pool.len(), MAX_PENDING);
+        // Full: a newcomer from a third address evicts the flooder's oldest,
+        // not the oldest connection overall.
+        let (_, newcomer) = pool.admit(ip(3));
+        assert_eq!(pool.len(), MAX_PENDING);
+        assert!(told(&flood[0].1), "the flooder's oldest goes first");
+        assert!(!told(&victim) && !told(&bystander) && !told(&newcomer));
+        // The flooder's own newcomer evicts the flooder again.
+        pool.admit(ip(9));
+        assert!(told(&flood[1].1));
+        // Releasing an evicted slot is a no-op; releasing a live one frees it.
+        pool.release(flood[0].0, ip(9));
+        assert_eq!(pool.len(), MAX_PENDING);
+        pool.release(victim_id, ip(1));
+        assert_eq!(pool.len(), MAX_PENDING - 1);
+        assert!(!pool.per_ip.contains_key(&ip(1)));
+    }
+
+    #[test]
+    fn a_full_pool_of_equals_evicts_the_oldest() {
+        let ip = |n: u16| IpAddr::from([10, 0, (n >> 8) as u8, n as u8]);
+        let mut pool = Pending::default();
+        let slots: Vec<_> = (0..MAX_PENDING as u16).map(|n| pool.admit(ip(n))).collect();
+        pool.admit(ip(999));
+        assert!(told(&slots[0].1));
+        assert!(!told(&slots[1].1));
     }
 }

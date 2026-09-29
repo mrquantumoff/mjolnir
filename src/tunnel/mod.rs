@@ -17,6 +17,8 @@ mod proto;
 mod pump;
 mod server;
 mod spec;
+#[cfg(test)]
+mod tests;
 
 pub use client::{ClientConfig, TunnelClient};
 pub use pump::Traffic;
@@ -37,11 +39,9 @@ pub const MAX_CONNS: u32 = 32;
 /// Stream ids the server picks (for `-R`) have this bit set; the client's
 /// do not.
 const SERVER_STREAM: u32 = 1 << 31;
-/// Preamble plus Noise message 1, and a stream hello, must arrive within
-/// this.
+/// A connection's whole handshake, from accept to the client's `Hello` or
+/// to a stream hello's MAC check, must finish within this.
 const HANDSHAKE_DEADLINE: Duration = Duration::from_secs(10);
-/// After the handshake, the client's `Hello` must arrive within this.
-const HELLO_DEADLINE: Duration = Duration::from_secs(10);
 /// Connecting to a server, a forward target, or a `-R` destination.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// How long a new stream waits for all of its connections.

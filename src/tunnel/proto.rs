@@ -2,7 +2,7 @@
 //! channel, the stream connection hello, and stream frames. The layouts are
 //! specified in `docs/TUNNEL.md`.
 
-use anyhow::{Context, Result, anyhow, ensure};
+use anyhow::{Context, Result, anyhow, bail, ensure};
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
@@ -80,29 +80,40 @@ pub struct CtrlRx<R> {
     cipher: CipherState,
 }
 
-/// Wraps a handshaken control connection. The client sends under
+/// The keys of a handshaken control connection: the client sends under
 /// `k_ctrl_s2r`, the server under `k_ctrl_r2s`.
+fn control_keys(keys: &SessionKeys, client: bool) -> (&[u8; 32], &[u8; 32]) {
+    if client {
+        (&keys.ctrl_s2r, &keys.ctrl_r2s)
+    } else {
+        (&keys.ctrl_r2s, &keys.ctrl_s2r)
+    }
+}
+
+/// Wraps a handshaken control connection.
 pub fn control<R, W>(
     reader: R,
     writer: W,
     keys: &SessionKeys,
     client: bool,
 ) -> (CtrlTx<W>, CtrlRx<R>) {
-    let (tx, rx) = if client {
-        (&keys.ctrl_s2r, &keys.ctrl_r2s)
-    } else {
-        (&keys.ctrl_r2s, &keys.ctrl_s2r)
-    };
     (
+        CtrlTx::new(writer, keys, client),
+        CtrlRx::new(reader, keys, client),
+    )
+}
+
+/// The sealed length of `Hello`: its postcard tag, the cipher's tag, and
+/// the AEAD tag.
+pub const HELLO_MSG_LEN: usize = 2 + TAG_LEN;
+
+impl<W> CtrlTx<W> {
+    pub fn new(writer: W, keys: &SessionKeys, client: bool) -> Self {
         CtrlTx {
             writer,
-            cipher: CipherState::new(Cipher::ChaCha20Poly1305, tx),
-        },
-        CtrlRx {
-            reader,
-            cipher: CipherState::new(Cipher::ChaCha20Poly1305, rx),
-        },
-    )
+            cipher: CipherState::new(Cipher::ChaCha20Poly1305, control_keys(keys, client).0),
+        }
+    }
 }
 
 impl<W: AsyncWrite + Unpin> CtrlTx<W> {
@@ -119,7 +130,51 @@ impl<W: AsyncWrite + Unpin> CtrlTx<W> {
     }
 }
 
+impl<R> CtrlRx<R> {
+    pub fn new(reader: R, keys: &SessionKeys, client: bool) -> Self {
+        CtrlRx {
+            reader,
+            cipher: CipherState::new(Cipher::ChaCha20Poly1305, control_keys(keys, client).1),
+        }
+    }
+
+    /// Continues the same stream on another reader, say one with a buffer,
+    /// keeping the receive state.
+    pub fn with_reader<R2>(self, reader: impl FnOnce(R) -> R2) -> CtrlRx<R2> {
+        CtrlRx {
+            reader: reader(self.reader),
+            cipher: self.cipher,
+        }
+    }
+}
+
 impl<R: AsyncRead + Unpin> CtrlRx<R> {
+    /// Reads the `Hello` that opens a session. Its length is fixed, so a
+    /// peer that only replayed Noise message 1, and so cannot seal
+    /// anything, gets at most `HELLO_MSG_LEN` bytes of buffer before it is
+    /// dropped, and never a message-sized allocation.
+    pub async fn recv_hello(&mut self) -> Result<Cipher> {
+        let mut len = [0u8; 4];
+        self.reader
+            .read_exact(&mut len)
+            .await
+            .context("closed before Hello")?;
+        let len = u32::from_be_bytes(len) as usize;
+        ensure!(len == HELLO_MSG_LEN, "bad Hello length {len}");
+        let mut buf = [0u8; HELLO_MSG_LEN];
+        self.reader
+            .read_exact(&mut buf)
+            .await
+            .context("closed before Hello")?;
+        self.cipher
+            .open(b"", &mut buf)
+            .context("Hello failed to authenticate")?;
+        match postcard::from_bytes(&buf[..HELLO_MSG_LEN - TAG_LEN]).context("malformed Hello")? {
+            TunnelMsg::Hello { cipher } => Ok(cipher),
+            other => bail!("expected Hello, got {other:?}"),
+        }
+    }
+
     /// The next message, or `None` if the peer closed the connection
     /// between messages. Not cancellation safe: a message half read when the
     /// future is dropped is lost, and the stream with it.
@@ -329,6 +384,37 @@ mod tests {
             // The client's own receive key is the other direction.
             let (_, mut wrong) = control(&wire[..], tokio::io::sink(), &keys, true);
             assert!(wrong.recv().await.is_err());
+        });
+    }
+
+    #[test]
+    fn hello_seals_to_its_fixed_length_for_every_cipher() {
+        let keys = SessionKeys::derive(&[1u8; 32], &[2u8; 32]);
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            for cipher in [Cipher::Aes256Gcm, Cipher::ChaCha20Poly1305] {
+                let mut tx = CtrlTx::new(Vec::new(), &keys, true);
+                tx.send(&TunnelMsg::Hello { cipher }).await.unwrap();
+                assert_eq!(tx.writer.len(), 4 + HELLO_MSG_LEN);
+                let mut rx = CtrlRx::new(&tx.writer[..], &keys, false);
+                assert_eq!(rx.recv_hello().await.unwrap(), cipher);
+            }
+            let mut tx = CtrlTx::new(Vec::new(), &keys, true);
+            tx.send(&TunnelMsg::Welcome { max_conns: 1 }).await.unwrap();
+            let mut rx = CtrlRx::new(&tx.writer[..], &keys, false);
+            assert!(rx.recv_hello().await.is_err());
+            let mut tx = CtrlTx::new(Vec::new(), &keys, true);
+            tx.send(&TunnelMsg::Close {
+                stream: 1,
+                message: String::new(),
+            })
+            .await
+            .unwrap();
+            let mut rx = CtrlRx::new(&tx.writer[..], &keys, false);
+            let err = rx.recv_hello().await.unwrap_err().to_string();
+            assert!(err.contains("bad Hello length"), "{err}");
         });
     }
 

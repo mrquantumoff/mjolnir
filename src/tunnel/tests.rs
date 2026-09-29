@@ -1,0 +1,191 @@
+//! Protocol-level tests that drive the server with hand-made clients: the
+//! handshake pool, replayed handshakes, and peers that break the rules.
+
+use std::net::SocketAddr;
+use std::time::{Duration, Instant};
+
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::{TcpListener, TcpStream};
+use tokio::time::{sleep, timeout};
+
+use super::proto::{self, PROLOGUE};
+use super::{ClientConfig, Permits, Policy, ServerConfig, TunnelClient, TunnelServer};
+use crate::crypto::{Cipher, Initiator, NOISE_MSG_MAX, SessionKeys};
+use crate::keys::{AuthorizedKey, PrivateKey, PublicKey};
+use crate::wire::ConnKind;
+
+const LIMIT: Duration = Duration::from_secs(30);
+/// The server's pool of connections in their handshake.
+const MAX_PENDING: usize = 256;
+
+struct Srv {
+    addr: SocketAddr,
+    pubkey: PublicKey,
+    client: PrivateKey,
+}
+
+async fn start_server(open: &[&str], listen: &[&str]) -> Srv {
+    let client = PrivateKey::generate();
+    let policy = Policy::new(
+        &[AuthorizedKey {
+            key: client.public_key(),
+            options: vec![],
+        }],
+        Permits {
+            open: open.iter().map(|p| p.parse().unwrap()).collect(),
+            listen: listen.iter().map(|p| p.parse().unwrap()).collect(),
+        },
+    )
+    .unwrap();
+    let server = TunnelServer::bind(ServerConfig {
+        listen: "127.0.0.1:0".parse().unwrap(),
+        key: PrivateKey::generate(),
+        policy,
+        verbose: false,
+    })
+    .await
+    .unwrap();
+    let (addr, pubkey) = (server.local_addr(), server.public_key());
+    tokio::spawn(server.run());
+    Srv {
+        addr,
+        pubkey,
+        client,
+    }
+}
+
+fn cfg(s: &Srv, conns: u32, local: &[String]) -> ClientConfig {
+    ClientConfig {
+        addr: s.addr.to_string(),
+        key: s.client.clone(),
+        peer: s.pubkey,
+        cipher: Cipher::Aes256Gcm,
+        conns,
+        local: local.iter().map(|x| x.parse().unwrap()).collect(),
+        remote: vec![],
+        verbose: false,
+    }
+}
+
+/// The Noise handshake on a fresh connection, up to but not including
+/// `Hello`.
+async fn raw_handshake(s: &Srv) -> (TcpStream, SessionKeys) {
+    let mut t = TcpStream::connect(s.addr).await.unwrap();
+    t.write_all(&ConnKind::TunnelControl.preamble())
+        .await
+        .unwrap();
+    let (hs, m1) = Initiator::start(&s.client, &s.pubkey, PROLOGUE).unwrap();
+    proto::write_noise(&mut t, &m1).await.unwrap();
+    let m2 = proto::read_noise(&mut t, NOISE_MSG_MAX).await.unwrap();
+    (t, hs.finish(&m2).unwrap())
+}
+
+async fn echo_server() -> SocketAddr {
+    let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let a = l.local_addr().unwrap();
+    tokio::spawn(async move {
+        loop {
+            let (mut s, _) = l.accept().await.unwrap();
+            tokio::spawn(async move {
+                let (mut r, mut w) = s.split();
+                let _ = tokio::io::copy(&mut r, &mut w).await;
+                let _ = w.shutdown().await;
+            });
+        }
+    });
+    a
+}
+
+async fn round_trip(addr: SocketAddr, data: &[u8]) -> std::io::Result<Vec<u8>> {
+    let mut s = TcpStream::connect(addr).await?;
+    let (mut r, mut w) = s.split();
+    let write = async {
+        w.write_all(data).await?;
+        w.shutdown().await
+    };
+    let read = async {
+        let mut got = Vec::new();
+        r.read_to_end(&mut got).await?;
+        Ok(got)
+    };
+    let (a, b) = tokio::join!(write, read);
+    a?;
+    b
+}
+
+/// How long until the peer closes or resets `s`, reading and discarding.
+async fn until_closed(mut s: TcpStream, t0: Instant) -> Duration {
+    let mut buf = [0u8; 4096];
+    loop {
+        match s.read(&mut buf).await {
+            Ok(0) | Err(_) => return t0.elapsed(),
+            Ok(_) => {}
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn idle_connections_do_not_lock_out_sessions_or_streams() {
+    let echo = echo_server().await;
+    let srv = start_server(&["127.0.0.1:*"], &[]).await;
+    let spec = format!("127.0.0.1:0:127.0.0.1:{}", echo.port());
+    let client = TunnelClient::connect(cfg(&srv, 1, std::slice::from_ref(&spec)))
+        .await
+        .unwrap();
+    let local = client.local_addrs()[0];
+    tokio::spawn(client.run());
+    assert_eq!(round_trip(local, b"ping").await.unwrap(), b"ping");
+
+    let mut idle = Vec::new();
+    for _ in 0..MAX_PENDING {
+        idle.push(TcpStream::connect(srv.addr).await.unwrap());
+    }
+    sleep(Duration::from_millis(300)).await;
+    let got = timeout(LIMIT, round_trip(local, b"ping"))
+        .await
+        .expect("a stream on an established session must not wait for idle sockets")
+        .expect("idle sockets must not break a stream");
+    assert_eq!(got, b"ping");
+    let fresh = timeout(LIMIT, TunnelClient::connect(cfg(&srv, 1, &[])))
+        .await
+        .expect("a new session must not wait for idle sockets");
+    fresh.expect("idle sockets must not refuse a new session");
+    drop(idle);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_handshake_has_one_deadline_from_accept() {
+    let srv = start_server(&[], &[]).await;
+    let t0 = Instant::now();
+    let mut t = TcpStream::connect(srv.addr).await.unwrap();
+    // A preamble sent late does not buy another full deadline.
+    sleep(Duration::from_secs(8)).await;
+    t.write_all(&ConnKind::TunnelControl.preamble())
+        .await
+        .unwrap();
+    let closed = timeout(Duration::from_secs(20), until_closed(t, t0))
+        .await
+        .expect("the server closes an unfinished handshake");
+    assert!(
+        closed < Duration::from_secs(13),
+        "closed only after {closed:?}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_replayed_message_1_gets_no_buffer_past_hello() {
+    let srv = start_server(&[], &[]).await;
+    // Whoever replays message 1 gets message 2 back but cannot seal a
+    // Hello; claiming a long one must not make the server wait for it.
+    let (mut t, _keys) = raw_handshake(&srv).await;
+    let t0 = Instant::now();
+    t.write_all(&(64u32 << 10).to_be_bytes()).await.unwrap();
+    t.write_all(&[0u8; 100]).await.unwrap();
+    let closed = timeout(Duration::from_secs(20), until_closed(t, t0))
+        .await
+        .expect("the server closes the connection");
+    assert!(
+        closed < Duration::from_secs(3),
+        "the server waited {closed:?} for a body it should never read"
+    );
+}
