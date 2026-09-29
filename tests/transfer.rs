@@ -710,10 +710,14 @@ fn a_stalled_handshake_does_not_block_a_real_sender() {
     stall.write_all(b"MJLN\x02\x00\xff").unwrap();
     thread::sleep(Duration::from_millis(100));
 
-    let started = Instant::now();
-    Send::to(sk, rx.public).run(rx.addr, &[&file]).unwrap();
+    let report = Send::to(sk, rx.public).run(rx.addr, &[&file]).unwrap();
     rx.join().unwrap();
-    assert!(started.elapsed() < Duration::from_secs(5));
+    // The guarded property is that the handshake does not wait out the
+    // stalled peer's 10 s deadline, so bound the connect phase only: the
+    // durable publish after the data is disk-bound and took over 5 s on
+    // loaded CI runners.
+    let connect = report.phase_times.connect;
+    assert!(connect < Duration::from_secs(5), "connect took {connect:?}");
     assert_file_eq(&file, &out.path().join("f.bin"));
     drop(stall);
 }
