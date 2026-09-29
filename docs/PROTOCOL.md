@@ -57,8 +57,10 @@ same form WireGuard uses.
   `known_hosts` entry.
 - The receiver admits only senders whose public key is listed in its
   authorized keys file (`--authorized`), like SSH `authorized_keys`. Each
-  line is `<base64 key> [comment]`; blank lines and lines starting with `#`
-  are ignored. `--allow <KEY>` adds a key from the command line.
+  line is `[options] <base64 key> [comment]`; blank lines and lines
+  starting with `#` are ignored. A line with tunnel options (see
+  [TUNNEL.md](TUNNEL.md)) authorizes a sender only if it also carries the
+  `transfer` option. `--allow <KEY>` adds a key from the command line.
 
 ## Connection preamble
 
@@ -67,6 +69,9 @@ Every TCP connection starts with the sender writing 6 bytes:
 ```
 "MJLN" (4 bytes) | version u8 = 2 | kind u8 (0 = control, 1 = data)
 ```
+
+Kinds 2 and 3 belong to tunnels, which share the preamble, handshake, and
+key schedule but run their own protocol; see [TUNNEL.md](TUNNEL.md).
 
 The first connection must be the control connection. Data connections are
 accepted only after the control handshake has finished.

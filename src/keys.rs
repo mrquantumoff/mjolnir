@@ -6,7 +6,7 @@ use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{Context, Result, anyhow, bail, ensure};
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as B64;
 use curve25519_dalek::montgomery::MontgomeryPoint;
@@ -172,29 +172,157 @@ pub fn default_key_path() -> Result<PathBuf> {
     Ok(config.join("mjolnir").join("mjolnir.key"))
 }
 
-/// Parses an authorized-keys file: one `<base64 key> [comment]` per line;
-/// blank lines and lines starting with `#` are ignored.
-pub fn parse_authorized_keys(text: &str) -> Result<Vec<PublicKey>> {
+/// One line of an authorized-keys file.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AuthorizedKey {
+    pub key: PublicKey,
+    /// Options written before the key, in order. A line without options
+    /// grants everything; a line with options grants only what they name.
+    pub options: Vec<KeyOption>,
+}
+
+/// An option on an authorized-keys line, as in SSH's `authorized_keys`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum KeyOption {
+    /// `permitopen="HOST:PORT"`: the tunnel server lets this key reach
+    /// matching targets with `-L` and `-W`.
+    PermitOpen(String),
+    /// `permitlisten="HOST:PORT"`: the tunnel server lets this key listen
+    /// on matching addresses with `-R`.
+    PermitListen(String),
+    /// `transfer`: `mjolnir recv` accepts files from this key. A line with
+    /// tunnel options and without this one is a tunnel-only key.
+    Transfer,
+}
+
+/// Option names an authorized-keys line may carry.
+pub const KEY_OPTIONS: &[&str] = &["permitopen", "permitlisten", "transfer"];
+
+impl AuthorizedKey {
+    /// Whether `mjolnir recv` may take files from this key: a line without
+    /// options, or one that says `transfer`.
+    pub fn grants_transfer(&self) -> bool {
+        self.options.is_empty() || self.options.contains(&KeyOption::Transfer)
+    }
+}
+
+/// Parses an authorized-keys file: one `[options] <base64 key> [comment]`
+/// per line; blank lines and lines starting with `#` are ignored. Options
+/// are `name=value` pairs joined by commas, with no spaces unless the value
+/// is in double quotes, as in SSH's `authorized_keys`.
+pub fn parse_authorized_entries(text: &str) -> Result<Vec<AuthorizedKey>> {
     let mut keys = Vec::new();
     for (n, line) in text.lines().enumerate() {
         let line = line.trim();
         if line.is_empty() || line.starts_with('#') {
             continue;
         }
-        let token = line.split_whitespace().next().unwrap_or_default();
-        let key = token
-            .parse()
-            .with_context(|| format!("authorized keys line {}", n + 1))?;
-        keys.push(key);
+        let entry = parse_entry(line).with_context(|| format!("authorized keys line {}", n + 1))?;
+        keys.push(entry);
     }
     Ok(keys)
 }
 
-/// Reads and parses an authorized-keys file.
+fn parse_entry(line: &str) -> Result<AuthorizedKey> {
+    let first = line.split_whitespace().next().unwrap_or_default();
+    if !looks_like_options(first) {
+        return Ok(AuthorizedKey {
+            key: first.parse()?,
+            options: Vec::new(),
+        });
+    }
+    // Options run up to the first space outside double quotes.
+    let mut options = Vec::new();
+    let (mut name, mut value) = (String::new(), None::<String>);
+    let mut quoted = false;
+    let mut rest = "";
+    let mut finish = |name: &mut String, value: &mut Option<String>| -> Result<()> {
+        let needs_value = |value: &mut Option<String>| {
+            value
+                .take()
+                .ok_or_else(|| anyhow!("option {name:?} needs a value, as in {name}=\"...\""))
+        };
+        let option = match name.as_str() {
+            "permitopen" => KeyOption::PermitOpen(needs_value(value)?),
+            "permitlisten" => KeyOption::PermitListen(needs_value(value)?),
+            "transfer" => {
+                ensure!(value.take().is_none(), "option \"transfer\" takes no value");
+                KeyOption::Transfer
+            }
+            _ => bail!(
+                "unknown option {name:?} (known: {})",
+                KEY_OPTIONS.join(", ")
+            ),
+        };
+        name.clear();
+        options.push(option);
+        Ok(())
+    };
+    for (i, c) in line.char_indices() {
+        match (c, quoted, value.is_some()) {
+            ('"', _, true) => quoted = !quoted,
+            (c, false, _) if c.is_whitespace() => {
+                rest = &line[i..];
+                break;
+            }
+            (',', false, _) => finish(&mut name, &mut value)?,
+            ('=', false, false) => value = Some(String::new()),
+            (c, _, true) => value.as_mut().unwrap().push(c),
+            (c, false, false) => name.push(c.to_ascii_lowercase()),
+            (_, true, false) => unreachable!("quotes open only inside a value"),
+        }
+    }
+    ensure!(!quoted, "unterminated quote in the options");
+    finish(&mut name, &mut value)?;
+    let token = rest
+        .split_whitespace()
+        .next()
+        .context("no key after the options")?;
+    Ok(AuthorizedKey {
+        key: token.parse()?,
+        options,
+    })
+}
+
+/// Whether a line's first token is options rather than a key: `name=` with
+/// something other than base64 padding after the `=`, or a bare option name.
+fn looks_like_options(token: &str) -> bool {
+    match token.split_once('=') {
+        Some((name, value)) => {
+            !name.is_empty()
+                && name.chars().all(|c| c.is_ascii_alphabetic())
+                && !value.chars().all(|c| c == '=')
+        }
+        None => KEY_OPTIONS.contains(&token.to_ascii_lowercase().as_str()),
+    }
+}
+
+/// Parses an authorized-keys file and keeps the keys that may send files:
+/// tunnel-only lines are left out. See [`AuthorizedKey::grants_transfer`].
+pub fn parse_authorized_keys(text: &str) -> Result<Vec<PublicKey>> {
+    Ok(transfer_keys(&parse_authorized_entries(text)?))
+}
+
+/// Reads and parses an authorized-keys file, keeping the keys that may
+/// send files.
 pub fn load_authorized_keys(path: &Path) -> Result<Vec<PublicKey>> {
+    Ok(transfer_keys(&load_authorized_entries(path)?))
+}
+
+/// The keys among `entries` that may send files.
+pub fn transfer_keys(entries: &[AuthorizedKey]) -> Vec<PublicKey> {
+    entries
+        .iter()
+        .filter(|e| e.grants_transfer())
+        .map(|e| e.key)
+        .collect()
+}
+
+/// Reads and parses an authorized-keys file, options included.
+pub fn load_authorized_entries(path: &Path) -> Result<Vec<AuthorizedKey>> {
     let text = std::fs::read_to_string(path)
         .with_context(|| format!("reading authorized keys {}", path.display()))?;
-    parse_authorized_keys(&text).with_context(|| format!("in {}", path.display()))
+    parse_authorized_entries(&text).with_context(|| format!("in {}", path.display()))
 }
 
 pub(crate) fn require_nonempty(keys: &[PublicKey]) -> Result<()> {
@@ -310,6 +438,76 @@ mod tests {
         std::fs::write(&plain, B64.encode([7u8; 32])).unwrap();
         let err = format!("{:#}", PrivateKey::load(&plain).unwrap_err());
         assert!(err.contains("S-1-1-0") && err.contains("icacls"), "{err}");
+    }
+
+    #[test]
+    fn authorized_key_options() {
+        let a = PrivateKey::generate().public_key();
+        let b = PrivateKey::generate().public_key();
+        let text = format!(
+            "permitopen=\"db:5432\",PermitOpen=\"[::1]:22\",permitlisten=\"127.0.0.1:8080\" {a} backup\n\
+             permitopen=\"a b:1\" {b}\n{b} plain\n"
+        );
+        let entries = parse_authorized_entries(&text).unwrap();
+        assert_eq!(entries.len(), 3);
+        assert_eq!(entries[0].key, a);
+        assert_eq!(
+            entries[0].options,
+            vec![
+                KeyOption::PermitOpen("db:5432".into()),
+                KeyOption::PermitOpen("[::1]:22".into()),
+                KeyOption::PermitListen("127.0.0.1:8080".into()),
+            ]
+        );
+        assert_eq!(
+            entries[1].options,
+            vec![KeyOption::PermitOpen("a b:1".into())]
+        );
+        assert!(entries[2].options.is_empty());
+    }
+
+    /// A shared file: a key restricted to tunnels must not become a file
+    /// sender, while a plain line and a `transfer` line still do.
+    #[test]
+    fn tunnel_only_keys_do_not_send_files() {
+        let (a, b, c, d) = (
+            PrivateKey::generate().public_key(),
+            PrivateKey::generate().public_key(),
+            PrivateKey::generate().public_key(),
+            PrivateKey::generate().public_key(),
+        );
+        let text = format!(
+            "permitopen=\"db:5432\" {a} tunnel only\n{b} plain\n\
+             permitlisten=\"127.0.0.1:8080\",transfer {c} both\nTransfer {d}\n"
+        );
+        let entries = parse_authorized_entries(&text).unwrap();
+        assert!(!entries[0].grants_transfer());
+        assert!(entries[1].grants_transfer());
+        assert!(entries[2].grants_transfer());
+        assert_eq!(entries[3].options, vec![KeyOption::Transfer]);
+        assert_eq!(parse_authorized_keys(&text).unwrap(), vec![b, c, d]);
+        let err = format!(
+            "{:#}",
+            parse_authorized_keys(&format!("transfer=\"yes\" {a}")).unwrap_err()
+        );
+        assert!(err.contains("takes no value"), "{err}");
+    }
+
+    #[test]
+    fn authorized_key_bad_options_are_named() {
+        let a = PrivateKey::generate().public_key();
+        for (line, want) in [
+            (format!("permitopn=\"x:1\" {a}"), "unknown option"),
+            (format!("permitopen {a}"), "needs a value"),
+            (format!("permitopen=\"x:1 {a}"), "unterminated"),
+            ("permitopen=x:1".to_string(), "no key"),
+        ] {
+            let err = format!("{:#}", parse_authorized_keys(&line).unwrap_err());
+            assert!(
+                err.contains(want) && err.contains("line 1"),
+                "{line}: {err}"
+            );
+        }
     }
 
     fn hex32(s: &str) -> [u8; 32] {

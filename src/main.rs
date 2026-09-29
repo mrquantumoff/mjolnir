@@ -8,10 +8,12 @@ use anyhow::{Result, bail};
 use clap::{Parser, Subcommand};
 
 use mjolnir::filemap::{ApplyPolicy, Preserve};
+use mjolnir::keys::AuthorizedKey;
 use mjolnir::printable::escape;
+use mjolnir::tunnel::{self, ForwardSpec, HostPort, Pattern, Permits, Policy};
 use mjolnir::{
     Cipher, Phase, PhaseTimes, PrivateKey, Progress, PublicKey, Receiver, RecvConfig, SendConfig,
-    load_authorized_keys, parse_size, web,
+    load_authorized_entries, parse_size, transfer_keys, web,
 };
 
 #[derive(Parser)]
@@ -100,6 +102,63 @@ enum Cmd {
         #[arg(required = true)]
         paths: Vec<PathBuf>,
     },
+    /// Forward TCP ports through a tunnel server, like `ssh -L` and `ssh -R`.
+    Tunnel {
+        /// Tunnel server address, HOST:PORT.
+        addr: String,
+        #[arg(long)]
+        key: PathBuf,
+        /// The tunnel server's public key.
+        #[arg(long)]
+        peer: PublicKey,
+        /// Listen here and connect from the server: [BIND:]PORT:HOST:HOSTPORT
+        /// (repeatable).
+        #[arg(short = 'L', long = "local", value_name = "SPEC")]
+        local: Vec<ForwardSpec>,
+        /// Listen on the server and connect from here:
+        /// [BIND:]PORT:HOST:HOSTPORT (repeatable).
+        #[arg(short = 'R', long = "remote", value_name = "SPEC")]
+        remote: Vec<ForwardSpec>,
+        /// Carry one stream to HOST:PORT (reached from the server) over stdin
+        /// and stdout, like `ssh -W`; for use as an ssh ProxyCommand.
+        #[arg(short = 'W', long, value_name = "HOST:PORT", conflicts_with_all = ["local", "remote"])]
+        stdio: Option<HostPort>,
+        /// Connections per stream; more than 1 stripes each stream across
+        /// them.
+        #[arg(short = 'n', long, default_value_t = 1)]
+        connections: u32,
+        #[arg(long, value_enum, default_value_t = Cipher::Aes256Gcm)]
+        cipher: Cipher,
+        /// Log every stream.
+        #[arg(short = 'v', long)]
+        verbose: bool,
+    },
+    /// Accept tunnel clients and carry their forwards.
+    TunnelServer {
+        #[arg(long)]
+        key: PathBuf,
+        /// File of authorized client keys, one `[options] <base64> [comment]`
+        /// per line; `permitopen="HOST:PORT"` and `permitlisten="HOST:PORT"`
+        /// options replace the --permit-* defaults for that key.
+        #[arg(long)]
+        authorized: Option<PathBuf>,
+        /// Authorize a client public key (repeatable).
+        #[arg(long)]
+        allow: Vec<PublicKey>,
+        #[arg(long, default_value_t = SocketAddr::from(([0, 0, 0, 0], tunnel::DEFAULT_PORT)))]
+        listen: SocketAddr,
+        /// Let clients open connections to HOST:PORT for -L; `*` matches any
+        /// host or port (repeatable).
+        #[arg(long, value_name = "HOST:PORT")]
+        permit_open: Vec<Pattern>,
+        /// Let clients listen on HOST:PORT on this host for -R; `*` matches
+        /// any host or port (repeatable).
+        #[arg(long, value_name = "HOST:PORT")]
+        permit_listen: Vec<Pattern>,
+        /// Log every stream.
+        #[arg(short = 'v', long)]
+        verbose: bool,
+    },
     /// Serve the local web UI.
     Serve {
         #[arg(long, default_value = "127.0.0.1:7878")]
@@ -143,7 +202,15 @@ fn run(cmd: Cmd) -> Result<()> {
             allow_special_bits,
         } => {
             if let Some(path) = authorized {
-                allow.extend(load_authorized_keys(&path)?);
+                let entries = load_authorized_entries(&path)?;
+                for entry in entries.iter().filter(|e| !e.grants_transfer()) {
+                    eprintln!(
+                        "mjolnir: {}: key {} has tunnel options and no `transfer` option, so it may not send files",
+                        path.display(),
+                        entry.key
+                    );
+                }
+                allow.extend(transfer_keys(&entries));
             }
             if allow.is_empty() {
                 bail!("no authorized sender keys: pass --authorized FILE or --allow KEY");
@@ -236,6 +303,75 @@ fn run(cmd: Cmd) -> Result<()> {
             );
             report_files(report.hashed, &report.file_hashes, &report.warnings);
         }
+        Cmd::Tunnel {
+            addr,
+            key,
+            peer,
+            local,
+            remote,
+            stdio,
+            connections,
+            cipher,
+            verbose,
+        } => {
+            if stdio.is_none() && local.is_empty() && remote.is_empty() {
+                bail!("nothing to forward: pass -L, -R, or -W");
+            }
+            let cfg = tunnel::ClientConfig {
+                addr,
+                key: PrivateKey::load(&key)?,
+                peer,
+                cipher,
+                conns: connections,
+                local,
+                remote,
+                verbose,
+            };
+            block_on(async move {
+                let client = tunnel::TunnelClient::connect(cfg).await?;
+                match stdio {
+                    Some(target) => client.stdio(target).await.map(drop),
+                    None => {
+                        eprintln!("mjolnir: tunnel up");
+                        client.run_until(interrupted()).await
+                    }
+                }
+            })?;
+        }
+        Cmd::TunnelServer {
+            key,
+            authorized,
+            allow,
+            listen,
+            permit_open,
+            permit_listen,
+            verbose,
+        } => {
+            let mut entries = match authorized {
+                Some(path) => load_authorized_entries(&path)?,
+                None => Vec::new(),
+            };
+            entries.extend(allow.into_iter().map(|key| AuthorizedKey {
+                key,
+                options: Vec::new(),
+            }));
+            let defaults = Permits {
+                open: permit_open,
+                listen: permit_listen,
+            };
+            let cfg = tunnel::ServerConfig {
+                listen,
+                key: PrivateKey::load(&key)?,
+                policy: Policy::new(&entries, defaults)?,
+                verbose,
+            };
+            block_on(async move {
+                let server = tunnel::TunnelServer::bind(cfg).await?;
+                eprintln!("public key {}", server.public_key());
+                eprintln!("listening on {}", server.local_addr());
+                server.run_until(interrupted()).await
+            })?;
+        }
         Cmd::Serve {
             listen,
             key,
@@ -258,6 +394,26 @@ fn run(cmd: Cmd) -> Result<()> {
 }
 
 const MIB: f64 = (1 << 20) as f64;
+
+/// Completes on Ctrl-C (or never, if the signal cannot be watched).
+async fn interrupted() {
+    if tokio::signal::ctrl_c().await.is_err() {
+        std::future::pending::<()>().await;
+    }
+    eprintln!("mjolnir: interrupted, closing");
+}
+
+/// Runs `work` on a multi-threaded tokio runtime. Only the tunnel commands
+/// use tokio. The runtime is not waited for on the way out: a blocking stdin
+/// read would hold it up forever.
+fn block_on<T>(work: impl Future<Output = Result<T>>) -> Result<T> {
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?;
+    let result = rt.block_on(work);
+    rt.shutdown_background();
+    result
+}
 
 /// Runs `work` on a thread and prints progress to stderr about once a second.
 fn with_progress<T: Send>(

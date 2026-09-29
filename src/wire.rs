@@ -18,27 +18,45 @@ pub const VERSION: u8 = 2;
 pub enum ConnKind {
     Control = 0,
     Data = 1,
+    /// A tunnel session's control connection; see `docs/TUNNEL.md`.
+    TunnelControl = 2,
+    /// A connection that carries one tunnel stream.
+    TunnelData = 3,
+}
+
+impl ConnKind {
+    /// The 6-byte preamble that starts a connection of this kind.
+    pub fn preamble(self) -> [u8; 6] {
+        let mut p = [0u8; 6];
+        p[..4].copy_from_slice(MAGIC);
+        p[4] = VERSION;
+        p[5] = self as u8;
+        p
+    }
+
+    /// Parses a preamble.
+    pub fn from_preamble(p: &[u8; 6]) -> Result<Self> {
+        ensure!(&p[..4] == MAGIC, "not a mjolnir connection");
+        ensure!(p[4] == VERSION, "unsupported protocol version {}", p[4]);
+        match p[5] {
+            0 => Ok(ConnKind::Control),
+            1 => Ok(ConnKind::Data),
+            2 => Ok(ConnKind::TunnelControl),
+            3 => Ok(ConnKind::TunnelData),
+            k => bail!("unknown connection kind {k}"),
+        }
+    }
 }
 
 pub fn write_preamble(w: &mut impl Write, kind: ConnKind) -> Result<()> {
-    let mut p = [0u8; 6];
-    p[..4].copy_from_slice(MAGIC);
-    p[4] = VERSION;
-    p[5] = kind as u8;
-    w.write_all(&p)?;
+    w.write_all(&kind.preamble())?;
     Ok(())
 }
 
 pub fn read_preamble(r: &mut impl Read) -> Result<ConnKind> {
     let mut p = [0u8; 6];
     r.read_exact(&mut p)?;
-    ensure!(&p[..4] == MAGIC, "not a mjolnir connection");
-    ensure!(p[4] == VERSION, "unsupported protocol version {}", p[4]);
-    match p[5] {
-        0 => Ok(ConnKind::Control),
-        1 => Ok(ConnKind::Data),
-        k => bail!("unknown connection kind {k}"),
-    }
+    ConnKind::from_preamble(&p)
 }
 
 /// Control messages. Variant order is the postcard tag; see PROTOCOL.md.

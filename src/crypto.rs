@@ -184,15 +184,16 @@ impl SessionKeys {
             prk: prk.into(),
         };
         prk.as_mut_slice().zeroize();
-        keys.ctrl_s2r = *keys.okm(b"ctrl s2r");
-        keys.ctrl_r2s = *keys.okm(b"ctrl r2s");
-        keys.hello = *keys.okm(b"hello");
-        let sid = keys.okm(b"session id");
+        keys.ctrl_s2r = *keys.expand(b"ctrl s2r");
+        keys.ctrl_r2s = *keys.expand(b"ctrl r2s");
+        keys.hello = *keys.expand(b"hello");
+        let sid = keys.expand(b"session id");
         keys.session_id.copy_from_slice(&sid[..16]);
         keys
     }
 
-    fn okm(&self, info: &[u8]) -> Zeroizing<[u8; 32]> {
+    /// `E(info)`: 32 bytes of HKDF output for the label `info`.
+    pub fn expand(&self, info: &[u8]) -> Zeroizing<[u8; 32]> {
         let mut okm = Zeroizing::new([0u8; 32]);
         Hkdf::<Sha256>::from_prk(&self.prk)
             .expect("the PRK is one hash long")
@@ -207,7 +208,7 @@ impl SessionKeys {
         info[..4].copy_from_slice(b"data");
         info[4..8].copy_from_slice(&round.to_be_bytes());
         info[8..].copy_from_slice(&conn.to_be_bytes());
-        self.okm(&info)
+        self.expand(&info)
     }
 
     fn hello_hmac(&self, challenge: &[u8; 32], round: u32, conn: u32) -> Hmac<Sha256> {
@@ -256,46 +257,58 @@ fn read_noise(r: &mut impl Read, max: usize) -> Result<Vec<u8>> {
     Ok(msg)
 }
 
-/// Sender side. Returns the session keys once the receiver has proven it
-/// holds `remote`'s private key.
-pub fn handshake_initiator(
-    stream: &mut (impl Read + Write),
-    local: &PrivateKey,
-    remote: &PublicKey,
-) -> Result<SessionKeys> {
-    let mut hs = builder()
-        .local_private_key(local.as_bytes())?
-        .remote_public_key(&remote.0)?
-        .prologue(PROLOGUE)?
-        .build_initiator()?;
-    // Message 2's payload, the master secret, is decrypted into `buf`.
-    let mut buf = Zeroizing::new(vec![0u8; NOISE_MAX]);
-    let n = hs.write_message(&[], &mut buf)?;
-    write_noise(stream, &buf[..n]).context("sending Noise message 1")?;
-    let msg = read_noise(stream, NOISE_MAX).map_err(|_| anyhow!(REJECTED))?;
-    let n = hs
-        .read_message(&msg, &mut buf)
-        .context("Noise message 2 did not authenticate")?;
-    ensure!(n == 32, "Noise message 2 payload is {n} bytes, expected 32");
-    let mut master = Zeroizing::new([0u8; 32]);
-    master.copy_from_slice(&buf[..32]);
-    Ok(SessionKeys::derive(hs.get_handshake_hash(), &master))
+/// The initiator's half-finished handshake, for callers that do their own
+/// I/O (the tunnel runs over async sockets).
+pub struct Initiator(snow::HandshakeState);
+
+impl Initiator {
+    /// Builds Noise message 1 (without its length prefix).
+    pub fn start(
+        local: &PrivateKey,
+        remote: &PublicKey,
+        prologue: &[u8],
+    ) -> Result<(Self, Vec<u8>)> {
+        let mut hs = builder()
+            .local_private_key(local.as_bytes())?
+            .remote_public_key(&remote.0)?
+            .prologue(prologue)?
+            .build_initiator()?;
+        let mut buf = vec![0u8; NOISE_MAX];
+        let n = hs.write_message(&[], &mut buf)?;
+        buf.truncate(n);
+        Ok((Initiator(hs), buf))
+    }
+
+    /// Reads Noise message 2 and derives the session keys.
+    pub fn finish(mut self, msg2: &[u8]) -> Result<SessionKeys> {
+        // Message 2's payload, the master secret, is decrypted into `buf`.
+        let mut buf = Zeroizing::new(vec![0u8; NOISE_MAX]);
+        let n = self
+            .0
+            .read_message(msg2, &mut buf)
+            .context("Noise message 2 did not authenticate")?;
+        ensure!(n == 32, "Noise message 2 payload is {n} bytes, expected 32");
+        let mut master = Zeroizing::new([0u8; 32]);
+        master.copy_from_slice(&buf[..32]);
+        Ok(SessionKeys::derive(self.0.get_handshake_hash(), &master))
+    }
 }
 
-/// Receiver side. Reads message 1, checks the sender's static key against
-/// `authorized`, and only then replies. On rejection nothing is sent.
-pub fn handshake_responder(
-    stream: &mut (impl Read + Write),
+/// Responder side without I/O: reads Noise message 1, checks the sender's
+/// static key against `authorized`, and only then builds message 2. Returns
+/// message 2 (without its length prefix), the keys, and the peer's key.
+pub fn respond(
+    msg1: &[u8],
     local: &PrivateKey,
     authorized: &[PublicKey],
-) -> Result<(SessionKeys, PublicKey)> {
+    prologue: &[u8],
+) -> Result<(Vec<u8>, SessionKeys, PublicKey)> {
     let mut hs = builder()
         .local_private_key(local.as_bytes())?
-        .prologue(PROLOGUE)?
+        .prologue(prologue)?
         .build_responder()?;
-    let msg = read_noise(stream, IK_MSG1_LEN).context("reading Noise message 1")?;
     let mut buf = vec![0u8; NOISE_MAX];
-    let n = hs.read_message(&msg, &mut buf).map_err(|_| {
+    let n = hs.read_message(msg1, &mut buf).map_err(|_| {
         anyhow!(
             "Noise message 1 did not decrypt: the sender did not pin this receiver's public key"
         )
@@ -311,8 +324,43 @@ pub fn handshake_responder(
     let mut master = Zeroizing::new([0u8; 32]);
     getrandom::fill(&mut *master).map_err(|e| anyhow!("OS random number generator: {e}"))?;
     let n = hs.write_message(&*master, &mut buf)?;
-    write_noise(stream, &buf[..n]).context("sending Noise message 2")?;
-    Ok((SessionKeys::derive(hs.get_handshake_hash(), &master), peer))
+    buf.truncate(n);
+    Ok((
+        buf,
+        SessionKeys::derive(hs.get_handshake_hash(), &master),
+        peer,
+    ))
+}
+
+/// The longest Noise message 1 a responder reads.
+pub const NOISE_MSG1_MAX: usize = IK_MSG1_LEN;
+/// The longest Noise message an initiator reads.
+pub const NOISE_MSG_MAX: usize = NOISE_MAX;
+
+/// Sender side. Returns the session keys once the receiver has proven it
+/// holds `remote`'s private key.
+pub fn handshake_initiator(
+    stream: &mut (impl Read + Write),
+    local: &PrivateKey,
+    remote: &PublicKey,
+) -> Result<SessionKeys> {
+    let (hs, msg1) = Initiator::start(local, remote, PROLOGUE)?;
+    write_noise(stream, &msg1).context("sending Noise message 1")?;
+    let msg2 = read_noise(stream, NOISE_MAX).map_err(|_| anyhow!(REJECTED))?;
+    hs.finish(&msg2)
+}
+
+/// Receiver side. Reads message 1, checks the sender's static key against
+/// `authorized`, and only then replies. On rejection nothing is sent.
+pub fn handshake_responder(
+    stream: &mut (impl Read + Write),
+    local: &PrivateKey,
+    authorized: &[PublicKey],
+) -> Result<(SessionKeys, PublicKey)> {
+    let msg1 = read_noise(stream, IK_MSG1_LEN).context("reading Noise message 1")?;
+    let (msg2, keys, peer) = respond(&msg1, local, authorized, PROLOGUE)?;
+    write_noise(stream, &msg2).context("sending Noise message 2")?;
+    Ok((keys, peer))
 }
 
 #[cfg(test)]
