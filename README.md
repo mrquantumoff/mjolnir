@@ -339,8 +339,8 @@ the toolchain to an exact Rust release.
 Pushing a `v` tag builds and publishes a release from that tag:
 
 ```sh
-git tag v0.1.0
-git push origin v0.1.0
+git tag v0.2.0
+git push origin v0.2.0
 ```
 
 The release holds `mjolnir-<target>.tar.gz` for Linux and macOS,
