@@ -312,6 +312,18 @@ pub fn chunk_span(size: u64, chunk_size: ChunkSize, index: u64) -> (u64, u32) {
     (offset, len as u32)
 }
 
+/// Bytes the read-back checks (verification and `--hash`) take per claim
+/// and per read: chunks smaller than this are claimed and read as a run
+/// of adjacent chunks, then hashed one by one.
+pub const RUN_BYTES: u32 = 64 << 10;
+/// The longest run, reached at `MIN_CHUNK_SIZE`.
+pub const MAX_RUN: usize = (RUN_BYTES / MIN_CHUNK_SIZE) as usize;
+
+/// Chunks per read-back run: as many as fit in `RUN_BYTES`, at least one.
+pub fn run_len(chunk_size: ChunkSize) -> u64 {
+    u64::from((RUN_BYTES / chunk_size.get()).max(1))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

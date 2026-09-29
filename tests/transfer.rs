@@ -394,7 +394,7 @@ fn verification_repairs_present_chunks_whose_bytes_rotted() {
     let src = TempDir::new().unwrap();
     let file = resume_source(&src, 32, 12);
     let out = TempDir::new().unwrap();
-    let rot = [0, 6, 30];
+    let rot = [0, 2, 6, 30];
     let (rk, _) = keypair();
     let (sk, spub) = keypair();
     let chunks = seed_resume(&file, out.path(), spub, |k| k % 2 == 0, &rot);

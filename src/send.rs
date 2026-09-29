@@ -21,9 +21,11 @@ use crate::crypto::{
 };
 use crate::filemap::{self, EntryKind, FileMap, Preserve};
 use crate::keys::{PrivateKey, PublicKey};
-use crate::manifest::{ChunkId, ChunkSize, FileEntry, Manifest, chunk_count, chunk_span, mtime_of};
+use crate::manifest::{
+    ChunkId, ChunkSize, FileEntry, Manifest, chunk_count, chunk_span, mtime_of, run_len,
+};
 use crate::net::{self, Io, tell_peer_about, unexpected};
-use crate::pool::{Buffers, InFlight, Pool, buffer_count, check_threads, resolve_threads};
+use crate::pool::{Buffers, InFlight, Pool, Scratch, buffer_count, check_threads, resolve_threads};
 use crate::posio::read_exact_at;
 use crate::progress::{ActiveConnection, Cancelled, Phase, PhaseTimes, Progress};
 use crate::recv::MAX_DATA_CONNECTIONS;
@@ -190,6 +192,8 @@ enum SendJob {
 
 /// One window of the `--hash` re-read: chunks `first..first + count` of
 /// `file`, digests written to `out` at `(index - first) * DIGEST_LEN`.
+/// Workers claim `run_len` adjacent chunks at a time from `cursor`, which
+/// counts runs.
 #[derive(Default)]
 struct HashRun {
     window: Mutex<(u32, u64, u64)>,
@@ -773,7 +777,8 @@ fn hash_window(ctx: &Ctx, file: u32, first: u64, n: u64) -> Result<Vec<u8>> {
     *run.window.lock().unwrap() = (file, first, n);
     *run.out.lock().unwrap() = vec![0u8; n as usize * DIGEST_LEN];
     run.cursor.store(0, Relaxed);
-    let jobs = usize::try_from(n).map_or(ctx.pool.threads(), |n| ctx.pool.threads().min(n));
+    let runs = n.div_ceil(run_len(ctx.manifest.chunk_size));
+    let jobs = usize::try_from(runs).map_or(ctx.pool.threads(), |r| ctx.pool.threads().min(r));
     for _ in 0..jobs {
         ctx.in_flight.add();
         ctx.pool.submit(SendJob::Hash);
@@ -793,9 +798,12 @@ fn hash_some(ctx: &Ctx) {
     let run = &ctx.hashing;
     let (file, first, n) = *run.window.lock().unwrap();
     let entry = &ctx.manifest.files[file as usize];
+    let chunk_size = ctx.manifest.chunk_size;
+    let len = run_len(chunk_size);
     let stop = || ctx.progress.is_cancelled();
-    // A pooled frame buffer is idle between rounds and large enough.
-    let Some(mut buf) = ctx.buffers.take(&stop) else {
+    // A pooled frame buffer is idle between rounds; one fits a run of one.
+    let buf_len = len as usize * chunk_size.get() as usize;
+    let Some(mut buf) = Scratch::take(ctx.buffers, buf_len, &stop) else {
         return;
     };
     let mut done = Vec::new();
@@ -803,26 +811,29 @@ fn hash_some(ctx: &Ctx) {
         Ok(f) => f,
         Err(e) => {
             *run.error.lock().unwrap() = Some(e);
-            ctx.buffers.give(buf);
             return;
         }
     };
-    while let i = run.cursor.fetch_add(1, Relaxed)
-        && i < n
+    while let r = run.cursor.fetch_add(1, Relaxed)
+        && r * len < n
         && !ctx.progress.is_cancelled()
     {
-        let (offset, len) = chunk_span(entry.size, ctx.manifest.chunk_size, first + i);
-        let data = &mut buf[..len as usize];
+        let start = r * len;
+        let count = len.min(n - start);
+        let offset = chunk_span(entry.size, chunk_size, first + start).0;
+        let (last, last_len) = chunk_span(entry.size, chunk_size, first + start + count - 1);
+        let data = &mut buf[..(last + u64::from(last_len) - offset) as usize];
         if let Err(e) = read_exact_at(&source, data, offset) {
             let e = anyhow!(e).context(format!("re-reading {}", entry.path.display()));
             *run.error.lock().unwrap() = Some(e);
-            ctx.buffers.give(buf);
             return;
         }
-        done.push((i, chunk_digest(data)));
-        ctx.progress.add_chunk(u64::from(len));
+        for (i, chunk) in (start..).zip(data.chunks(chunk_size.get() as usize)) {
+            done.push((i, chunk_digest(chunk)));
+            ctx.progress.add_chunk(chunk.len() as u64);
+        }
     }
-    ctx.buffers.give(buf);
+    drop(buf);
     let mut out = run.out.lock().unwrap();
     for (i, digest) in done {
         out[i as usize * DIGEST_LEN..][..DIGEST_LEN].copy_from_slice(&digest);

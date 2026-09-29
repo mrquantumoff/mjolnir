@@ -24,9 +24,11 @@ use crate::crypto::{
 use crate::filemap::{self, ApplyPolicy, EntryKind, FileMap};
 use crate::fsops;
 use crate::keys::{PrivateKey, PublicKey, require_nonempty};
-use crate::manifest::{ChunkSize, FileEntry, Manifest, chunk_count, chunk_span};
+use crate::manifest::{ChunkSize, FileEntry, MAX_RUN, Manifest, chunk_count, chunk_span, run_len};
 use crate::net::{self, Io, tell_peer_about, unexpected};
-use crate::pool::{Buffers, Gate, InFlight, Permit, Permits, Pool, buffer_count, resolve_threads};
+use crate::pool::{
+    Buffers, Gate, InFlight, Permit, Permits, Pool, Scratch, buffer_count, resolve_threads,
+};
 use crate::posio::{read_exact_at, write_all_at};
 use crate::printable;
 use crate::progress::{ActiveConnection, Cancelled, Phase, PhaseTimes, Progress, Stop};
@@ -319,13 +321,12 @@ impl Receiver {
             buffer_count(pool.threads(), EXPECTED_CONNECTIONS, buf_len, usize::MAX),
             buf_len,
         );
-        let starts = targets
-            .iter()
-            .scan(0, |next, t| {
-                let first = *next;
-                *next += t.present.len();
-                Some(first)
-            })
+        let run = run_len(manifest.chunk_size);
+        let starts = std::iter::once(0)
+            .chain(targets.iter().scan(0, |next, t| {
+                *next += t.present.len().div_ceil(run);
+                Some(*next)
+            }))
             .collect();
         let session = Session {
             keys,
@@ -637,14 +638,29 @@ impl Target {
         Ok(Landed::Written)
     }
 
-    /// Reads chunk `index` back and compares it with its stored digest.
-    fn check(&self, files: &Open, index: u64, buf: &mut [u8]) -> io::Result<bool> {
-        let (offset, len) = self.span(index);
-        let data = &mut buf[..len as usize];
+    /// Reads chunks `first..first + count` back, with one payload read and
+    /// one digest read, and returns those whose bytes no longer match their
+    /// stored digest. `count` is at most `MAX_RUN`.
+    fn check_run(
+        &self,
+        files: &Open,
+        first: u64,
+        count: u64,
+        buf: &mut [u8],
+    ) -> io::Result<Vec<u64>> {
+        let offset = self.span(first).0;
+        let (last, last_len) = self.span(first + count - 1);
+        let data = &mut buf[..(last + u64::from(last_len) - offset) as usize];
         read_exact_at(&files.part, data, offset)?;
-        let mut stored = [0u8; DIGEST_LEN];
-        read_exact_at(&files.sums, &mut stored, index * DIGEST_LEN as u64)?;
-        Ok(chunk_digest(data) == stored)
+        let mut stored = [0u8; MAX_RUN * DIGEST_LEN];
+        let stored = &mut stored[..count as usize * DIGEST_LEN];
+        read_exact_at(&files.sums, stored, first * DIGEST_LEN as u64)?;
+        let chunks = data.chunks(self.chunk_size.get() as usize);
+        Ok((first..)
+            .zip(chunks.zip(stored.chunks(DIGEST_LEN)))
+            .filter(|(_, (chunk, digest))| chunk_digest(chunk)[..] != **digest)
+            .map(|(index, _)| index)
+            .collect())
     }
 
     /// Makes a chunk missing again after it failed verification.
@@ -949,7 +965,7 @@ enum RecvJob {
         header: [u8; HEADER_LEN],
         buf: Vec<u8>,
     },
-    /// Read chunks back from `verify_run.cursor` until none are left.
+    /// Read runs back from `verify_run.cursor` until none are left.
     Verify,
 }
 
@@ -960,9 +976,11 @@ struct RecvConn {
     dead: AtomicBool,
 }
 
-/// Shared state of one verification pass.
+/// Shared state of one verification pass, whose workers claim `run_len`
+/// adjacent chunks at a time.
 struct VerifyRun {
-    /// `starts[j]` is the global number of file j's first chunk.
+    /// `starts[j]` is the global number of file j's first run; the last
+    /// entry is the number of runs.
     starts: Vec<u64>,
     cursor: AtomicU64,
     failure: Mutex<Option<anyhow::Error>>,
@@ -1220,7 +1238,8 @@ impl Session<'_> {
         self.progress.set_totals(total_chunks, total_bytes);
         let run = &self.verify_run;
         run.cursor.store(0, Relaxed);
-        let jobs = usize::try_from(total_chunks)
+        let runs = *run.starts.last().expect("starts ends with the run count");
+        let jobs = usize::try_from(runs)
             .map_or(MAX_VERIFY_THREADS, |n| n.min(MAX_VERIFY_THREADS))
             .min(self.pool.threads());
         for _ in 0..jobs {
@@ -1240,10 +1259,12 @@ impl Session<'_> {
     /// One pool worker's share of a verification pass.
     fn verify_some(&self) {
         let run = &self.verify_run;
-        let total = self.targets.iter().map(|t| t.present.len()).sum();
+        let total = *run.starts.last().expect("starts ends with the run count");
+        let len = run_len(self.manifest.chunk_size);
         let stop = || self.progress.is_cancelled();
         // No frames move during verification, so a pooled buffer is free.
-        let Some(mut buf) = self.buffers.take(&stop) else {
+        let buf_len = len as usize * self.manifest.chunk_size.get() as usize;
+        let Some(mut buf) = Scratch::take(self.buffers, buf_len, &stop) else {
             return;
         };
         while let n = run.cursor.fetch_add(1, Relaxed)
@@ -1251,13 +1272,14 @@ impl Session<'_> {
             && !self.progress.is_cancelled()
         {
             let file = run.starts.partition_point(|&first| first <= n) - 1;
-            let (t, index) = (&self.targets[file], n - run.starts[file]);
-            if let Err(e) = self.verify_chunk(file as u32, t, index, &mut buf) {
+            let t = &self.targets[file];
+            let first = (n - run.starts[file]) * len;
+            let count = len.min(t.present.len() - first);
+            if let Err(e) = self.verify_chunks(file as u32, t, first, count, &mut buf) {
                 *run.failure.lock().unwrap() = Some(e);
                 break;
             }
         }
-        self.buffers.give(buf);
     }
 
     /// Runs one pool job.
@@ -1291,27 +1313,37 @@ impl Session<'_> {
         self.in_flight.done();
     }
 
-    fn verify_chunk(&self, file: u32, t: &Target, index: u64, buf: &mut [u8]) -> Result<()> {
-        let ok = self
+    /// Checks chunks `first..first + count` of `t` and makes each one that
+    /// fails missing again.
+    fn verify_chunks(
+        &self,
+        file: u32,
+        t: &Target,
+        first: u64,
+        count: u64,
+        buf: &mut [u8],
+    ) -> Result<()> {
+        let bad = self
             .store
             .handles
             .get(t)
-            .and_then(|files| t.check(&files, index, buf))
+            .and_then(|files| t.check_run(&files, first, count, buf))
             .with_context(|| format!("reading back {}", t.payload.lock().unwrap().display()))?;
-        self.progress.add_chunk(u64::from(t.span(index).1));
-        if ok {
-            return Ok(());
+        for index in first..first + count {
+            self.progress.add_chunk(u64::from(t.span(index).1));
         }
-        t.reject(index);
-        self.stats.repaired.fetch_add(1, Relaxed);
-        let mut failures = self.verify_failures.lock().unwrap();
-        let count = failures.entry((file, index)).or_default();
-        *count += 1;
-        ensure!(
-            *count < MAX_VERIFY_FAILURES,
-            "chunk {index} of {} keeps failing verification",
-            t.entry.path.display()
-        );
+        for index in bad {
+            t.reject(index);
+            self.stats.repaired.fetch_add(1, Relaxed);
+            let mut failures = self.verify_failures.lock().unwrap();
+            let failed = failures.entry((file, index)).or_default();
+            *failed += 1;
+            ensure!(
+                *failed < MAX_VERIFY_FAILURES,
+                "chunk {index} of {} keeps failing verification",
+                t.entry.path.display()
+            );
+        }
         Ok(())
     }
 
@@ -1890,10 +1922,10 @@ mod tests {
             .unwrap();
         t.land(&files, 1, &vec![2u8; MIN_CHUNK_SIZE as usize - 5])
             .unwrap();
-        assert!(t.check(&files, 0, &mut buf).unwrap());
-        assert!(t.check(&files, 1, &mut buf).unwrap());
+        assert!(t.check_run(&files, 0, 1, &mut buf).unwrap().is_empty());
+        assert!(t.check_run(&files, 1, 1, &mut buf).unwrap().is_empty());
         write_all_at(&files.part, &[9u8], 3).unwrap();
-        assert!(!t.check(&files, 0, &mut buf).unwrap());
+        assert_eq!(t.check_run(&files, 0, 1, &mut buf).unwrap(), [0]);
         t.reject(0);
         assert!(!t.present.get(0) && !t.claimed.get(0));
         assert_eq!(
@@ -1901,7 +1933,28 @@ mod tests {
                 .unwrap(),
             Landed::Written
         );
-        assert!(t.check(&files, 0, &mut buf).unwrap());
+        assert!(t.check_run(&files, 0, 1, &mut buf).unwrap().is_empty());
+        drop((files, t, store));
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_run_check_names_each_bad_chunk() {
+        let dir = tempdir("checkrun");
+        let cs = MIN_CHUNK_SIZE as usize;
+        let (store, t) = target_in(&dir, 5 * cs as u64 - 7);
+        let files = store.handles.get(&t).unwrap();
+        for index in 0..5u64 {
+            let len = t.span(index).1 as usize;
+            t.land(&files, index, &vec![index as u8 + 1; len]).unwrap();
+        }
+        let mut buf = vec![0u8; 5 * cs];
+        assert!(t.check_run(&files, 0, 5, &mut buf).unwrap().is_empty());
+        write_all_at(&files.part, &[0xEE], 3 * cs as u64 + 1).unwrap();
+        write_all_at(&files.part, &[0xEE], 5 * cs as u64 - 8).unwrap();
+        write_all_at(&files.sums, &[0xEE; DIGEST_LEN], DIGEST_LEN as u64).unwrap();
+        assert_eq!(t.check_run(&files, 0, 5, &mut buf).unwrap(), [1, 3, 4]);
+        assert_eq!(t.check_run(&files, 2, 2, &mut buf).unwrap(), [3]);
         drop((files, t, store));
         fs::remove_dir_all(dir).unwrap();
     }
@@ -1967,7 +2020,11 @@ mod tests {
         let mut buf = vec![0u8; MIN_CHUNK_SIZE as usize];
         for t in &targets {
             let files = store.handles.get(t).unwrap();
-            assert!(t.check(&files, 0, &mut buf).unwrap(), "{}", t.file_id);
+            assert!(
+                t.check_run(&files, 0, 1, &mut buf).unwrap().is_empty(),
+                "{}",
+                t.file_id
+            );
         }
         drop((targets, store));
         fs::remove_dir_all(dir).unwrap();

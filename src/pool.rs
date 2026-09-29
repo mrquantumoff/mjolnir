@@ -93,6 +93,7 @@ impl<J> Pool<J> {
 pub(crate) struct Buffers {
     free: Mutex<Vec<Vec<u8>>>,
     cv: Condvar,
+    len: usize,
 }
 
 /// Buffers held at once: `2 * threads + connections`, but never more than
@@ -115,6 +116,7 @@ impl Buffers {
         Buffers {
             free: Mutex::new((0..count).map(|_| vec![0u8; len]).collect()),
             cv: Condvar::new(),
+            len,
         }
     }
 
@@ -143,6 +145,52 @@ impl Buffers {
     pub(crate) fn give(&self, buf: Vec<u8>) {
         self.free.lock().unwrap().push(buf);
         self.cv.notify_one();
+    }
+}
+
+/// A read buffer of at least `len` bytes for the read-back checks: a
+/// pooled buffer when one is large enough, which it is whenever a run is
+/// one chunk, else an owned one, at most `RUN_BYTES`. A pooled buffer goes
+/// back to its pool when dropped.
+pub(crate) struct Scratch<'a> {
+    buf: Vec<u8>,
+    pool: Option<&'a Buffers>,
+}
+
+impl<'a> Scratch<'a> {
+    /// `None` once `stop` returns true while waiting for a pooled buffer.
+    pub(crate) fn take(buffers: &'a Buffers, len: usize, stop: &dyn Fn() -> bool) -> Option<Self> {
+        if len > buffers.len {
+            return Some(Scratch {
+                buf: vec![0u8; len],
+                pool: None,
+            });
+        }
+        Some(Scratch {
+            buf: buffers.take(stop)?,
+            pool: Some(buffers),
+        })
+    }
+}
+
+impl std::ops::Deref for Scratch<'_> {
+    type Target = [u8];
+    fn deref(&self) -> &[u8] {
+        &self.buf
+    }
+}
+
+impl std::ops::DerefMut for Scratch<'_> {
+    fn deref_mut(&mut self) -> &mut [u8] {
+        &mut self.buf
+    }
+}
+
+impl Drop for Scratch<'_> {
+    fn drop(&mut self) {
+        if let Some(pool) = self.pool {
+            pool.give(std::mem::take(&mut self.buf));
+        }
     }
 }
 
@@ -308,5 +356,19 @@ mod tests {
             s.spawn(|| buffers.give(first));
             assert_eq!(buffers.take(&|| false).unwrap().len(), 8);
         });
+    }
+
+    #[test]
+    fn scratch_borrows_a_pooled_buffer_only_when_it_fits() {
+        let buffers = Buffers::new(1, 8);
+        {
+            let pooled = Scratch::take(&buffers, 8, &|| false).unwrap();
+            assert_eq!(pooled.len(), 8);
+            assert!(buffers.try_take().is_none());
+            let owned = Scratch::take(&buffers, 9, &|| true).unwrap();
+            assert_eq!(owned.len(), 9);
+        }
+        assert_eq!(buffers.try_take().unwrap().len(), 8, "given back on drop");
+        assert!(buffers.try_take().is_none(), "the owned one is not pooled");
     }
 }
