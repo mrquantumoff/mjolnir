@@ -276,8 +276,12 @@ fails, or every connection closing before the peer's fin. An aborted
 stream closes its connections, which the peer sees as the connections
 ending without a fin, and resets its local TCP connection (`SO_LINGER` 0),
 so an application sees a failure rather than an end of stream that would
-pass a cut-off download as complete. A stream whose setup fails resets the
-application's connection the same way. One failed connection aborts its
+pass a cut-off download as complete. On macOS the reset waits, up to a
+second, until the application's side has acknowledged everything written
+to it: macOS takes a reset only at the sequence number it last
+acknowledged, and would otherwise miss one that follows fresh data. A
+stream whose setup fails resets the application's connection the same
+way. One failed connection aborts its
 whole stream: frames on it are lost, and there is no retransmission above
 TCP.
 

@@ -136,9 +136,61 @@ impl ResetGuard {
 
 impl Drop for ResetGuard {
     fn drop(&mut self) {
-        if let Some(handle) = &self.0 {
+        if let Some(handle) = self.0.take() {
             let _ = handle.set_linger(Some(Duration::ZERO));
+            #[cfg(target_vendor = "apple")]
+            reset_once_acknowledged(handle);
         }
+    }
+}
+
+/// How long a reset waits for the peer to acknowledge what was sent.
+#[cfg(target_vendor = "apple")]
+const RESET_ACK_WAIT: Duration = Duration::from_secs(1);
+
+/// Closes `handle`, whose linger is already zero, once the peer has
+/// acknowledged everything sent on it, or after `RESET_ACK_WAIT`. macOS
+/// takes a reset only at exactly the sequence number it last acknowledged.
+/// A reset that follows data it has not acknowledged yet, as happens when a
+/// stream aborts right after writing and the peer delays its ACK, gets a
+/// challenge ACK instead, and this side, its socket closed, drops that
+/// without an answer: the application would wait forever. Closing only
+/// once nothing is unacknowledged puts the reset where the peer expects it.
+/// The handle closes, and resets, at once if the runtime goes away first.
+#[cfg(target_vendor = "apple")]
+fn reset_once_acknowledged(handle: socket2::Socket) {
+    let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+        return;
+    };
+    if unacknowledged(&handle) == 0 {
+        return;
+    }
+    runtime.spawn(async move {
+        let deadline = tokio::time::Instant::now() + RESET_ACK_WAIT;
+        while unacknowledged(&handle) > 0 && tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    });
+}
+
+/// Bytes in the socket's send buffer: not sent yet, or sent and not yet
+/// acknowledged. Zero if the socket cannot say.
+#[cfg(target_vendor = "apple")]
+fn unacknowledged(handle: &socket2::Socket) -> u32 {
+    use std::os::fd::AsRawFd;
+    // SAFETY: the kernel fills at most `len` bytes of a plain-data struct
+    // for an open socket.
+    unsafe {
+        let mut info: libc::tcp_connection_info = std::mem::zeroed();
+        let mut len = std::mem::size_of_val(&info) as libc::socklen_t;
+        let rc = libc::getsockopt(
+            handle.as_raw_fd(),
+            libc::IPPROTO_TCP,
+            libc::TCP_CONNECTION_INFO,
+            (&raw mut info).cast(),
+            &mut len,
+        );
+        if rc == 0 { info.tcpi_snd_sbbytes } else { 0 }
     }
 }
 
