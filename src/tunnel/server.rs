@@ -57,6 +57,10 @@ const CTRL_QUEUE: usize = 64;
 /// How long one control message may take to write before the client
 /// counts as not reading, which ends the session.
 pub(crate) const CTRL_STALL: Duration = Duration::from_secs(10);
+/// The control connection's kernel send buffer. Small on purpose, so the
+/// writer blocks (and `CTRL_STALL` fires) when the client stops reading,
+/// rather than the kernel swallowing the whole backlog.
+const CTRL_SEND_BUF: usize = 16 << 10;
 /// Longest host name in `Open` and `Listen`, the DNS limit.
 pub(crate) const MAX_HOST_LEN: usize = 255;
 
@@ -419,6 +423,13 @@ async fn control(
     cipher: Cipher,
     rx: CtrlRx<()>,
 ) -> Result<()> {
+    // A small send buffer for control replies, so a client that stops
+    // reading fills it within a few hundred messages and the writer's own
+    // `CTRL_STALL` timeout fires; without it the kernel would buffer the
+    // whole bounded backlog and the writer would never block. Control
+    // messages are tiny and read promptly, so this never limits a live
+    // client.
+    let _ = socket2::SockRef::from(&stream).set_send_buffer_size(CTRL_SEND_BUF);
     let (r, w) = stream.into_split();
     let mut tx = CtrlTx::new(w, &keys, false);
     let rx = rx.with_reader(|()| BufReader::new(r));
@@ -659,7 +670,7 @@ impl Session {
                             self.peer,
                             shown(&why)
                         );
-                        self.close(stream, why).await;
+                        self.close(stream, why).await?;
                         return Ok(());
                     }
                 };
@@ -701,13 +712,13 @@ impl Session {
                             id,
                             addr: addr.to_string(),
                         })
-                        .await;
+                        .await?;
                         let session = self.clone();
                         tasks.spawn(async move { session.listen(id, listener, conns).await });
                     }
                     Err(message) => {
                         eprintln!("mjolnir: listener from {}: {}", self.peer, shown(&message));
-                        self.send(TunnelMsg::ListenFailed { id, message }).await;
+                        self.send(TunnelMsg::ListenFailed { id, message }).await?;
                     }
                 }
             }
@@ -729,10 +740,19 @@ impl Session {
         Ok(())
     }
 
-    /// Queues a control message, waiting for room; a session that has
-    /// ended drops it.
-    async fn send(&self, msg: TunnelMsg) {
-        let _ = self.ctrl.send(msg).await;
+    /// Queues a control message, waiting up to `CTRL_STALL` for room. A
+    /// queue that stays full that long means the client is not reading its
+    /// replies, so the whole backlog cannot drain however large the socket
+    /// buffers are; that ends the session. A session already gone drops the
+    /// message.
+    async fn send(&self, msg: TunnelMsg) -> Result<()> {
+        match self.ctrl.send_timeout(msg, CTRL_STALL).await {
+            Ok(()) => Ok(()),
+            Err(mpsc::error::SendTimeoutError::Closed(_)) => Ok(()),
+            Err(mpsc::error::SendTimeoutError::Timeout(_)) => {
+                bail!("the client stopped reading its control connection")
+            }
+        }
     }
 
     /// Whether a stream of `conns` connections fits the session's limits.
@@ -754,8 +774,8 @@ impl Session {
         Ok(())
     }
 
-    async fn close(&self, stream: u32, message: String) {
-        self.send(TunnelMsg::Close { stream, message }).await;
+    async fn close(&self, stream: u32, message: String) -> Result<()> {
+        self.send(TunnelMsg::Close { stream, message }).await
     }
 
     /// Makes a slot for `stream`'s connections. The caller then wakes any
@@ -851,7 +871,7 @@ impl Session {
                 self.slots.lock().unwrap().map.remove(&stream);
                 let why = format!("its {} did not arrive", connections(conns));
                 eprintln!("mjolnir: stream {stream} ({what}): {why}");
-                self.close(stream, why).await;
+                let _ = self.close(stream, why).await;
                 return;
             }
         };
@@ -895,7 +915,7 @@ impl Session {
                 self.slots.lock().unwrap().map.remove(&stream);
                 let why = format!("{e:#}");
                 eprintln!("mjolnir: stream {stream} ({what}): {why}");
-                self.close(stream, why).await;
+                let _ = self.close(stream, why).await;
                 return;
             }
         };
@@ -938,12 +958,13 @@ impl Session {
                     // Server streams are made before the client hears of
                     // them, so no connection ever waits for one.
                     let (counted, ready) = self.register(&mut self.slots.lock().unwrap(), stream, conns);
-                    self.send(TunnelMsg::Incoming {
-                        listener: id,
-                        stream,
-                        from: from.to_string(),
-                    })
-                    .await;
+                    let _ = self
+                        .send(TunnelMsg::Incoming {
+                            listener: id,
+                            stream,
+                            from: from.to_string(),
+                        })
+                        .await;
                     let session = self.clone();
                     let what = format!("{from} -> {}", self.peer);
                     streams.spawn(async move {

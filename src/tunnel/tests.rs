@@ -468,19 +468,25 @@ async fn a_client_that_stops_reading_is_disconnected() {
     ));
     let host = "h".repeat(MAX_HOST_LEN);
     let t0 = Instant::now();
-    let mut sent = 0u32;
+    let sent = std::cell::Cell::new(0u32);
     let outcome = timeout(CTRL_STALL * 3, async {
         loop {
-            sent += 1;
-            if tx.send(&open(sent, &host)).await.is_err() {
+            sent.set(sent.get() + 1);
+            if tx.send(&open(sent.get(), &host)).await.is_err() {
                 return t0.elapsed();
             }
         }
     })
     .await;
-    let cut_off = outcome.expect("the server never stopped taking requests it could not answer");
+    let cut_off = outcome.unwrap_or_else(|_| {
+        panic!(
+            "the server never stopped taking requests it could not answer: {} sent",
+            sent.get()
+        )
+    });
     assert!(
         cut_off < CTRL_STALL * 2,
-        "cut off only after {cut_off:?} and {sent} requests"
+        "cut off only after {cut_off:?} and {} requests",
+        sent.get()
     );
 }
