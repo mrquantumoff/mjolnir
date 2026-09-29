@@ -1087,12 +1087,14 @@ fn hash_check_repairs_a_source_changed_during_the_transfer() {
     let progress = Arc::new(Progress::default());
     let editor = {
         let (progress, file) = (progress.clone(), file.clone());
+        let mut changed = fs::read(&file).unwrap();
+        changed[3] ^= 0xFF;
+        // Edit as soon as chunk 0 has gone out, so the edit lands long
+        // before the hash pass even when the test suite loads the machine.
         thread::spawn(move || {
-            while progress.bytes_done.load(Relaxed) < 8 << 20 {
+            while progress.bytes_done.load(Relaxed) == 0 {
                 thread::sleep(Duration::from_millis(1));
             }
-            let mut changed = fs::read(&file).unwrap();
-            changed[3] ^= 0xFF;
             edit_in_place(&file, 3, changed[3]);
             changed
         })
