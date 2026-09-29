@@ -112,8 +112,8 @@ so every request is treated as hostile until it proves otherwise.
   CORS headers. If an `Origin` header is present it must be
   `http://<Host>`. Violations get 403.
 - **Browser hardening.** The HTML is served with
-  `Content-Security-Policy: default-src 'self'; connect-src 'self'; script-src 'self'; ...`,
-  `frame-ancestors 'none'`, `X-Frame-Options: DENY`,
+  `Content-Security-Policy: default-src 'self'; connect-src 'self'; img-src 'self' data:; style-src 'self'; script-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'`,
+  `X-Frame-Options: DENY`,
   `X-Content-Type-Options: nosniff`, `Referrer-Policy: no-referrer`, and
   `Cache-Control: no-store`. Scripts and styles are separate embedded files,
   so no inline script is needed. The page builds the DOM with `textContent`,
@@ -153,12 +153,13 @@ have the shape `{ "error": "message", "field": "name" | null }`, where
 | 405 | Wrong method for the endpoint |
 | 409 | Removing a transfer that is still running, or a receiver whose `out_dir` overlaps a running receiver's |
 | 413 | Body over 1 MiB |
+| 429 | 16 transfers are already running |
 | 431 | Request head over 16 KiB |
 
 ### `GET /api/identity`
 
 ```json
-{ "public_key": "base64", "key_path": "/home/me/.config/mjolnir/key" }
+{ "public_key": "base64", "key_path": "/home/me/.config/mjolnir/mjolnir.key" }
 ```
 
 ### `GET /api/transfers`

@@ -98,8 +98,8 @@ reaches it.
 
 `--permit-open` and `--permit-listen` set the defaults for every key. A
 line in the `--authorized` file can carry its own options, as in SSH's
-`authorized_keys`, and a key with any options gets exactly those instead of
-the defaults:
+`authorized_keys`, and a key with any `permitopen` or `permitlisten`
+option gets exactly those instead of the defaults:
 
 ```
 # Can reach the database, nothing else, and cannot send files.
@@ -201,7 +201,8 @@ Host names in `Open` and `Listen` are at most 255 bytes, the DNS limit;
 longer ones are a protocol error.
 
 Client stream ids are 1, 2, 3, ... in the order of their `Open`s; server
-stream ids (for `-R`) have the top bit set and grow the same way. Each
+stream ids (for `-R`) are `0x80000000`, `0x80000001`, ..., the top bit set
+over a counter from 0. Each
 side refuses an id from the other that is not above every earlier one,
 which lets the server tell a stream that is still to come from one that
 is over, and keeps an id, and so its keys and frame counters, from being

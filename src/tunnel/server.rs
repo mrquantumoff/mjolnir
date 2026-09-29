@@ -945,12 +945,13 @@ impl Session {
                             continue;
                         }
                     };
+                    // Armed first, so a refused connection is reset too.
+                    let guard = ResetGuard::new(&socket);
                     if let Err(why) = self.may_start(conns) {
                         eprintln!("mjolnir: listener {id}: dropping {from}: {why}");
                         continue;
                     }
                     prepare(&socket);
-                    let guard = ResetGuard::new(&socket);
                     let Some(stream) = next_server_stream(&self.next_server_stream) else {
                         eprintln!("mjolnir: listener {id}: dropping {from}: this session has used every stream id; reconnect to start a new session");
                         continue;

@@ -22,7 +22,7 @@ A receiver serves one transfer at a time and stops after one transfer
 completes. It runs each incoming handshake on its own thread (at most 256 at
 once; connections beyond that are closed at once) and requires the preamble and Noise message 1 to arrive within 10
 seconds, so a peer that trickles bytes cannot hold up a real sender.
-Message 1 must be exactly 96 bytes, its size in IK with an empty payload. Message 1 can be
+The receiver reads 96 bytes for message 1, its size in IK with an empty payload; anything else fails to decrypt. Message 1 can be
 replayed, and the receiver answers a replay like the original, so a
 finished handshake does not prove the sender is live; its `Confirm` does,
 because only the real sender can seal it. Each handshake thread therefore
@@ -453,8 +453,8 @@ changing.
 Once the receiver reports `Delivered`, the sender reads every file again and
 computes each chunk's 16-byte digest, `BLAKE3(chunk plaintext)`, in its worker
 pool, all chunks in parallel. It streams the digests in `Digests` messages of
-at most 1,048,576 digests each. The receiver compares them with its
-`.mjolnir-sums` entries. Those entries were already confirmed against the
+at most 1,048,576 digests each. The receiver compares them with the
+digests in its `.sums` files. Those entries were already confirmed against the
 disk by the verification pass, so the receiver does not read the files a
 third time.
 
@@ -501,7 +501,11 @@ connections are open. Each admitted connection holds a thread and a read
 buffer of at most 256 KiB (16 KiB for chunks of 256 KiB and up) until it
 closes, so those two caps bound what an authorized sender can make the
 receiver hold; `send --connections` stops at the same 256. The fresh
-challenge stops a captured hello from being replayed.
+challenge stops a captured hello from being replayed. At most 64 data
+connections may be waiting for admission at once; more are closed at
+accept. The receiver allows 10 seconds for the preamble and hello, the
+sender 30 seconds for the challenge and verdict, and after admission either
+side drops a data connection that moves no byte for 60 seconds.
 
 `RoundStart` and the round's data connections travel on different TCP
 connections, so a data connection can reach the receiver before the
@@ -551,8 +555,10 @@ exact:
   arrival order. It then hands `(conn key, k, header, buffer)` to a shared
   pool of `--threads` workers. A worker opens the frame, claims the chunk,
   does the positional write, writes the digest, sets `present`, and returns
-  the buffer to the pool. Writes go to each chunk's own offset, so workers
-  never wait on each other.
+  the buffer to the pool. Writes go to each chunk's own offset, but only
+  one worker writes a given file at a time: concurrent positional writes
+  into one file serialize on the inode lock anyway, and on Linux the
+  waiters spin. The other workers keep opening frames meanwhile.
 - **Sender.** Each connection has a writer thread with a small FIFO of
   pending slots (depth 4). The writer claims the next chunk from the
   scheduler and assigns it the connection's next counter value `k`. It
@@ -580,11 +586,17 @@ one lock, and frame counters are still per connection and assigned in the
 order the connection claims, so the nonce rule is unchanged.
 
 **Backpressure.** Buffers come from a bounded pool of
-`2 * threads + connections` buffers of `chunk_size + 32` bytes. When the
+`2 * threads + connections` buffers, where `connections` is the sender's
+`--connections` on the sender and a fixed 16 on the receiver. A buffer holds
+one sealed frame: `chunk_size + 32` bytes on the sender (header, chunk,
+tag) and `chunk_size + 16` on the receiver (chunk and tag). The sender caps
+the count further at `max(4 * connections, min(threads, 8))`, since each
+connection holds at most 4 frames between sealing and the socket. When the
 pool is empty, readers stop reading, and TCP flow control slows the sender.
 Memory therefore stays at about that many chunks, no matter how fast
 either side is. If that would exceed 1 GiB (large chunks with many
-threads), the pool shrinks to fit. It never goes below `threads`.
+threads), the pool shrinks to fit, down to one buffer; workers without a
+buffer wait.
 
 A frame that fails to open ends its connection, as before. Frames from that
 connection that other workers already opened are valid on their own, since
@@ -615,7 +627,7 @@ If the claim finds the bit already set, the frame is a duplicate: it is
 dropped without touching the file and counted in `duplicate_chunks`. If
 the write fails, the claim is released, so the chunk stays missing and a
 later round sends it again. The sender never sends the same chunk twice in
-one round, because each connection claims chunks from a shared atomic cursor.
+one round, because the scheduler hands each chunk out exactly once.
 In later rounds it sends only what the receiver's `Have` reports missing.
 An honest transfer therefore reports `duplicate_chunks = 0`, and the tests
 assert that.
@@ -649,7 +661,8 @@ the write path. So before finishing, the receiver checks its own disk.
 
 - On receipt, after a chunk authenticates, the receiver computes
   `digest = BLAKE3(plaintext)` truncated to 16 bytes. It writes the digest
-  at offset `chunk_index * 16` of `out/<path>.mjolnir-sums`, after writing
+  at offset `chunk_index * 16` of the file's `.sums` file in its staging
+  directory (see "Receiver storage and resume"), after writing
   the chunk and before setting its `present` bit. Digests live on disk, not
   in memory, so the cost scales to any file size.
 - When every chunk is present, the receiver syncs the part and sums files.
