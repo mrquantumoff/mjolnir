@@ -154,13 +154,17 @@ pub fn serve(guard: &Guard, app: &App, mut stream: TcpStream) {
     let _ = stream.set_nodelay(true);
     let _ = stream.set_write_timeout(Some(WRITE_TIMEOUT));
     let started = Instant::now();
-    let (reply, unread, head_only) = match read_head(&mut stream, started + HEAD_DEADLINE) {
+    // `drain` is whether the client may still be sending: a body we did not
+    // read, or the rest of a head we refused. Closing with unread input makes
+    // TCP send a reset, and on macOS the reset can arrive before the client
+    // has read the reply, so the reply is lost.
+    let (reply, drain, head_only) = match read_head(&mut stream, started + HEAD_DEADLINE) {
         Ok(mut req) => {
             let reply = admit_and_route(guard, app, &mut stream, &mut req);
             let unread = req.content_length.saturating_sub(req.buffered.len() as u64);
-            (reply, unread, req.method == Method::Head)
+            (reply, unread > 0, req.method == Method::Head)
         }
-        Err(e) => (Err(status_of(e)), 0, false),
+        Err(e) => (Err(status_of(e)), true, false),
     };
     let (head, body) = render(reply);
     let written = stream.write_all(&head).and_then(|()| {
@@ -174,7 +178,7 @@ pub fn serve(guard: &Guard, app: &App, mut stream: TcpStream) {
         return;
     }
     let _ = stream.shutdown(Shutdown::Write);
-    if unread > 0 {
+    if drain {
         linger(&mut stream);
     }
 }
