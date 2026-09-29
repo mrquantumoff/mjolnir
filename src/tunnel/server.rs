@@ -688,9 +688,9 @@ impl Session {
                 } else if !self.permits.may_listen(&bind) {
                     Err(format!("listening on {bind} is not permitted for this key"))
                 } else {
-                    TcpListener::bind((bind.host.as_str(), bind.port))
+                    bind_listener(&bind)
                         .await
-                        .map_err(|e| format!("listening on {bind}: {e}"))
+                        .map_err(|e| format!("listening on {bind}: {e:#}"))
                 };
                 match checked {
                     Ok(listener) => {
@@ -957,6 +957,83 @@ impl Session {
     }
 }
 
+/// Binds a `-R` listener on `bind`, trying each address it resolves to.
+/// The socket is exclusive on Windows: without `SO_EXCLUSIVEADDRUSE`,
+/// binding `127.0.0.1:P` succeeds there while another service listens on
+/// `0.0.0.0:P`, and loopback connections meant for that service go to
+/// the tunnel instead. Linux refuses such a bind on its own; the option
+/// makes Windows do the same.
+async fn bind_listener(bind: &HostPort) -> Result<TcpListener> {
+    let addrs: Vec<SocketAddr> = tokio::net::lookup_host((bind.host.as_str(), bind.port))
+        .await
+        .with_context(|| format!("resolving {bind}"))?
+        .collect();
+    ensure!(!addrs.is_empty(), "{bind} resolved to no addresses");
+    let mut last = None;
+    for addr in addrs {
+        match bind_exclusive(addr) {
+            Ok(listener) => return Ok(listener),
+            Err(e) => last = Some(e),
+        }
+    }
+    Err(last.expect("at least one address was tried").into())
+}
+
+fn bind_exclusive(addr: SocketAddr) -> std::io::Result<TcpListener> {
+    // Windows lets a specific address be bound over another socket's
+    // wildcard bind of the same port, whatever options the new socket
+    // sets. What it does refuse is an exclusive bind of the wildcard while
+    // any socket holds the port, so that is tried first, as a probe.
+    #[cfg(windows)]
+    if !addr.ip().is_unspecified() {
+        let wildcard = SocketAddr::new(
+            match addr {
+                SocketAddr::V4(_) => std::net::Ipv4Addr::UNSPECIFIED.into(),
+                SocketAddr::V6(_) => std::net::Ipv6Addr::UNSPECIFIED.into(),
+            },
+            addr.port(),
+        );
+        exclusive_socket(wildcard)?.bind(&wildcard.into())?;
+    }
+    let socket = exclusive_socket(addr)?;
+    socket.bind(&addr.into())?;
+    socket.listen(1024)?;
+    socket.set_nonblocking(true)?;
+    TcpListener::from_std(socket.into())
+}
+
+/// A socket for `addr` that no later bind may share: `SO_EXCLUSIVEADDRUSE`
+/// on Windows. Elsewhere `SO_REUSEADDR` only lets the port be taken again
+/// right after a session ends, while its last connections are in
+/// TIME_WAIT; a listening socket still cannot be shadowed.
+fn exclusive_socket(addr: SocketAddr) -> std::io::Result<socket2::Socket> {
+    use socket2::{Domain, Socket, Type};
+    let socket = Socket::new(Domain::for_address(addr), Type::STREAM, None)?;
+    #[cfg(windows)]
+    {
+        use std::os::windows::io::AsRawSocket;
+        use windows_sys::Win32::Networking::WinSock::{
+            SO_EXCLUSIVEADDRUSE, SOL_SOCKET, setsockopt,
+        };
+        let on: i32 = 1;
+        let rc = unsafe {
+            setsockopt(
+                socket.as_raw_socket() as usize,
+                SOL_SOCKET,
+                SO_EXCLUSIVEADDRUSE,
+                (&on as *const i32).cast(),
+                std::mem::size_of::<i32>() as i32,
+            )
+        };
+        if rc != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+    }
+    #[cfg(not(windows))]
+    socket.set_reuse_address(true)?;
+    Ok(socket)
+}
+
 /// The next `-R` stream id: the top bit set, then a counter. Once the
 /// counter runs out the session must end, since an id used again would
 /// reuse its keys and nonces.
@@ -987,6 +1064,43 @@ fn shown(text: &str) -> String {
 mod tests {
     use super::*;
     use tokio::time::timeout;
+
+    /// Another service listens on every interface; a -R listener asking
+    /// for the same port on loopback must be refused, or it would take
+    /// that service's loopback traffic. Linux refuses this on its own;
+    /// Windows needs the exclusive option. macOS allows the bind with
+    /// SO_REUSEADDR, so the check is not made there.
+    #[cfg(any(windows, target_os = "linux"))]
+    #[tokio::test]
+    async fn a_reverse_listener_cannot_shadow_a_wildcard_listener() {
+        let wild = std::net::TcpListener::bind("0.0.0.0:0").unwrap();
+        let port = wild.local_addr().unwrap().port();
+        let specific = HostPort {
+            host: "127.0.0.1".into(),
+            port,
+        };
+        let err = match bind_listener(&specific).await {
+            Ok(_) => panic!("bound 127.0.0.1:{port} over a listener on 0.0.0.0:{port}"),
+            Err(e) => e,
+        };
+        assert!(!format!("{err:#}").contains("resolving"), "{err:#}");
+        drop(wild);
+        bind_listener(&specific)
+            .await
+            .expect("the port is free once the other listener is gone");
+        // The other way round as well: a wildcard request over a service
+        // on loopback.
+        let loopback = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = loopback.local_addr().unwrap().port();
+        let wildcard = HostPort {
+            host: "0.0.0.0".into(),
+            port,
+        };
+        assert!(
+            bind_listener(&wildcard).await.is_err(),
+            "bound 0.0.0.0:{port} over a listener on 127.0.0.1:{port}"
+        );
+    }
 
     #[test]
     fn server_stream_ids_stop_before_they_could_repeat() {
