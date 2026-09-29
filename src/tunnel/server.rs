@@ -17,7 +17,7 @@ use tokio::task::JoinSet;
 use tokio::time::{Instant, timeout, timeout_at};
 
 use super::proto::{self, ADMITTED, CHALLENGE_LEN, CtrlRx, CtrlTx, HELLO_LEN, PROLOGUE, TunnelMsg};
-use super::pump::{StreamCrypto, pump_tcp};
+use super::pump::{BUFFER_BUDGET, Budget, ResetGuard, StreamCrypto, pump_tcp};
 use super::spec::{HostPort, Permits, Policy};
 use super::{
     GATHER_WAIT, HANDSHAKE_DEADLINE, MAX_CONNS, SERVER_STREAM, connect_target, connections, human,
@@ -65,6 +65,8 @@ struct Shared {
     /// Live sessions by route, for stream connections to find theirs.
     sessions: Mutex<HashMap<[u8; 16], Arc<Session>>>,
     pending: Mutex<Pending>,
+    /// Out-of-order stream bytes held across every session.
+    budget: Budget,
     /// Becomes true when the server stops.
     stop: watch::Sender<bool>,
 }
@@ -170,6 +172,7 @@ impl TunnelServer {
                 verbose: cfg.verbose,
                 sessions: Mutex::new(HashMap::new()),
                 pending: Mutex::new(Pending::default()),
+                budget: Budget::new(BUFFER_BUDGET),
                 stop: watch::Sender::new(false),
             }),
         })
@@ -371,6 +374,7 @@ async fn control(
         peer,
         permits: shared.policy.for_key(&peer).clone(),
         verbose: shared.verbose,
+        budget: shared.budget.clone(),
         ctrl,
         slots: Mutex::new(Slots::default()),
         registered: Notify::new(),
@@ -407,6 +411,7 @@ struct Session {
     peer: PublicKey,
     permits: Permits,
     verbose: bool,
+    budget: Budget,
     /// Messages for the control writer task. Bounded: senders wait when
     /// the client does not read, so nothing piles up on its behalf.
     ctrl: mpsc::Sender<TunnelMsg>,
@@ -708,11 +713,14 @@ impl Session {
         }
     }
 
-    /// Waits for a stream's connections, admits them, and pumps.
+    /// Waits for a stream's connections, admits them, and pumps. `guard`
+    /// resets `local` on any way out but a clean end, so an application
+    /// whose stream never started sees a failure, not an empty reply.
     async fn start(
         &self,
         stream: u32,
         local: TcpStream,
+        guard: ResetGuard,
         ready: oneshot::Receiver<Vec<TcpStream>>,
         conns: u32,
         what: &str,
@@ -742,7 +750,7 @@ impl Session {
             );
         }
         let crypto = StreamCrypto::new(&self.keys, self.cipher, stream, conns, false);
-        match pump_tcp(local, sockets, crypto).await {
+        match pump_tcp(local, guard, sockets, crypto, self.budget.clone()).await {
             Ok(t) if self.verbose => eprintln!(
                 "mjolnir: stream {stream} ({what}) closed, {} to the client, {} from it",
                 human(t.sent),
@@ -773,7 +781,8 @@ impl Session {
                 return;
             }
         };
-        self.start(stream, local, ready, conns, &what).await;
+        let guard = ResetGuard::new(&local);
+        self.start(stream, local, guard, ready, conns, &what).await;
     }
 
     /// A `-R` listener: every accepted connection becomes a server stream.
@@ -795,13 +804,14 @@ impl Session {
                         continue;
                     }
                     prepare(&socket);
+                    let guard = ResetGuard::new(&socket);
                     let Some(stream) = next_server_stream(&self.next_server_stream) else {
                         eprintln!("mjolnir: listener {id}: dropping {from}: this session has used every stream id; reconnect to start a new session");
                         continue;
                     };
                     // Server streams are made before the client hears of
                     // them, so no connection ever waits for one.
-                    let (guard, ready) = self.register(&mut self.slots.lock().unwrap(), stream, conns);
+                    let (counted, ready) = self.register(&mut self.slots.lock().unwrap(), stream, conns);
                     self.send(TunnelMsg::Incoming {
                         listener: id,
                         stream,
@@ -811,8 +821,8 @@ impl Session {
                     let session = self.clone();
                     let what = format!("{from} -> {}", self.peer);
                     streams.spawn(async move {
-                        let _guard = guard;
-                        session.start(stream, socket, ready, conns, &what).await;
+                        let _counted = counted;
+                        session.start(stream, socket, guard, ready, conns, &what).await;
                     });
                 }
                 Some(_) = streams.join_next(), if !streams.is_empty() => {}

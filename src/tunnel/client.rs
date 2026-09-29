@@ -15,7 +15,7 @@ use tokio::task::JoinSet;
 use tokio::time::timeout;
 
 use super::proto::{self, ADMITTED, CHALLENGE_LEN, CtrlRx, CtrlTx, PROLOGUE, TunnelMsg};
-use super::pump::{ResetGuard, StreamCrypto, Traffic, pump, pump_tcp};
+use super::pump::{BUFFER_BUDGET, Budget, ResetGuard, StreamCrypto, Traffic, pump, pump_tcp};
 use super::spec::{ForwardSpec, HostPort};
 use super::{
     CONNECT_TIMEOUT, GATHER_WAIT, HANDSHAKE_DEADLINE, MAX_CONNS, connect_any, connect_target,
@@ -23,6 +23,7 @@ use super::{
 };
 use crate::crypto::{Cipher, Initiator, NOISE_MSG_MAX, REJECTED, SessionKeys};
 use crate::keys::{PrivateKey, PublicKey};
+use crate::printable::escape;
 use crate::wire::ConnKind;
 
 #[derive(Clone, Debug)]
@@ -69,6 +70,8 @@ struct Shared {
     cipher: Cipher,
     conns: u32,
     verbose: bool,
+    /// Out-of-order stream bytes held across every stream.
+    budget: Budget,
     /// The last stream id used. Held while an `Open` is queued, so `Open`s
     /// go out in id order, which the server checks.
     next_stream: Mutex<u32>,
@@ -180,6 +183,7 @@ impl TunnelClient {
                 cipher: cfg.cipher,
                 conns: cfg.conns,
                 verbose: cfg.verbose,
+                budget: Budget::new(BUFFER_BUDGET),
                 next_stream: Mutex::new(0),
                 ctrl,
             }),
@@ -227,9 +231,15 @@ impl TunnelClient {
         let shared = self.shared.clone();
         let stream = async move {
             let (id, crypto, conns) = shared.open(&target).await?;
-            pump(tokio::io::stdin(), tokio::io::stdout(), conns, crypto)
-                .await
-                .with_context(|| format!("stream {id} to {target}"))
+            pump(
+                tokio::io::stdin(),
+                tokio::io::stdout(),
+                conns,
+                crypto,
+                shared.budget.clone(),
+            )
+            .await
+            .with_context(|| format!("stream {id} to {target}"))
         };
         self.run_with(stream).await
     }
@@ -446,9 +456,8 @@ async fn accept_local(
 
 /// Carries an accepted `-L` connection to `target` from the server.
 async fn serve_local(shared: Arc<Shared>, socket: TcpStream, from: SocketAddr, target: HostPort) {
-    // Resets the application's connection if setup fails or is cancelled;
-    // once pumping, `pump_tcp` takes over.
-    let mut setup_guard = ResetGuard::new(&socket);
+    // Resets the application's connection if setup fails or is cancelled.
+    let guard = ResetGuard::new(&socket);
     let what = format!("{from} -> {target}");
     match shared.open(&target).await {
         Ok((id, crypto, conns)) => {
@@ -458,10 +467,7 @@ async fn serve_local(shared: Arc<Shared>, socket: TcpStream, from: SocketAddr, t
                     connections(shared.conns)
                 );
             }
-            let result = pump_tcp(socket, conns, crypto).await;
-            if result.is_ok() {
-                setup_guard.disarm();
-            }
+            let result = pump_tcp(socket, guard, conns, crypto, shared.budget.clone()).await;
             shared.report(id, &what, result);
         }
         Err(e) => eprintln!("mjolnir: stream ({what}) failed: {e:#}"),
@@ -470,17 +476,30 @@ async fn serve_local(shared: Arc<Shared>, socket: TcpStream, from: SocketAddr, t
 
 /// Carries a stream the server accepted on a `-R` listener to `target`.
 async fn serve_incoming(shared: Arc<Shared>, stream: u32, from: String, target: HostPort) {
-    let what = format!("{from} -> {target}");
-    let setup = async { tokio::try_join!(connect_target(&target), shared.open_conns(stream)) };
-    match setup.await {
-        Ok((local, conns)) => {
+    let what = format!("{} -> {target}", escape(&from));
+    let (local, conns) = tokio::join!(connect_target(&target), shared.open_conns(stream));
+    // The target is reset, never left with a clean empty end, if the
+    // stream's connections failed.
+    let setup = local.and_then(|local| {
+        let guard = ResetGuard::new(&local);
+        conns.map(|conns| (local, guard, conns))
+    });
+    match setup {
+        Ok((local, guard, conns)) => {
             if shared.verbose {
                 eprintln!(
                     "mjolnir: stream {stream} ({what}) open, {}",
                     connections(shared.conns)
                 );
             }
-            let result = pump_tcp(local, conns, shared.crypto(stream)).await;
+            let result = pump_tcp(
+                local,
+                guard,
+                conns,
+                shared.crypto(stream),
+                shared.budget.clone(),
+            )
+            .await;
             shared.report(stream, &what, result);
         }
         Err(e) => shared.fail(stream, &what, &e),
