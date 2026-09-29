@@ -203,6 +203,13 @@ collision. So a file `tree/a` and a directory `tree/A` collide, as do the
 files `a` and `a/b` and the files `Docs/x` and `docs/y`. `file_id` is the
 index into `files`.
 
+Each sent root arrives at the top of that tree under its own name, so two
+roots with the same name collide like any other two paths. Sending `x/data`
+and `y/data` fails as a duplicate directory ("directory data is listed
+twice"), where earlier versions merged the two into one `data`, and two
+root files `x/f.txt` and `y/f.txt` fail as a duplicate name. The sender
+builds the same manifest, so it reports the collision before it connects.
+
 `chunk_size` is between 4 KiB and 64 MiB. File `j` has
 `ceil(size / chunk_size)` chunks. Chunk `k` covers bytes
 `[k * chunk_size, min(size, (k + 1) * chunk_size))`. An empty file has zero
