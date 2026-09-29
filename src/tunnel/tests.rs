@@ -10,6 +10,7 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::time::{sleep, timeout};
 
 use super::proto::{self, CHALLENGE_LEN, CtrlRx, CtrlTx, PROLOGUE, TunnelMsg};
+use super::pump::{BUFFER_BUDGET, Budget, StreamCrypto, pump};
 use super::{ClientConfig, Permits, Policy, ServerConfig, TunnelClient, TunnelServer};
 use crate::crypto::{Cipher, Initiator, NOISE_MSG_MAX, SessionKeys};
 use crate::keys::{AuthorizedKey, PrivateKey, PublicKey};
@@ -135,6 +136,29 @@ fn open(stream: u32, host: &str) -> TunnelMsg {
         host: host.into(),
         port: 1,
         conns: 1,
+    }
+}
+
+trait WithPort {
+    fn clone_with_port(&self, port: u16) -> TunnelMsg;
+}
+
+impl WithPort for TunnelMsg {
+    fn clone_with_port(&self, port: u16) -> TunnelMsg {
+        match self {
+            TunnelMsg::Open {
+                stream,
+                host,
+                conns,
+                ..
+            } => TunnelMsg::Open {
+                stream: *stream,
+                host: host.clone(),
+                port,
+                conns: *conns,
+            },
+            other => panic!("not an Open: {other:?}"),
+        }
     }
 }
 
@@ -287,6 +311,43 @@ async fn a_host_over_the_dns_limit_is_a_protocol_error() {
             .flatten()
             .is_none()
     );
+}
+
+/// A stream keeps running after its control connection closed cleanly:
+/// the server stops taking new streams but lets this one finish.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_clean_control_close_lets_running_streams_finish() {
+    let echo = echo_server().await;
+    let srv = start_server(&["127.0.0.1:*"], &[]).await;
+    let (mut tx, rx, keys) = raw_session(&srv).await;
+    tx.send(&open(1, "127.0.0.1").clone_with_port(echo.port()))
+        .await
+        .unwrap();
+    let mut conn = raw_stream_conn(srv.addr, &keys, 1, 0).await;
+    assert_eq!(conn.read_u8().await.unwrap(), proto::ADMITTED);
+    let (mut app, pump_end) = tokio::io::duplex(1 << 16);
+    let (r, w) = tokio::io::split(pump_end);
+    let crypto = StreamCrypto::new(&keys, Cipher::Aes256Gcm, 1, 1, true);
+    let pumping = tokio::spawn(pump(r, w, vec![conn], crypto, Budget::new(BUFFER_BUDGET)));
+    app.write_all(b"before").await.unwrap();
+    let mut buf = [0u8; 6];
+    app.read_exact(&mut buf).await.unwrap();
+    assert_eq!(&buf, b"before");
+    // The control connection closes cleanly with the stream still open.
+    drop((tx, rx));
+    sleep(Duration::from_millis(300)).await;
+    app.write_all(b"after").await.unwrap();
+    let mut buf = [0u8; 5];
+    timeout(LIMIT, app.read_exact(&mut buf))
+        .await
+        .unwrap()
+        .expect("the stream was cut off by the clean close");
+    assert_eq!(&buf, b"after");
+    app.shutdown().await.unwrap();
+    let mut rest = Vec::new();
+    app.read_to_end(&mut rest).await.unwrap();
+    assert!(rest.is_empty());
+    timeout(LIMIT, pumping).await.unwrap().unwrap().unwrap();
 }
 
 /// A client that sends requests but never reads the replies: the server

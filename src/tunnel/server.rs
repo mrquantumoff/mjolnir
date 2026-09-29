@@ -377,6 +377,7 @@ async fn control(
         budget: shared.budget.clone(),
         ctrl,
         slots: Mutex::new(Slots::default()),
+        closing: watch::Sender::new(false),
         registered: Notify::new(),
         streams: AtomicUsize::new(0),
         next_server_stream: AtomicU32::new(0),
@@ -416,6 +417,8 @@ struct Session {
     /// the client does not read, so nothing piles up on its behalf.
     ctrl: mpsc::Sender<TunnelMsg>,
     slots: Mutex<Slots>,
+    /// Becomes true when the control connection closed cleanly.
+    closing: watch::Sender<bool>,
     /// Signalled whenever a stream registers.
     registered: Notify,
     /// Streams starting or running.
@@ -490,7 +493,14 @@ impl Session {
                 msg = in_rx.recv() => {
                     let msg = match msg {
                         Some(Ok(Some(msg))) => msg,
-                        Some(Ok(None)) => break Ok(()),
+                        // A clean close: no new streams, but the running
+                        // ones finish on their own terms, so nothing the
+                        // client sent before closing is thrown away.
+                        Some(Ok(None)) => {
+                            self.closing.send_replace(true);
+                            while tasks.join_next().await.is_some() {}
+                            break Ok(());
+                        }
                         Some(Err(e)) => break Err(e),
                         None => break Err(anyhow!("control reader stopped")),
                     };
@@ -786,10 +796,18 @@ impl Session {
     }
 
     /// A `-R` listener: every accepted connection becomes a server stream.
+    /// When the session closes cleanly the listener goes away and its
+    /// streams drain.
     async fn listen(self: Arc<Self>, id: u32, listener: TcpListener, conns: u32) {
         let mut streams = JoinSet::new();
+        let mut closing = self.closing.subscribe();
         loop {
             tokio::select! {
+                () = async { drop(closing.wait_for(|&closing| closing).await) } => {
+                    drop(listener);
+                    while streams.join_next().await.is_some() {}
+                    return;
+                }
                 accepted = listener.accept() => {
                     let (socket, from) = match accepted {
                         Ok(a) => a,

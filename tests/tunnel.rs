@@ -495,3 +495,114 @@ async fn stopping_the_server_resets_its_streams() {
     let ended = timeout(LIMIT, run).await.unwrap().unwrap();
     assert!(ended.is_err());
 }
+
+/// A target with nothing to say: it half-closes at once, then reads
+/// slowly, and reports how many bytes it got and how its input ended.
+async fn slow_half_closing_target() -> (
+    SocketAddr,
+    tokio::sync::mpsc::Receiver<Result<usize, String>>,
+) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (report, reports) = tokio::sync::mpsc::channel(4);
+    tokio::spawn(async move {
+        loop {
+            let (mut s, _) = listener.accept().await.unwrap();
+            let report = report.clone();
+            tokio::spawn(async move {
+                let (mut r, mut w) = s.split();
+                w.shutdown().await.unwrap();
+                let mut buf = vec![0u8; 64 << 10];
+                let mut n = 0;
+                let outcome = loop {
+                    match r.read(&mut buf).await {
+                        Ok(0) => break Ok(n),
+                        Ok(k) => n += k,
+                        Err(e) => break Err(format!("{e} after {n} bytes")),
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                };
+                let _ = report.send(outcome).await;
+            });
+        }
+    });
+    (addr, reports)
+}
+
+/// An upload as `-W` does it, to a target that answers nothing and reads
+/// slowly: when the client reports success, the target has every byte,
+/// and closing the session afterwards does not cut the stream off.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_stdio_upload_is_delivered_in_full_before_the_client_reports_success() {
+    let (target, mut reports) = slow_half_closing_target().await;
+    let setup = server(permits(&["127.0.0.1:*"], &[]), plain).await;
+    for conns in [1, 4] {
+        let client = TunnelClient::connect(client_cfg(&setup, conns, &[], &[]))
+            .await
+            .unwrap();
+        let (mut app, pump_end) = tokio::io::duplex(1 << 16);
+        let (r, w) = tokio::io::split(pump_end);
+        let target_hp = format!("127.0.0.1:{}", target.port()).parse().unwrap();
+        let carried = tokio::spawn(client.carry(target_hp, r, w));
+        let data = pattern(8 << 20, conns);
+        app.write_all(&data).await.unwrap();
+        app.shutdown().await.unwrap();
+        let mut back = Vec::new();
+        app.read_to_end(&mut back).await.unwrap();
+        assert!(back.is_empty());
+        let traffic = timeout(LIMIT, carried).await.unwrap().unwrap().unwrap();
+        assert_eq!(traffic.sent, data.len() as u64, "{conns} connections");
+        // The session is over; the target must still end up with all of it.
+        let got = timeout(LIMIT, reports.recv()).await.unwrap().unwrap();
+        assert_eq!(got, Ok(data.len()), "{conns} connections");
+    }
+}
+
+/// `mjolnir tunnel -W` as a subprocess, with its stdin held open: when the
+/// target ends, the reader of its stdout must see the end at once.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn stdio_closes_stdout_when_the_target_ends() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let target = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        loop {
+            let (mut s, _) = listener.accept().await.unwrap();
+            s.write_all(b"hello\n").await.unwrap();
+        }
+    });
+    let setup = server(permits(&["127.0.0.1:*"], &[]), plain).await;
+    let dir = tempfile::tempdir().unwrap();
+    let key_path = dir.path().join("client.key");
+    setup.client_key.save(&key_path).unwrap();
+    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_mjolnir"))
+        .arg("tunnel")
+        .arg(setup.server.to_string())
+        .arg("--key")
+        .arg(&key_path)
+        .arg("--peer")
+        .arg(setup.server_key.to_string())
+        .arg("-W")
+        .arg(format!("127.0.0.1:{}", target.port()))
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let stdin = child.stdin.take().unwrap();
+    let mut stdout = child.stdout.take().unwrap();
+    let output = tokio::task::spawn_blocking(move || {
+        let mut out = Vec::new();
+        std::io::Read::read_to_end(&mut stdout, &mut out).map(|_| out)
+    });
+    let out = timeout(Duration::from_secs(10), output)
+        .await
+        .expect("stdout must end when the target ends, not when stdin does")
+        .unwrap()
+        .unwrap();
+    assert_eq!(out, b"hello\n");
+    drop(stdin);
+    let status = tokio::task::spawn_blocking(move || child.wait())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(status.success(), "{status}");
+}

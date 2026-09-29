@@ -4,13 +4,15 @@
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::sync::{Arc, Mutex};
+use std::pin::Pin;
+use std::sync::Arc;
+use std::task::{Context as TaskContext, Poll};
 
 use anyhow::{Context, Result, anyhow, bail, ensure};
-use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::mpsc;
+use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore, mpsc};
 use tokio::task::JoinSet;
 use tokio::time::timeout;
 
@@ -18,8 +20,8 @@ use super::proto::{self, ADMITTED, CHALLENGE_LEN, CtrlRx, CtrlTx, PROLOGUE, Tunn
 use super::pump::{BUFFER_BUDGET, Budget, ResetGuard, StreamCrypto, Traffic, pump, pump_tcp};
 use super::spec::{ForwardSpec, HostPort};
 use super::{
-    CONNECT_TIMEOUT, GATHER_WAIT, HANDSHAKE_DEADLINE, MAX_CONNS, connect_any, connect_target,
-    connections, human,
+    CONNECT_TIMEOUT, GATHER_WAIT, HANDSHAKE_DEADLINE, MAX_CONNS, SERVER_STREAM, connect_any,
+    connect_target, connections, human,
 };
 use crate::crypto::{Cipher, Initiator, NOISE_MSG_MAX, REJECTED, SessionKeys};
 use crate::keys::{PrivateKey, PublicKey};
@@ -48,6 +50,12 @@ pub struct ClientConfig {
 /// server first connects to the target and gathers the stream's other
 /// connections.
 const ADMIT_WAIT: std::time::Duration = CONNECT_TIMEOUT.saturating_add(GATHER_WAIT);
+/// `-L` streams starting or running at once. A `-L` listener accepts only
+/// while one of these is free, so a flood of connections waits in the
+/// kernel's backlog instead of each getting tasks and sockets here.
+const MAX_LOCAL_STREAMS: usize = 256;
+/// Control messages queued for the server at once.
+const CTRL_QUEUE: usize = 64;
 
 /// An established session with its forwards set up. [`TunnelClient::run`]
 /// serves them until the session ends.
@@ -75,7 +83,9 @@ struct Shared {
     /// The last stream id used. Held while an `Open` is queued, so `Open`s
     /// go out in id order, which the server checks.
     next_stream: Mutex<u32>,
-    ctrl: mpsc::UnboundedSender<TunnelMsg>,
+    /// Bounded: a stream waits for room rather than piling requests up.
+    ctrl: mpsc::Sender<TunnelMsg>,
+    local_streams: Arc<Semaphore>,
 }
 
 impl TunnelClient {
@@ -173,7 +183,7 @@ impl TunnelClient {
             local.push((listener, spec.target.clone()));
         }
 
-        let (ctrl, ctrl_rx) = mpsc::unbounded_channel();
+        let (ctrl, ctrl_rx) = mpsc::channel(CTRL_QUEUE);
         let writer = tokio::spawn(write_control(tx, ctrl_rx));
         Ok(TunnelClient {
             shared: Arc::new(Shared {
@@ -186,6 +196,7 @@ impl TunnelClient {
                 budget: Budget::new(BUFFER_BUDGET),
                 next_stream: Mutex::new(0),
                 ctrl,
+                local_streams: Arc::new(Semaphore::new(MAX_LOCAL_STREAMS)),
             }),
             rx,
             writer,
@@ -226,20 +237,28 @@ impl TunnelClient {
     }
 
     /// Carries one stream to `target` over stdin and stdout, as `ssh -W`
-    /// does, and returns when it ends.
+    /// does, and returns when it ends. Stdout is closed when the target's
+    /// end arrives, so whatever reads it sees that end without waiting for
+    /// stdin to finish too.
     pub async fn stdio(self, target: HostPort) -> Result<Traffic> {
+        self.carry(target, tokio::io::stdin(), StdoutPipe::new())
+            .await
+    }
+
+    /// Carries one stream to `target` between `input` and `output`, and
+    /// returns when it ends: once both directions have ended and the server
+    /// has written everything sent to its side.
+    pub async fn carry<R, W>(self, target: HostPort, input: R, output: W) -> Result<Traffic>
+    where
+        R: AsyncRead + Unpin + Send + 'static,
+        W: AsyncWrite + Unpin + Send + 'static,
+    {
         let shared = self.shared.clone();
         let stream = async move {
             let (id, crypto, conns) = shared.open(&target).await?;
-            pump(
-                tokio::io::stdin(),
-                tokio::io::stdout(),
-                conns,
-                crypto,
-                shared.budget.clone(),
-            )
-            .await
-            .with_context(|| format!("stream {id} to {target}"))
+            pump(input, output, conns, crypto, shared.budget.clone())
+                .await
+                .with_context(|| format!("stream {id} to {target}"))
         };
         self.run_with(stream).await
     }
@@ -261,9 +280,15 @@ impl TunnelClient {
         let mut tasks = JoinSet::new();
         let (accepted_tx, mut accepted) = mpsc::channel(16);
         for (listener, target) in local {
-            tasks.spawn(accept_local(listener, target, accepted_tx.clone()));
+            tasks.spawn(accept_local(
+                listener,
+                target,
+                shared.local_streams.clone(),
+                accepted_tx.clone(),
+            ));
         }
         drop(accepted_tx);
+        let mut last_incoming = None;
         // Reading is not cancellation safe, so it has a task of its own.
         let (in_tx, mut in_rx) = mpsc::channel(16 + early.len());
         for msg in early {
@@ -294,13 +319,16 @@ impl TunnelClient {
                             let Some(target) = remote.get(&listener).cloned() else {
                                 break Err(anyhow!("protocol error: unknown listener {listener}"));
                             };
+                            if let Err(e) = check_incoming(&mut last_incoming, stream) {
+                                break Err(e);
+                            }
                             tasks.spawn(serve_incoming(shared.clone(), stream, from, target));
                         }
                         TunnelMsg::Close { stream, message } => {
-                            eprintln!("mjolnir: stream {stream}: the server said: {message}");
+                            eprintln!("mjolnir: stream {stream}: the server said: {}", escape(&message));
                         }
                         TunnelMsg::Error { message } => {
-                            break Err(anyhow!("the server reported an error: {message}"));
+                            break Err(anyhow!("the server reported an error: {}", escape(&message)));
                         }
                         other => break Err(anyhow!("protocol error: unexpected {other:?}")),
                     }
@@ -312,8 +340,8 @@ impl TunnelClient {
                         Err(e) => anyhow!("control writer failed: {e}"),
                     });
                 }
-                Some((socket, from, target)) = accepted.recv() => {
-                    tasks.spawn(serve_local(shared.clone(), socket, from, target));
+                Some((socket, from, target, permit)) = accepted.recv() => {
+                    tasks.spawn(serve_local(shared.clone(), socket, from, target, permit));
                 }
                 Some(_) = tasks.join_next(), if !tasks.is_empty() => {}
             }
@@ -327,12 +355,74 @@ impl TunnelClient {
 
 async fn write_control(
     mut tx: CtrlTx<OwnedWriteHalf>,
-    mut rx: mpsc::UnboundedReceiver<TunnelMsg>,
+    mut rx: mpsc::Receiver<TunnelMsg>,
 ) -> Result<()> {
     while let Some(msg) = rx.recv().await {
         tx.send(&msg).await?;
     }
     Ok(())
+}
+
+/// Server stream ids have the top bit set and only grow, so one that does
+/// not is a server reusing an id, whose keys and nonces were used before.
+fn check_incoming(last: &mut Option<u32>, stream: u32) -> Result<()> {
+    ensure!(
+        stream & SERVER_STREAM != 0 && last.is_none_or(|last| stream > last),
+        "protocol error: the server reused stream id {stream}"
+    );
+    *last = Some(stream);
+    Ok(())
+}
+
+/// Stdout as a stream's output: its shutdown closes the underlying file
+/// descriptor or handle, since tokio's own only flushes. Whatever reads
+/// the other end of the pipe then sees the end of the stream at once.
+struct StdoutPipe(tokio::io::Stdout);
+
+impl StdoutPipe {
+    fn new() -> Self {
+        StdoutPipe(tokio::io::stdout())
+    }
+}
+
+impl AsyncWrite for StdoutPipe {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut TaskContext<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        Pin::new(&mut self.0).poll_write(cx, buf)
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.0).poll_flush(cx)
+    }
+
+    fn poll_shutdown(
+        mut self: Pin<&mut Self>,
+        cx: &mut TaskContext<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        // The flush behind tokio's shutdown waits for its blocking write
+        // to finish, so nothing is in flight when the descriptor closes.
+        std::task::ready!(Pin::new(&mut self.0).poll_shutdown(cx))?;
+        close_stdout();
+        Poll::Ready(Ok(()))
+    }
+}
+
+/// Closes this process's stdout. Later writes to it by the standard
+/// library are ignored rather than failing.
+#[cfg(unix)]
+fn close_stdout() {
+    use std::os::fd::AsRawFd;
+    unsafe { libc::close(std::io::stdout().as_raw_fd()) };
+}
+
+#[cfg(windows)]
+fn close_stdout() {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Foundation::CloseHandle;
+    unsafe { CloseHandle(std::io::stdout().as_raw_handle()) };
 }
 
 impl Shared {
@@ -343,8 +433,8 @@ impl Shared {
         target: &HostPort,
     ) -> Result<(u32, StreamCrypto, Vec<TcpStream>)> {
         let id = {
-            let mut next = self.next_stream.lock().unwrap();
-            ensure!(*next < super::SERVER_STREAM - 1, "stream ids exhausted");
+            let mut next = self.next_stream.lock().await;
+            ensure!(*next < SERVER_STREAM - 1, "stream ids exhausted");
             *next += 1;
             self.ctrl
                 .send(TunnelMsg::Open {
@@ -353,6 +443,7 @@ impl Shared {
                     port: target.port,
                     conns: self.conns,
                 })
+                .await
                 .map_err(|_| anyhow!("the session has ended"))?;
             *next
         };
@@ -382,12 +473,15 @@ impl Shared {
         Ok(conns.into_iter().map(Option::unwrap).collect())
     }
 
-    fn fail(&self, stream: u32, what: &str, e: &anyhow::Error) {
+    async fn fail(&self, stream: u32, what: &str, e: &anyhow::Error) {
         eprintln!("mjolnir: stream {stream} ({what}) failed: {e:#}");
-        let _ = self.ctrl.send(TunnelMsg::Close {
-            stream,
-            message: format!("{e:#}"),
-        });
+        let _ = self
+            .ctrl
+            .send(TunnelMsg::Close {
+                stream,
+                message: format!("{e:#}"),
+            })
+            .await;
     }
 
     fn report(&self, stream: u32, what: &str, result: Result<Traffic>) {
@@ -432,17 +526,25 @@ async fn open_conn(
     }
 }
 
-/// Accepts `-L` connections and hands them to the session loop, which
-/// owns every stream task.
+/// Accepts `-L` connections, each with a stream permit taken first, and
+/// hands them to the session loop, which owns every stream task.
 async fn accept_local(
     listener: TcpListener,
     target: HostPort,
-    accepted: mpsc::Sender<(TcpStream, SocketAddr, HostPort)>,
+    permits: Arc<Semaphore>,
+    accepted: mpsc::Sender<(TcpStream, SocketAddr, HostPort, OwnedSemaphorePermit)>,
 ) {
     loop {
+        let Ok(permit) = permits.clone().acquire_owned().await else {
+            return;
+        };
         match listener.accept().await {
             Ok((socket, from)) => {
-                if accepted.send((socket, from, target.clone())).await.is_err() {
+                if accepted
+                    .send((socket, from, target.clone(), permit))
+                    .await
+                    .is_err()
+                {
                     return;
                 }
             }
@@ -454,8 +556,15 @@ async fn accept_local(
     }
 }
 
-/// Carries an accepted `-L` connection to `target` from the server.
-async fn serve_local(shared: Arc<Shared>, socket: TcpStream, from: SocketAddr, target: HostPort) {
+/// Carries an accepted `-L` connection to `target` from the server,
+/// holding its stream permit throughout.
+async fn serve_local(
+    shared: Arc<Shared>,
+    socket: TcpStream,
+    from: SocketAddr,
+    target: HostPort,
+    _permit: OwnedSemaphorePermit,
+) {
     // Resets the application's connection if setup fails or is cancelled.
     let guard = ResetGuard::new(&socket);
     let what = format!("{from} -> {target}");
@@ -502,6 +611,75 @@ async fn serve_incoming(shared: Arc<Shared>, stream: u32, from: String, target: 
             .await;
             shared.report(stream, &what, result);
         }
-        Err(e) => shared.fail(stream, &what, &e),
+        Err(e) => shared.fail(stream, &what, &e).await,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    #[test]
+    fn server_stream_ids_must_have_the_top_bit_and_grow() {
+        let mut last = None;
+        assert!(check_incoming(&mut last, 1).is_err(), "a client-side id");
+        assert!(check_incoming(&mut last, SERVER_STREAM).is_ok());
+        assert!(check_incoming(&mut last, SERVER_STREAM | 5).is_ok());
+        assert!(
+            check_incoming(&mut last, SERVER_STREAM | 5).is_err(),
+            "reused"
+        );
+        assert!(
+            check_incoming(&mut last, SERVER_STREAM | 2).is_err(),
+            "gone back"
+        );
+        assert!(check_incoming(&mut last, SERVER_STREAM | 6).is_ok());
+    }
+
+    /// The listener accepts only while a permit is free, so connections
+    /// beyond the limit wait in the backlog without a task or a socket
+    /// on this side.
+    #[tokio::test]
+    async fn local_streams_are_accepted_only_with_a_permit() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let permits = Arc::new(Semaphore::new(2));
+        let (tx, mut rx) = mpsc::channel(16);
+        let target = HostPort {
+            host: "x".into(),
+            port: 1,
+        };
+        tokio::spawn(accept_local(listener, target, permits, tx));
+        let _apps: Vec<_> = futures_connect(addr, 3).await;
+        let first = timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let second = timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            timeout(Duration::from_millis(300), rx.recv())
+                .await
+                .is_err(),
+            "a third stream was accepted without a permit"
+        );
+        drop(first.3);
+        drop(second.3);
+        let third = timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .expect("a freed permit lets the next one in")
+            .unwrap();
+        drop(third);
+    }
+
+    async fn futures_connect(addr: SocketAddr, n: usize) -> Vec<TcpStream> {
+        let mut out = Vec::new();
+        for _ in 0..n {
+            out.push(TcpStream::connect(addr).await.unwrap());
+        }
+        out
     }
 }
