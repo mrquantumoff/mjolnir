@@ -28,8 +28,8 @@ pub mod wire;
 
 pub use crypto::Cipher;
 pub use keys::{
-    AuthorizedKey, PrivateKey, PublicKey, default_key_path, load_authorized_entries,
-    load_authorized_keys, parse_authorized_entries, parse_authorized_keys,
+    AuthorizedKey, KeyOption, PrivateKey, PublicKey, default_key_path, load_authorized_entries,
+    load_authorized_keys, parse_authorized_entries, parse_authorized_keys, transfer_keys,
 };
 pub use manifest::parse_size;
 pub use progress::{Cancelled, Phase, PhaseTimes, Progress, ProgressSnapshot};

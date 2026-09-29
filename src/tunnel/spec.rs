@@ -9,7 +9,7 @@ use std::str::FromStr;
 use anyhow::{Context, Result, anyhow, bail, ensure};
 
 use super::server::MAX_HOST_LEN;
-use crate::keys::{AuthorizedKey, PublicKey};
+use crate::keys::{AuthorizedKey, KeyOption, PublicKey};
 
 /// A host name or address and a port. IPv6 addresses print in brackets.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -187,7 +187,8 @@ impl Permits {
 
 /// The server's authorized keys and what each may do. A key whose
 /// authorized-keys line carries `permitopen` or `permitlisten` options gets
-/// exactly those; every other key gets the server-wide defaults.
+/// exactly those; every other key gets the server-wide defaults. The
+/// `transfer` option is `mjolnir recv`'s business and changes nothing here.
 #[derive(Clone, Debug, Default)]
 pub struct Policy {
     keys: Vec<PublicKey>,
@@ -206,18 +207,19 @@ impl Policy {
             if !policy.keys.contains(&entry.key) {
                 policy.keys.push(entry.key);
             }
-            if entry.options.is_empty() {
-                continue;
-            }
-            let own = policy.own.entry(entry.key).or_default();
-            for (name, value) in &entry.options {
+            for option in &entry.options {
+                let (name, value) = match option {
+                    KeyOption::PermitOpen(v) => ("permitopen", v),
+                    KeyOption::PermitListen(v) => ("permitlisten", v),
+                    KeyOption::Transfer => continue,
+                };
                 let pattern = value
                     .parse()
                     .with_context(|| format!("{name}={value:?} for key {}", entry.key))?;
-                match name.as_str() {
-                    "permitopen" => own.open.push(pattern),
-                    "permitlisten" => own.listen.push(pattern),
-                    other => bail!("unknown key option {other:?}"),
+                let own = policy.own.entry(entry.key).or_default();
+                match option {
+                    KeyOption::PermitOpen(_) => own.open.push(pattern),
+                    _ => own.listen.push(pattern),
                 }
             }
         }
@@ -308,7 +310,7 @@ mod tests {
         let entries = vec![
             AuthorizedKey {
                 key: a,
-                options: vec![("permitlisten".into(), "127.0.0.1:9000".into())],
+                options: vec![KeyOption::PermitListen("127.0.0.1:9000".into())],
             },
             AuthorizedKey {
                 key: b,

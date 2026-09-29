@@ -13,7 +13,7 @@ use mjolnir::printable::escape;
 use mjolnir::tunnel::{self, ForwardSpec, HostPort, Pattern, Permits, Policy};
 use mjolnir::{
     Cipher, Phase, PhaseTimes, PrivateKey, Progress, PublicKey, Receiver, RecvConfig, SendConfig,
-    load_authorized_entries, load_authorized_keys, parse_size, web,
+    load_authorized_entries, parse_size, transfer_keys, web,
 };
 
 #[derive(Parser)]
@@ -202,7 +202,15 @@ fn run(cmd: Cmd) -> Result<()> {
             allow_special_bits,
         } => {
             if let Some(path) = authorized {
-                allow.extend(load_authorized_keys(&path)?);
+                let entries = load_authorized_entries(&path)?;
+                for entry in entries.iter().filter(|e| !e.grants_transfer()) {
+                    eprintln!(
+                        "mjolnir: {}: key {} has tunnel options and no `transfer` option, so it may not send files",
+                        path.display(),
+                        entry.key
+                    );
+                }
+                allow.extend(transfer_keys(&entries));
             }
             if allow.is_empty() {
                 bail!("no authorized sender keys: pass --authorized FILE or --allow KEY");

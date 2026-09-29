@@ -5,7 +5,7 @@ use std::io::ErrorKind;
 use std::net::SocketAddr;
 use std::time::Duration;
 
-use mjolnir::keys::AuthorizedKey;
+use mjolnir::keys::{AuthorizedKey, KeyOption};
 use mjolnir::tunnel::{
     ClientConfig, ForwardSpec, Permits, Policy, ServerConfig, TunnelClient, TunnelServer,
 };
@@ -255,7 +255,7 @@ async fn per_key_options_replace_the_server_defaults() {
     let setup = server(permits(&["*"], &["*"]), |k| {
         vec![AuthorizedKey {
             key: k.public_key(),
-            options: vec![("permitlisten".into(), "127.0.0.1:*".into())],
+            options: vec![KeyOption::PermitListen("127.0.0.1:*".into())],
         }]
     })
     .await;
