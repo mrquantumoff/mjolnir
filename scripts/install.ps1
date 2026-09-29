@@ -1,10 +1,8 @@
 # Install a mjolnir release binary on Windows (x64 or ARM64).
 #
-# Downloads with the GitHub CLI when it is logged in, otherwise through the
-# GitHub API with a personal access token from GH_TOKEN or GITHUB_TOKEN. The
-# token needs read access to the repository's contents. The archive is checked
-# against the release's SHA256SUMS before anything is installed, and the
-# install directory is added to the user PATH.
+# Downloads from the release's public URLs, so it needs no GitHub login or
+# token. The archive is checked against the release's SHA256SUMS before
+# anything is installed, and the install directory is added to the user PATH.
 #
 # usage: scripts/install.ps1 [-Version v0.1.0] [-InstallDir DIR] [-Repo owner/name]
 #   Each parameter defaults to MJOLNIR_VERSION, MJOLNIR_INSTALL_DIR and
@@ -35,34 +33,21 @@ $arch = switch ([System.Runtime.InteropServices.RuntimeInformation]::OSArchitect
     default { throw "install: no build for architecture $_" }
 }
 $asset = "mjolnir-$arch-pc-windows-msvc.zip"
-$token = if ($env:GH_TOKEN) { $env:GH_TOKEN } else { $env:GITHUB_TOKEN }
 
 $tmp = Join-Path ([System.IO.Path]::GetTempPath()) ([System.IO.Path]::GetRandomFileName())
 New-Item -ItemType Directory $tmp | Out-Null
 try {
-    $gh = Get-Command gh -ErrorAction SilentlyContinue
-    if ($gh) { gh auth token *> $null }
-    if ($gh -and $LASTEXITCODE -eq 0) {
-        $tag = if ($Version -eq 'latest') { @() } else { @($Version) }
-        gh release download @tag --repo $Repo --dir $tmp --pattern $asset --pattern SHA256SUMS
-        if ($LASTEXITCODE -ne 0) { throw "install: gh could not download $asset from $Repo ($Version)" }
-    } elseif ($token) {
-        $headers = @{ Authorization = "Bearer $token"; 'X-GitHub-Api-Version' = '2022-11-28' }
-        $api = "https://api.github.com/repos/$Repo/releases"
-        $url = if ($Version -eq 'latest') { "$api/latest" } else { "$api/tags/$Version" }
-        try {
-            $release = Invoke-RestMethod $url -Headers ($headers + @{ Accept = 'application/vnd.github+json' })
-        } catch {
-            throw "install: no release $Version in $Repo, or the token cannot read it ($($_.Exception.Message))"
-        }
-        foreach ($name in $asset, 'SHA256SUMS') {
-            $found = $release.assets | Where-Object name -EQ $name
-            if (-not $found) { throw "install: release $($release.tag_name) has no $name" }
-            Invoke-WebRequest $found.url -Headers ($headers + @{ Accept = 'application/octet-stream' }) `
-                -OutFile (Join-Path $tmp $name) -UseBasicParsing
-        }
+    $base = if ($Version -eq 'latest') {
+        "https://github.com/$Repo/releases/latest/download"
     } else {
-        throw "install: log in with 'gh auth login', or set GH_TOKEN to a personal access token"
+        "https://github.com/$Repo/releases/download/$Version"
+    }
+    foreach ($name in $asset, 'SHA256SUMS') {
+        try {
+            Invoke-WebRequest "$base/$name" -OutFile (Join-Path $tmp $name) -UseBasicParsing
+        } catch {
+            throw "install: cannot download $name from $Repo ($Version): $($_.Exception.Message)"
+        }
     }
 
     $archive = Join-Path $tmp $asset

@@ -23,6 +23,8 @@ pub mod recv;
 mod schedule;
 pub mod send;
 pub mod tunnel;
+#[cfg(feature = "self-update")]
+pub mod update;
 pub mod web;
 pub mod wire;
 

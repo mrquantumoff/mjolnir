@@ -42,7 +42,8 @@ enum Cmd {
     Recv {
         #[arg(long)]
         key: PathBuf,
-        /// File of authorized sender keys, one `<base64> [comment]` per line.
+        /// File of authorized sender keys, one `[options] <base64> [comment]`
+        /// per line; a line with tunnel options needs `transfer` to send files.
         #[arg(long)]
         authorized: Option<PathBuf>,
         /// Authorize a sender public key (repeatable).
@@ -171,9 +172,18 @@ enum Cmd {
         #[arg(long)]
         no_open: bool,
     },
+    /// Replace this binary with the latest release from GitHub.
+    #[cfg(feature = "self-update")]
+    Update {
+        /// Only report whether a newer release exists.
+        #[arg(long)]
+        check: bool,
+    },
 }
 
 fn main() {
+    #[cfg(all(feature = "self-update", windows))]
+    mjolnir::update::remove_leftover();
     if let Err(e) = run(Cli::parse().cmd) {
         eprintln!("mjolnir: error: {}", escape(&format!("{e:#}")));
         std::process::exit(1);
@@ -388,6 +398,26 @@ fn run(cmd: Cmd) -> Result<()> {
                 key_path,
                 open_browser: !no_open,
             })?;
+        }
+        #[cfg(feature = "self-update")]
+        Cmd::Update { check } => {
+            use mjolnir::update::{self, Outcome};
+            let releases = std::env::var("MJOLNIR_RELEASES_URL")
+                .unwrap_or_else(|_| update::RELEASES_URL.to_string());
+            let current = env!("CARGO_PKG_VERSION");
+            match update::update(&releases, check)? {
+                Outcome::UpToDate { latest } => {
+                    println!("mjolnir {current} is up to date (latest release {latest})")
+                }
+                Outcome::Available { latest } => {
+                    println!(
+                        "mjolnir {latest} is available (this is {current}); run `mjolnir update`"
+                    )
+                }
+                Outcome::Updated { version, path } => {
+                    println!("installed {version} to {}", path.display())
+                }
+            }
         }
     }
     Ok(())

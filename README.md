@@ -12,35 +12,23 @@ connections; see [Tunnels](#tunnels).
 
 ## Install
 
-Releases ship prebuilt binaries for Linux and Windows on x86_64 and
-aarch64. The install scripts download the latest one, check it against the
-release's `SHA256SUMS`, and install it. They download with the GitHub CLI
-when it is logged in, and otherwise with a personal access token in
-`GH_TOKEN` or `GITHUB_TOKEN` that can read this repository's contents.
+Releases ship prebuilt binaries for Linux, macOS, and Windows on x86_64
+and aarch64. The install scripts download the latest one from the release's
+public URLs, check it against the release's `SHA256SUMS`, and install it. No
+GitHub account, login, or token is needed.
 
-On Linux, [`scripts/install.sh`](scripts/install.sh) installs to
+On Linux and macOS, [`scripts/install.sh`](scripts/install.sh) installs to
 `~/.local/bin`:
 
 ```sh
-gh api repos/mrquantumoff/mjolnir/contents/scripts/install.sh \
-    -H "Accept: application/vnd.github.raw" | bash
-```
-
-With a token and no GitHub CLI (the header reaches curl as a config on
-stdin, so the token does not show up in the process list):
-
-```sh
-printf 'header = "Authorization: Bearer %s"\n' "$GH_TOKEN" |
-    curl -fsSL --config - -H "Accept: application/vnd.github.raw" \
-    https://api.github.com/repos/mrquantumoff/mjolnir/contents/scripts/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/mrquantumoff/mjolnir/master/scripts/install.sh | bash
 ```
 
 On Windows, [`scripts/install.ps1`](scripts/install.ps1) installs to
 `%LOCALAPPDATA%\Programs\mjolnir` and adds that folder to the user `PATH`:
 
 ```powershell
-gh api repos/mrquantumoff/mjolnir/contents/scripts/install.ps1 `
-    -H "Accept: application/vnd.github.raw" | Out-String | Invoke-Expression
+irm https://raw.githubusercontent.com/mrquantumoff/mjolnir/master/scripts/install.ps1 | iex
 ```
 
 Both scripts read `MJOLNIR_VERSION` to install a specific tag instead of
@@ -50,6 +38,27 @@ and `-InstallDir`.
 
 To build from source instead, run `cargo build --release`; the binary lands
 in `target/release`.
+
+### Updating
+
+`mjolnir update` replaces the running binary with the latest release, and
+`mjolnir update --check` only reports whether one exists. It reads the
+latest tag from GitHub's `releases/latest` redirect, downloads this
+platform's archive and `SHA256SUMS` from the public release URLs with the
+system's `curl`, refuses an archive that does not match, unpacks it with the
+system's `tar`, and swaps the new binary in only after it runs `--version`.
+Windows 10 and later ship both tools; on Windows the old binary is moved to
+`mjolnir.exe.old` and deleted on the next run. It never downgrades, and it
+refuses on platforms that have no release build.
+`MJOLNIR_RELEASES_URL` points it at a fork or mirror with the same layout.
+
+The updater is the `self-update` Cargo feature, on by default. Packagers who
+ship mjolnir through a package manager should build without it, which
+removes the `update` command:
+
+```sh
+cargo build --release --no-default-features
+```
 
 ## Quick start
 
@@ -129,6 +138,9 @@ local web UI; see [docs/WEB.md](docs/WEB.md).
 
 `mjolnir tunnel` and `mjolnir tunnel-server` forward TCP ports; see
 [Tunnels](#tunnels).
+
+`mjolnir update [--check]` updates the binary from the latest GitHub
+release; see [Updating](#updating).
 
 ## Tunnels
 
@@ -315,10 +327,11 @@ Rerun with `scripts/bench.sh [WORKDIR]` (`SIZE_MIB`, `REPEAT`, `PORT`,
 
 [`.github/workflows/ci.yml`](.github/workflows/ci.yml) builds release
 binaries for `x86_64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu`,
-`x86_64-pc-windows-msvc`, and `aarch64-pc-windows-msvc`, and runs the tests
-on the two x86_64 targets. The aarch64 targets cross-compile on x86_64
-runners, so their tests do not run. A macOS job runs the tests on Apple
-silicon and APFS; no macOS binary is released. It runs only for tags that start with
+`x86_64-pc-windows-msvc`, `aarch64-pc-windows-msvc`, `aarch64-apple-darwin`,
+and `x86_64-apple-darwin`. It runs the tests on x86_64 Linux, x86_64
+Windows, and Apple silicon macOS (on APFS). The other targets cross-compile,
+the aarch64 Linux and Windows ones on x86_64 runners and Intel macOS on the
+Apple silicon runner, so their tests do not run. It runs only for tags that start with
 `v`, or when started by hand from the Actions tab, which builds without
 publishing anything. Every action it uses is pinned to a commit SHA, and
 the toolchain to an exact Rust release.
@@ -330,6 +343,10 @@ git tag v0.1.0
 git push origin v0.1.0
 ```
 
-The release holds `mjolnir-<target>.tar.gz` for Linux,
+The release holds `mjolnir-<target>.tar.gz` for Linux and macOS,
 `mjolnir-<target>.zip` for Windows, and a `SHA256SUMS` file covering them,
-which is the layout the install scripts expect.
+which is the layout the install scripts and `mjolnir update` expect.
+
+## License
+
+BSD 2-Clause; see [LICENSE](LICENSE).

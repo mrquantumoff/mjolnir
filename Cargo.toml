@@ -2,8 +2,15 @@
 name = "mjolnir"
 version = "0.1.0"
 edition = "2024"
-description = "Fast authenticated file transfer: per-chunk AEAD over parallel TCP connections"
-license = "MIT OR Apache-2.0"
+description = "Fast authenticated file transfer and TCP tunnels: per-chunk AEAD over parallel TCP connections"
+repository = "https://github.com/mrquantumoff/mjolnir"
+license = "BSD-2-Clause"
+
+[features]
+default = ["self-update"]
+# `mjolnir update`, which replaces the binary with the latest GitHub release.
+# Packagers turn it off so the package manager owns the binary.
+self-update = []
 
 [dependencies]
 aes-gcm = { version = "0.10", features = ["zeroize"] }

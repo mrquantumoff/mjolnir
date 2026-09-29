@@ -23,9 +23,11 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # The ARM64 targets cross-compile on x86_64 runners: GitHub's hosted
-        # ARM64 runners are free only for public repositories. Their tests
-        # are skipped since the binaries cannot run on the build host.
+        # The Linux and Windows ARM64 targets cross-compile on x86_64
+        # runners, and Intel macOS cross-compiles on the Apple silicon
+        # runner. Cross-compiled targets skip their tests since the binaries
+        # cannot run on the build host. The Apple silicon build also runs
+        # the tests on APFS.
         include:
           - target: x86_64-unknown-linux-gnu
             os: ubuntu-22.04
@@ -38,6 +40,12 @@ jobs:
             test: true
           - target: aarch64-pc-windows-msvc
             os: windows-2022
+            test: false
+          - target: aarch64-apple-darwin
+            os: macos-latest
+            test: true
+          - target: x86_64-apple-darwin
+            os: macos-latest
             test: false
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -62,6 +70,11 @@ jobs:
         if: matrix.test
         run: cargo test --locked --target ${{ matrix.target }}
 
+      # What a distribution package builds: no `update` command.
+      - name: Check without the self-update feature
+        if: matrix.target == 'x86_64-unknown-linux-gnu'
+        run: cargo check --locked --no-default-features --all-targets
+
       - name: Build
         run: cargo build --release --locked --target ${{ matrix.target }}
 
@@ -76,20 +89,20 @@ jobs:
           echo "aese: $aese, pmull: $pmull"
           [ "$aese" -gt 0 ] && [ "$pmull" -gt 0 ]
 
-      - name: Package (Linux)
-        if: runner.os == 'Linux'
+      - name: Package (Linux, macOS)
+        if: runner.os != 'Windows'
         run: |
           mkdir -p dist
           tar -czf "dist/mjolnir-${{ matrix.target }}.tar.gz" \
             -C "target/${{ matrix.target }}/release" mjolnir \
-            -C "$GITHUB_WORKSPACE" README.md
+            -C "$GITHUB_WORKSPACE" README.md LICENSE
 
       - name: Package (Windows)
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force dist | Out-Null
-          Compress-Archive -Path "target/${{ matrix.target }}/release/mjolnir.exe", README.md `
+          Compress-Archive -Path "target/${{ matrix.target }}/release/mjolnir.exe", README.md, LICENSE `
             -DestinationPath "dist/mjolnir-${{ matrix.target }}.zip"
 
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
@@ -98,26 +111,9 @@ jobs:
           path: dist/*
           if-no-files-found: error
 
-  # Tests only: no macOS build is released. The runner is Apple silicon, so
-  # this is also where the ARMv8 AES backend runs, on APFS.
-  macos:
-    name: aarch64-apple-darwin (tests)
-    runs-on: macos-latest
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-
-      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master, 2026-09-12
-        with:
-          toolchain: 1.98.1
-
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
-
-      - name: Test
-        run: cargo test --locked
-
   release:
     name: Release
-    needs: [build, macos]
+    needs: build
     # Only a pushed tag publishes. A manual run started on a tag has the same
     # ref, and the README promises that manual runs publish nothing.
     if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
