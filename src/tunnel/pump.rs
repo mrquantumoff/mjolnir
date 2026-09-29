@@ -908,4 +908,76 @@ mod tests {
         assert_eq!(slow.await.unwrap(), up.len());
         side_b.await.unwrap().unwrap();
     }
+
+    /// One frame as the peer's writer seals it.
+    fn sealed(crypto: &StreamCrypto, k: u64, seq: u64, plaintext: &[u8]) -> Vec<u8> {
+        let header = FrameHeader {
+            seq,
+            kind: FrameKind::Data,
+            ct_len: (plaintext.len() + TAG_LEN) as u32,
+        }
+        .encode();
+        let mut buf = [&header[..], plaintext, &[0u8; TAG_LEN]].concat();
+        crypto.send[0]
+            .seal(
+                k,
+                &frame_aad(&crypto.session_id, &header),
+                &mut buf[FRAME_HEADER_LEN..],
+            )
+            .unwrap();
+        buf
+    }
+
+    /// A pump whose peer sends 1 MiB and then drops its connection, so the
+    /// pump aborts right after writing the last of it to the application.
+    /// Returns what the application's read ended with.
+    async fn abort_after_a_download() -> Result<std::io::Error, String> {
+        let keys = SessionKeys::derive(&[1u8; 32], &[2u8; 32]);
+        let (mut app, local) = {
+            let (a, b) = socket_pairs(1).await;
+            (a.into_iter().next().unwrap(), b.into_iter().next().unwrap())
+        };
+        let (ours, mut theirs) = socket_pairs(1).await;
+        let guard = ResetGuard::new(&local);
+        let crypto = StreamCrypto::new(&keys, Cipher::Aes256Gcm, 1, 1, true);
+        let pumping = tokio::spawn(pump_tcp(local, guard, ours, crypto, budget()));
+        let peer = StreamCrypto::new(&keys, Cipher::Aes256Gcm, 1, 1, false);
+        let sending = tokio::spawn(async move {
+            for k in 0..16 {
+                let frame = sealed(&peer, k, k, &vec![k as u8; FRAME_MAX]);
+                theirs[0].write_all(&frame).await.unwrap();
+            }
+        });
+        let mut got = Vec::new();
+        let read = timeout(Duration::from_secs(10), app.read_to_end(&mut got)).await;
+        sending.await.unwrap();
+        let ended = match read {
+            Err(_) => Err(format!("no reset after {} bytes", got.len())),
+            Ok(Ok(n)) => Err(format!("a clean end after {n} bytes")),
+            Ok(Err(e)) => Ok(e),
+        };
+        assert!(pumping.await.unwrap().is_err());
+        ended
+    }
+
+    /// Streams that abort right after writing to their application, while
+    /// its kernel may still owe an ACK for the last data, as when a target
+    /// resets mid-download. Each application must see its reset rather
+    /// than wait forever. Many run at once, since the reset is lost only
+    /// when it reaches the application's kernel before that ACK goes out.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn an_abort_right_after_data_still_resets_the_local_connection() {
+        for round in 0..4 {
+            let streams: Vec<_> = (0..32)
+                .map(|_| tokio::spawn(abort_after_a_download()))
+                .collect();
+            for (i, s) in streams.into_iter().enumerate() {
+                let err = s
+                    .await
+                    .unwrap()
+                    .unwrap_or_else(|why| panic!("round {round}, stream {i}: {why}"));
+                assert_eq!(err.kind(), std::io::ErrorKind::ConnectionReset);
+            }
+        }
+    }
 }
