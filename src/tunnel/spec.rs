@@ -8,6 +8,7 @@ use std::str::FromStr;
 
 use anyhow::{Context, Result, anyhow, bail, ensure};
 
+use super::server::MAX_HOST_LEN;
 use crate::keys::{AuthorizedKey, PublicKey};
 
 /// A host name or address and a port. IPv6 addresses print in brackets.
@@ -34,6 +35,10 @@ impl FromStr for HostPort {
         let [host, port] =
             <[String; 2]>::try_from(parts).map_err(|_| anyhow!("{s:?} is not HOST:PORT"))?;
         ensure!(!host.is_empty(), "{s:?} has an empty host");
+        ensure!(
+            host.len() <= MAX_HOST_LEN,
+            "the host in {s:?} is over {MAX_HOST_LEN} bytes"
+        );
         Ok(HostPort {
             host,
             port: parse_port(&port)?,

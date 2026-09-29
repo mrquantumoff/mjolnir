@@ -25,6 +25,7 @@ use super::{
 };
 use crate::crypto::{self, Cipher, NOISE_MSG1_MAX, SessionKeys};
 use crate::keys::{PrivateKey, PublicKey};
+use crate::printable::{escape, truncate};
 use crate::wire::ConnKind;
 
 pub struct ServerConfig {
@@ -42,6 +43,14 @@ const MAX_PENDING: usize = 256;
 const MAX_STREAMS: usize = 256;
 /// `-R` listeners one session may hold.
 const MAX_LISTENERS: usize = 64;
+/// Control messages queued for a client at once. A client that stops
+/// reading its control connection is not read either once this fills.
+const CTRL_QUEUE: usize = 64;
+/// How long one control message may take to write before the client
+/// counts as not reading, which ends the session.
+pub(crate) const CTRL_STALL: Duration = Duration::from_secs(10);
+/// Longest host name in `Open` and `Listen`, the DNS limit.
+pub(crate) const MAX_HOST_LEN: usize = 255;
 
 /// A bound tunnel server. [`TunnelServer::run`] serves until dropped.
 pub struct TunnelServer {
@@ -354,7 +363,7 @@ async fn control(
     let (r, w) = stream.into_split();
     let mut tx = CtrlTx::new(w, &keys, false);
     let rx = rx.with_reader(|()| BufReader::new(r));
-    let (ctrl, ctrl_rx) = mpsc::unbounded_channel();
+    let (ctrl, ctrl_rx) = mpsc::channel(CTRL_QUEUE);
     let route = proto::route(&keys);
     let session = Arc::new(Session {
         keys,
@@ -398,8 +407,9 @@ struct Session {
     peer: PublicKey,
     permits: Permits,
     verbose: bool,
-    /// Messages for the control writer task.
-    ctrl: mpsc::UnboundedSender<TunnelMsg>,
+    /// Messages for the control writer task. Bounded: senders wait when
+    /// the client does not read, so nothing piles up on its behalf.
+    ctrl: mpsc::Sender<TunnelMsg>,
     slots: Mutex<Slots>,
     /// Signalled whenever a stream registers.
     registered: Notify,
@@ -436,7 +446,7 @@ impl Session {
         self: &Arc<Self>,
         mut tx: CtrlTx<OwnedWriteHalf>,
         mut rx: CtrlRx<BufReader<OwnedReadHalf>>,
-        mut ctrl_rx: mpsc::UnboundedReceiver<TunnelMsg>,
+        mut ctrl_rx: mpsc::Receiver<TunnelMsg>,
         mut stop: watch::Receiver<bool>,
     ) -> Result<()> {
         let mut tasks = JoinSet::new();
@@ -445,7 +455,9 @@ impl Session {
         let mut writer = tokio::spawn(async move {
             while let Some(msg) = ctrl_rx.recv().await {
                 let last = matches!(msg, TunnelMsg::Error { .. });
-                tx.send(&msg).await?;
+                timeout(CTRL_STALL, tx.send(&msg))
+                    .await
+                    .map_err(|_| anyhow!("the client stopped reading its control connection"))??;
                 if last {
                     break;
                 }
@@ -478,7 +490,8 @@ impl Session {
                         None => break Err(anyhow!("control reader stopped")),
                     };
                     if let Err(e) = self.handle(msg, &mut tasks, &mut listeners).await {
-                        let _ = self.ctrl.send(TunnelMsg::Error { message: format!("{e:#}") });
+                        let error = TunnelMsg::Error { message: format!("{e:#}") };
+                        let _ = timeout(Duration::from_secs(1), self.ctrl.send(error)).await;
                         let _ = timeout(Duration::from_secs(1), &mut writer).await;
                         break Err(e);
                     }
@@ -513,7 +526,7 @@ impl Session {
                 port,
                 conns,
             } => {
-                let target = HostPort { host, port };
+                let target = host_port(host, port)?;
                 let allowed = self.may_start(conns).and_then(|()| {
                     if self.permits.may_open(&target) {
                         Ok(())
@@ -532,15 +545,21 @@ impl Session {
                     slots.highest_client = stream;
                     allowed.map(|()| self.register(&mut slots, stream, conns))
                 };
+                // Connections that arrived first learn either way: a slot
+                // to join, or a watermark past their stream.
+                self.registered.notify_waiters();
                 let (guard, ready) = match registered {
                     Ok(registered) => registered,
                     Err(why) => {
-                        eprintln!("mjolnir: stream {stream} from {}: {why}", self.peer);
-                        self.close(stream, why);
+                        eprintln!(
+                            "mjolnir: stream {stream} from {}: {}",
+                            self.peer,
+                            shown(&why)
+                        );
+                        self.close(stream, why).await;
                         return Ok(());
                     }
                 };
-                self.registered.notify_waiters();
                 let session = self.clone();
                 tasks.spawn(async move {
                     session
@@ -554,7 +573,7 @@ impl Session {
                 port,
                 conns,
             } => {
-                let bind = HostPort { host, port };
+                let bind = host_port(host, port)?;
                 let checked = if listeners.contains(&id) {
                     Err(format!("listener {id} already exists"))
                 } else if listeners.len() >= MAX_LISTENERS {
@@ -575,30 +594,42 @@ impl Session {
                         let addr = listener.local_addr()?;
                         eprintln!("mjolnir: {} listens on {addr}", self.peer);
                         listeners.insert(id);
-                        let _ = self.ctrl.send(TunnelMsg::Listening {
+                        self.send(TunnelMsg::Listening {
                             id,
                             addr: addr.to_string(),
-                        });
+                        })
+                        .await;
                         let session = self.clone();
                         tasks.spawn(async move { session.listen(id, listener, conns).await });
                     }
                     Err(message) => {
-                        eprintln!("mjolnir: listener from {}: {message}", self.peer);
-                        let _ = self.ctrl.send(TunnelMsg::ListenFailed { id, message });
+                        eprintln!("mjolnir: listener from {}: {}", self.peer, shown(&message));
+                        self.send(TunnelMsg::ListenFailed { id, message }).await;
                     }
                 }
             }
             TunnelMsg::Close { stream, message } => {
                 if self.verbose {
-                    eprintln!("mjolnir: stream {stream}: the client gave up: {message}");
+                    eprintln!(
+                        "mjolnir: stream {stream}: the client gave up: {}",
+                        shown(&message)
+                    );
                 }
                 // Dropping the slot tells the stream's task to stop.
                 self.slots.lock().unwrap().map.remove(&stream);
             }
-            TunnelMsg::Error { message } => bail!("the client reported an error: {message}"),
+            TunnelMsg::Error { message } => {
+                bail!("the client reported an error: {}", shown(&message))
+            }
             other => bail!("protocol error: unexpected {other:?}"),
         }
         Ok(())
+    }
+
+    /// Queues a control message, waiting for room; a session that has
+    /// ended drops it.
+    async fn send(&self, msg: TunnelMsg) {
+        let _ = self.ctrl.send(msg).await;
     }
 
     fn may_start(&self, conns: u32) -> Result<(), String> {
@@ -613,8 +644,8 @@ impl Session {
         Ok(())
     }
 
-    fn close(&self, stream: u32, message: String) {
-        let _ = self.ctrl.send(TunnelMsg::Close { stream, message });
+    async fn close(&self, stream: u32, message: String) {
+        self.send(TunnelMsg::Close { stream, message }).await;
     }
 
     /// Makes a slot for `stream`'s connections. The caller then wakes any
@@ -694,7 +725,7 @@ impl Session {
                 self.slots.lock().unwrap().map.remove(&stream);
                 let why = format!("its {} did not arrive", connections(conns));
                 eprintln!("mjolnir: stream {stream} ({what}): {why}");
-                self.close(stream, why);
+                self.close(stream, why).await;
                 return;
             }
         };
@@ -738,7 +769,7 @@ impl Session {
                 self.slots.lock().unwrap().map.remove(&stream);
                 let why = format!("{e:#}");
                 eprintln!("mjolnir: stream {stream} ({what}): {why}");
-                self.close(stream, why);
+                self.close(stream, why).await;
                 return;
             }
         };
@@ -764,16 +795,19 @@ impl Session {
                         continue;
                     }
                     prepare(&socket);
-                    let n = self.next_server_stream.fetch_add(1, Relaxed);
-                    let stream = SERVER_STREAM | (n & !SERVER_STREAM);
+                    let Some(stream) = next_server_stream(&self.next_server_stream) else {
+                        eprintln!("mjolnir: listener {id}: dropping {from}: this session has used every stream id; reconnect to start a new session");
+                        continue;
+                    };
                     // Server streams are made before the client hears of
                     // them, so no connection ever waits for one.
                     let (guard, ready) = self.register(&mut self.slots.lock().unwrap(), stream, conns);
-                    let _ = self.ctrl.send(TunnelMsg::Incoming {
+                    self.send(TunnelMsg::Incoming {
                         listener: id,
                         stream,
                         from: from.to_string(),
-                    });
+                    })
+                    .await;
                     let session = self.clone();
                     let what = format!("{from} -> {}", self.peer);
                     streams.spawn(async move {
@@ -787,10 +821,48 @@ impl Session {
     }
 }
 
+/// The next `-R` stream id: the top bit set, then a counter. Once the
+/// counter runs out the session must end, since an id used again would
+/// reuse its keys and nonces.
+fn next_server_stream(counter: &AtomicU32) -> Option<u32> {
+    counter
+        .fetch_update(Relaxed, Relaxed, |n| (n < SERVER_STREAM).then_some(n + 1))
+        .ok()
+        .map(|n| SERVER_STREAM | n)
+}
+
+/// A host and port from the client, with the host held to the DNS limit;
+/// over it is a protocol error rather than something to echo back.
+fn host_port(host: String, port: u16) -> Result<HostPort> {
+    ensure!(
+        host.len() <= MAX_HOST_LEN,
+        "protocol error: a host name of {} bytes is over the {MAX_HOST_LEN}-byte limit",
+        host.len()
+    );
+    Ok(HostPort { host, port })
+}
+
+/// Peer-supplied text as it may be logged: escaped and cut short.
+fn shown(text: &str) -> String {
+    escape(&truncate(text, 300)).into_owned()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use tokio::time::timeout;
+
+    #[test]
+    fn server_stream_ids_stop_before_they_could_repeat() {
+        let counter = AtomicU32::new(SERVER_STREAM - 2);
+        assert_eq!(next_server_stream(&counter), Some(u32::MAX - 1));
+        assert_eq!(next_server_stream(&counter), Some(u32::MAX));
+        assert_eq!(next_server_stream(&counter), None);
+        assert_eq!(next_server_stream(&counter), None);
+        let fresh = AtomicU32::new(0);
+        assert_eq!(next_server_stream(&fresh), Some(SERVER_STREAM));
+        assert_eq!(next_server_stream(&fresh), Some(SERVER_STREAM | 1));
+    }
 
     fn told(evicted: &Notify) -> bool {
         let rt = tokio::runtime::Builder::new_current_thread()

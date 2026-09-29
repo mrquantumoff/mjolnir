@@ -4,11 +4,12 @@
 use std::net::SocketAddr;
 use std::time::{Duration, Instant};
 
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
+use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::time::{sleep, timeout};
 
-use super::proto::{self, PROLOGUE};
+use super::proto::{self, CHALLENGE_LEN, CtrlRx, CtrlTx, PROLOGUE, TunnelMsg};
 use super::{ClientConfig, Permits, Policy, ServerConfig, TunnelClient, TunnelServer};
 use crate::crypto::{Cipher, Initiator, NOISE_MSG_MAX, SessionKeys};
 use crate::keys::{AuthorizedKey, PrivateKey, PublicKey};
@@ -17,6 +18,11 @@ use crate::wire::ConnKind;
 const LIMIT: Duration = Duration::from_secs(30);
 /// The server's pool of connections in their handshake.
 const MAX_PENDING: usize = 256;
+/// How long the server lets one control write stall before it gives up
+/// on the client.
+const CTRL_STALL: Duration = Duration::from_secs(10);
+/// The longest host name the server takes in a request.
+const MAX_HOST_LEN: usize = 255;
 
 struct Srv {
     addr: SocketAddr,
@@ -78,6 +84,58 @@ async fn raw_handshake(s: &Srv) -> (TcpStream, SessionKeys) {
     proto::write_noise(&mut t, &m1).await.unwrap();
     let m2 = proto::read_noise(&mut t, NOISE_MSG_MAX).await.unwrap();
     (t, hs.finish(&m2).unwrap())
+}
+
+type Tx = CtrlTx<OwnedWriteHalf>;
+type Rx = CtrlRx<BufReader<OwnedReadHalf>>;
+
+/// A hand-driven, fully authenticated client session.
+async fn raw_session(s: &Srv) -> (Tx, Rx, SessionKeys) {
+    let (t, keys) = raw_handshake(s).await;
+    let (r, w) = t.into_split();
+    let (mut tx, mut rx) = proto::control(BufReader::new(r), w, &keys, true);
+    tx.send(&TunnelMsg::Hello {
+        cipher: Cipher::Aes256Gcm,
+    })
+    .await
+    .unwrap();
+    match rx.recv().await.unwrap() {
+        Some(TunnelMsg::Welcome { .. }) => {}
+        other => panic!("{other:?}"),
+    }
+    (tx, rx, keys)
+}
+
+/// Opens a stream connection and sends its (valid) hello.
+async fn raw_stream_conn(
+    addr: SocketAddr,
+    keys: &SessionKeys,
+    stream: u32,
+    conn: u32,
+) -> TcpStream {
+    let mut t = TcpStream::connect(addr).await.unwrap();
+    t.write_all(&ConnKind::TunnelData.preamble()).await.unwrap();
+    let mut ch = [0u8; CHALLENGE_LEN];
+    t.read_exact(&mut ch).await.unwrap();
+    t.write_all(&proto::encode_hello(
+        keys,
+        &proto::route(keys),
+        &ch,
+        stream,
+        conn,
+    ))
+    .await
+    .unwrap();
+    t
+}
+
+fn open(stream: u32, host: &str) -> TunnelMsg {
+    TunnelMsg::Open {
+        stream,
+        host: host.into(),
+        port: 1,
+        conns: 1,
+    }
 }
 
 async fn echo_server() -> SocketAddr {
@@ -187,5 +245,88 @@ async fn a_replayed_message_1_gets_no_buffer_past_hello() {
     assert!(
         closed < Duration::from_secs(3),
         "the server waited {closed:?} for a body it should never read"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_refused_open_wakes_connections_that_arrived_first() {
+    let srv = start_server(&[], &[]).await;
+    let (mut tx, mut rx, keys) = raw_session(&srv).await;
+    let early = raw_stream_conn(srv.addr, &keys, 1, 0).await;
+    sleep(Duration::from_millis(200)).await;
+    let t0 = Instant::now();
+    tx.send(&open(1, "not-permitted")).await.unwrap();
+    assert!(matches!(
+        rx.recv().await.unwrap(),
+        Some(TunnelMsg::Close { stream: 1, .. })
+    ));
+    let closed = timeout(LIMIT, until_closed(early, t0)).await.unwrap();
+    assert!(
+        closed < Duration::from_secs(3),
+        "the early connection waited {closed:?} for a stream that was refused at once"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_host_over_the_dns_limit_is_a_protocol_error() {
+    let srv = start_server(&["*"], &[]).await;
+    let (mut tx, mut rx, _keys) = raw_session(&srv).await;
+    tx.send(&open(1, &"a".repeat(MAX_HOST_LEN + 1)))
+        .await
+        .unwrap();
+    match timeout(LIMIT, rx.recv()).await.unwrap() {
+        Ok(Some(TunnelMsg::Error { message })) => assert!(message.contains("host"), "{message}"),
+        Ok(None) | Err(_) => {}
+        other => panic!("expected the session to end, got {other:?}"),
+    }
+    assert!(
+        timeout(LIMIT, rx.recv())
+            .await
+            .unwrap()
+            .ok()
+            .flatten()
+            .is_none()
+    );
+}
+
+/// A client that sends requests but never reads the replies: the server
+/// must stop reading it and, after a while, drop it, rather than queue
+/// replies without bound.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_client_that_stops_reading_is_disconnected() {
+    let srv = start_server(&[], &[]).await;
+    let (t, keys) = raw_handshake(&srv).await;
+    // Small socket buffers so the stall shows after a few hundred replies
+    // instead of a few thousand.
+    let sock = socket2::SockRef::from(&t);
+    sock.set_recv_buffer_size(4096).unwrap();
+    sock.set_send_buffer_size(4096).unwrap();
+    let (r, w) = t.into_split();
+    let (mut tx, mut rx) = proto::control(BufReader::new(r), w, &keys, true);
+    tx.send(&TunnelMsg::Hello {
+        cipher: Cipher::Aes256Gcm,
+    })
+    .await
+    .unwrap();
+    assert!(matches!(
+        rx.recv().await.unwrap(),
+        Some(TunnelMsg::Welcome { .. })
+    ));
+    let host = "h".repeat(MAX_HOST_LEN);
+    let t0 = Instant::now();
+    let mut sent = 0u32;
+    let outcome = timeout(CTRL_STALL * 3, async {
+        loop {
+            sent += 1;
+            if tx.send(&open(sent, &host)).await.is_err() {
+                return t0.elapsed();
+            }
+        }
+    })
+    .await;
+    let cut_off = outcome.expect("the server never stopped taking requests it could not answer");
+    assert!(
+        cut_off < CTRL_STALL * 2,
+        "cut off only after {cut_off:?} and {sent} requests"
     );
 }
