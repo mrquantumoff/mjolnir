@@ -492,11 +492,11 @@ R -> S : 0x01 admitted, or 0x00 rejected (then close)
 The receiver admits a connection only if the MAC is valid, `round` is the
 current round, `(round, conn)` has not been admitted before, fewer than 256
 connections have been admitted in this round, and fewer than 256 admitted
-connections are open. Each admitted connection holds a thread and a
-256 KiB read buffer until it closes, so those two caps bound what an
-authorized sender can make the receiver hold; `send --connections` stops
-at the same 256. The fresh challenge stops a captured hello from being
-replayed.
+connections are open. Each admitted connection holds a thread and a read
+buffer of at most 256 KiB (16 KiB for chunks of 256 KiB and up) until it
+closes, so those two caps bound what an authorized sender can make the
+receiver hold; `send --connections` stops at the same 256. The fresh
+challenge stops a captured hello from being replayed.
 
 `RoundStart` and the round's data connections travel on different TCP
 connections, so a data connection can reach the receiver before the
@@ -650,8 +650,11 @@ the write path. So before finishing, the receiver checks its own disk.
 - When every chunk is present, the receiver syncs the part and sums files.
   It then reads every chunk back from the part file, using a pool of up to
   16 threads, recomputes each digest, and compares it with the stored one.
-  Chunks carried over from an earlier session are checked the same way;
-  that is the main point.
+  Chunks under 64 KiB are read in runs of adjacent chunks, up to 64 KiB
+  per read with the run's digests in one more read, and each chunk is
+  still hashed, compared, and repaired on its own. Chunks carried over
+  from an earlier session are checked the same way; that is the main
+  point.
 - A mismatch clears that chunk's `present` and `claimed` bits. The receiver
   then sends `Have` instead of `Finished`, and the next round resends only
   the bad chunks, never the whole file. These count in `repaired_chunks`.

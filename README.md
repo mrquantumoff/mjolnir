@@ -239,27 +239,28 @@ not receive into a directory that other users can write to.
 
 Full tables and method: [docs/BENCHMARKS.md](docs/BENCHMARKS.md). Loopback on
 one machine (Ryzen 9 9950X, Samsung 970 EVO Plus), 2 GiB of random data,
-medians of 3 runs, commit 4daa636. Every disk-writing output matched the
+medians of 3 runs, commit 9df9b84. Every disk-writing output matched the
 source's SHA-256; the discard rows write nothing to check.
 
 | Setup | Windows | Linux (WSL2, ext4) |
 |---|---|---|
-| Raw disk write + fsync, 1 writer | 868 MiB/s | 1311 MiB/s |
-| 1 connection, 1 MiB chunks | 823 MiB/s | 844 MiB/s |
-| 8 connections, 1 MiB chunks | 786 MiB/s | 744 MiB/s |
-| 8 connections, 16 files of 128 MiB | 1059 MiB/s | 1090 MiB/s |
-| 8 connections, receiver discards data (no disk) | 3553 MiB/s | 3713 MiB/s |
-| No disk, 2 connections, 16 workers (transfer phase) | 2218 MiB/s | 5583 MiB/s |
+| Raw disk write + fsync, 1 writer | 1459 MiB/s | 1711 MiB/s |
+| 1 connection, 1 MiB chunks | 846 MiB/s | 911 MiB/s |
+| 8 connections, 1 MiB chunks | 859 MiB/s | 886 MiB/s |
+| 8 connections, 16 files of 128 MiB | 958 MiB/s | 966 MiB/s |
+| 8 connections, 4 KiB chunks | 242 MiB/s | 191 MiB/s |
+| 8 connections, receiver discards data (no disk) | 4240 MiB/s | 3868 MiB/s |
+| No disk, 2 connections, 16 workers (transfer phase) | 4159 MiB/s | 5019 MiB/s |
 
 Crypto scales with `--threads` until the connections' network threads are
-the limit, at about 1.4 GiB/s per connection with 1 worker and up to 3.5
-GiB/s with 16. With a disk in the loop, the drive is the limit: both OSes
-write one file at 750-850 MiB/s from 1 to 16 connections with the receiver
-on 1.3-1.7 cores, and a directory of files goes faster because files move
-in parallel. The drive itself was in a slower state than at the previous
-run (2.0 GiB/s raw then, 0.9-1.3 now); the tables say how that was handled.
-4 KiB chunks cost 4-5x throughput. Chunk size is independent of the network
-MTU; see [Chunks, frames, and the
+the limit, at about 1.2-1.4 GiB/s per connection with 1 worker and up to
+3.3 GiB/s with 4 or more. With a disk in the loop, the drive is the limit:
+both OSes write one file at 830-950 MiB/s from 1 to 16 connections with the
+receiver on 1.2-1.7 cores, and 16 large files go faster because files move
+in parallel. 4 KiB chunks cost 3.5-4.6x throughput. Memory is bounded by
+the buffer pools: the receiver peaks at about 90 MiB with the default
+1 MiB chunks and under 1 GiB at 64 MiB. Chunk size is independent of the
+network MTU; see [Chunks, frames, and the
 MTU](docs/PROTOCOL.md#chunks-frames-and-the-mtu).
 
 Rerun with `scripts/bench.sh [WORKDIR]` (`SIZE_MIB`, `REPEAT`, `PORT`,
