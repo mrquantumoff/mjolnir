@@ -3,7 +3,8 @@
 //! Noise IK. The protocol is specified in `docs/PROTOCOL.md`.
 //!
 //! [`send`] and [`Receiver::run`] block until the transfer ends; run them on
-//! a thread and watch the shared [`Progress`].
+//! a thread and watch the shared [`Progress`]. [`tunnel`] forwards TCP ports
+//! over the same authenticated sessions and runs on tokio.
 
 mod benchmode;
 pub mod bitset;
@@ -21,12 +22,14 @@ pub mod progress;
 pub mod recv;
 mod schedule;
 pub mod send;
+pub mod tunnel;
 pub mod web;
 pub mod wire;
 
 pub use crypto::Cipher;
 pub use keys::{
-    PrivateKey, PublicKey, default_key_path, load_authorized_keys, parse_authorized_keys,
+    AuthorizedKey, PrivateKey, PublicKey, default_key_path, load_authorized_entries,
+    load_authorized_keys, parse_authorized_entries, parse_authorized_keys,
 };
 pub use manifest::parse_size;
 pub use progress::{Cancelled, Phase, PhaseTimes, Progress, ProgressSnapshot};

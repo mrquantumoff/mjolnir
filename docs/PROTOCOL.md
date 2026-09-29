@@ -68,6 +68,9 @@ Every TCP connection starts with the sender writing 6 bytes:
 "MJLN" (4 bytes) | version u8 = 2 | kind u8 (0 = control, 1 = data)
 ```
 
+Kinds 2 and 3 belong to tunnels, which share the preamble, handshake, and
+key schedule but run their own protocol; see [TUNNEL.md](TUNNEL.md).
+
 The first connection must be the control connection. Data connections are
 accepted only after the control handshake has finished.
 

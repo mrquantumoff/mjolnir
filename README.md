@@ -6,6 +6,10 @@ them over several TCP connections at once. The receiver decrypts each chunk
 and writes it at its offset. Both hosts authenticate with static key pairs,
 and an interrupted transfer resumes where it stopped.
 
+It also forwards TCP ports, like `ssh -L` and `ssh -R`, over the same
+authenticated sessions, and can stripe one TCP stream across several
+connections; see [Tunnels](#tunnels).
+
 ## Install
 
 Releases ship prebuilt binaries for Linux and Windows on x86_64 and
@@ -123,6 +127,41 @@ as `incoming/photos/...`.
 `mjolnir serve [--listen 127.0.0.1:7878] [--key PATH] [--no-open]` starts a
 local web UI; see [docs/WEB.md](docs/WEB.md).
 
+`mjolnir tunnel` and `mjolnir tunnel-server` forward TCP ports; see
+[Tunnels](#tunnels).
+
+## Tunnels
+
+A `tunnel-server` carries TCP connections for authorized clients. The
+server decides what each key may reach; nothing is allowed by default:
+
+```sh
+mjolnir tunnel-server --key server.key --allow <CLIENT_PUBLIC_KEY> \
+    --permit-open db.internal:5432 --permit-listen 127.0.0.1:8080
+```
+
+The client forwards ports in either direction, with the same
+`[BIND:]PORT:HOST:HOSTPORT` specs as ssh:
+
+```sh
+# localhost:15432 here reaches db.internal:5432 from the server.
+mjolnir tunnel server.example:7778 --key client.key --peer <SERVER_PUBLIC_KEY> \
+    -L 15432:db.internal:5432
+# 127.0.0.1:8080 on the server reaches localhost:3000 here.
+mjolnir tunnel server.example:7778 --key client.key --peer <SERVER_PUBLIC_KEY> \
+    -R 8080:localhost:3000
+```
+
+Every forwarded connection travels over its own connections to the server,
+so streams never stall each other. With `-n N`, each stream is striped
+across N connections and put back in order on the other side, which helps
+on high-latency links and on paths that throttle each connection. `-W
+HOST:PORT` carries one stream over stdin and stdout, for use as an ssh
+`ProxyCommand`. A stream that breaks resets the application's connection
+instead of ending it, so a cut-off download never looks complete.
+Permissions, per-key `permitopen` and `permitlisten` options, and the wire
+format are in [docs/TUNNEL.md](docs/TUNNEL.md).
+
 ## How it works
 
 The sender opens a control connection and runs a Noise IK handshake. The
@@ -190,7 +229,8 @@ not receive into a directory that other users can write to.
 ## Caveats
 
 - No relay or NAT traversal. The sender must reach the receiver's port
-  directly.
+  directly. (A tunnel client must likewise reach the tunnel server, but
+  `-R` then serves connections back through it.)
 - One transfer per `recv` process. The receiver keeps listening through
   failed handshakes and failed sessions and exits after one transfer
   completes. One session at a time may receive into an output directory;
@@ -217,6 +257,9 @@ not receive into a directory that other users can write to.
 - Permissions are copied by default (on Windows only as the read-only
   attribute); times and owners only when asked for. Windows ACLs and
   extended attributes are not copied.
+- Tunnels: a stream fails if any one of its connections fails; there is no
+  retransmission above TCP. The client exits when its session ends and
+  does not reconnect on its own.
 - Private key files are stored unencrypted, protected only by file
   permissions.
 - A source that changes during a transfer is caught only by its size or
