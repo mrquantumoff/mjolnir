@@ -1524,6 +1524,19 @@ impl Drop for ReaderGuard<'_> {
     }
 }
 
+/// The reader's buffer size. Small frames need a large buffer, so one
+/// socket read brings in many of them. A body longer than the buffer is
+/// read straight into its pooled buffer, except the part the header's
+/// refill already brought in, which is copied once more. Large frames
+/// therefore get a small buffer, so at most 16 KiB of each is copied.
+fn read_buffer_len(chunk_size: ChunkSize) -> usize {
+    if chunk_size.get() >= 256 << 10 {
+        16 << 10
+    } else {
+        256 << 10
+    }
+}
+
 /// The connection's reader: does I/O only. It checks each header, reads
 /// the body into a pooled buffer, numbers the frame, and hands it to the
 /// pool, which opens and lands it.
@@ -1535,7 +1548,8 @@ fn receive_frames(
     stop: &dyn Fn() -> bool,
 ) -> Result<()> {
     let sid = &session.keys.session_id;
-    let mut reader = BufReader::with_capacity(256 << 10, io);
+    let capacity = read_buffer_len(session.manifest.chunk_size);
+    let mut reader = BufReader::with_capacity(capacity, io);
     for k in 0u64.. {
         let mut header = [0u8; HEADER_LEN];
         reader
