@@ -18,17 +18,19 @@ use tokio::time::timeout;
 const LIMIT: Duration = Duration::from_secs(30);
 
 /// A target that echoes each connection's bytes back as they arrive and
-/// half-closes when its input ends.
+/// half-closes when its input ends. Errors are ignored: a test that ends
+/// by dropping the client resets the forwarded connections by design, and
+/// the echo must not panic when that reset reaches it.
 async fn echo_server() -> SocketAddr {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move {
-        loop {
-            let (mut s, _) = listener.accept().await.unwrap();
+        while let Ok((mut s, _)) = listener.accept().await {
             tokio::spawn(async move {
                 let (mut r, mut w) = s.split();
-                tokio::io::copy(&mut r, &mut w).await.unwrap();
-                w.shutdown().await.unwrap();
+                if tokio::io::copy(&mut r, &mut w).await.is_ok() {
+                    let _ = w.shutdown().await;
+                }
             });
         }
     });

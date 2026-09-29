@@ -442,8 +442,10 @@ impl Reorder {
 
     /// Adds a frame from connection `conn`, waiting while the buffer or the
     /// process budget is full unless this is the frame the writer needs
-    /// next. The connection's watermark moves before any wait, so a wait
-    /// here can never hide that the frame the writer needs is gone.
+    /// next. The connection's watermark moves only once the frame is
+    /// stored, so while a frame waits for room it still counts as able to
+    /// deliver the seq the writer needs, and a healthy stream is never
+    /// mistaken for a gap.
     pub(crate) async fn push(&self, conn: usize, seq: u64, frame: Frame) -> Result<()> {
         let cost = frame.cost();
         let units = frame.units();
@@ -468,9 +470,7 @@ impl Reorder {
                 );
                 s.fin = Some(seq);
             }
-            s.conns[conn].last = Some(seq);
         }
-        self.changed.notify_waiters();
         let mut frame = Some(frame);
         loop {
             let changed = self.changed.notified();
@@ -479,7 +479,7 @@ impl Reorder {
             let fits = {
                 let mut s = self.state.lock().unwrap();
                 if seq == s.next {
-                    self.store(&mut s, seq, frame.take().unwrap(), cost, None);
+                    self.store(&mut s, conn, seq, frame.take().unwrap(), cost, None);
                     return Ok(());
                 }
                 s.held + cost <= self.limit
@@ -492,7 +492,7 @@ impl Reorder {
                         // Room may have gone while waiting; the next frame
                         // is still always taken.
                         if seq == s.next || s.held + cost <= self.limit {
-                            self.store(&mut s, seq, frame.take().unwrap(), cost, Some(permit));
+                            self.store(&mut s, conn, seq, frame.take().unwrap(), cost, Some(permit));
                             return Ok(());
                         }
                     }
@@ -507,12 +507,14 @@ impl Reorder {
     fn store(
         &self,
         s: &mut std::sync::MutexGuard<'_, ReorderState>,
+        conn: usize,
         seq: u64,
         frame: Frame,
         cost: usize,
         budget: Option<OwnedSemaphorePermit>,
     ) {
         s.held += cost;
+        s.conns[conn].last = Some(seq);
         s.pending.insert(
             seq,
             Held {
@@ -664,6 +666,50 @@ mod tests {
             assert_eq!(r.pop().await.unwrap(), data(seq));
         }
         waiting.await.unwrap().unwrap();
+    }
+
+    /// Many frames striped over several connections through a buffer far
+    /// too small to hold them, pushed concurrently while one task drains:
+    /// every frame must arrive in order and the stream must never be
+    /// mistaken for aborted while a needed frame waits for room. This is
+    /// the race behind a false "peer aborted the stream".
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_needed_frame_waiting_for_room_is_not_mistaken_for_a_gap() {
+        for _ in 0..20 {
+            const K: usize = 4;
+            const N: u64 = 4000;
+            // Room for only a couple of frames, so most pushes wait.
+            let r = Arc::new(reorder(K, 8192));
+            let mut pushers = Vec::new();
+            for c in 0..K {
+                let r = r.clone();
+                pushers.push(tokio::spawn(async move {
+                    let mut seq = c as u64;
+                    while seq < N {
+                        r.push(c, seq, data(seq as u8)).await.unwrap();
+                        seq += K as u64;
+                    }
+                }));
+            }
+            let popper = tokio::spawn({
+                let r = r.clone();
+                async move {
+                    for seq in 0..N {
+                        match r.pop().await.unwrap() {
+                            Frame::Data(b) => assert_eq!(b, vec![seq as u8; 10]),
+                            Frame::Fin => panic!("no fin was sent"),
+                        }
+                    }
+                }
+            });
+            for p in pushers {
+                p.await.unwrap();
+            }
+            timeout(Duration::from_secs(10), popper)
+                .await
+                .expect("the stream must not stall or abort")
+                .unwrap();
+        }
     }
 
     #[tokio::test]
