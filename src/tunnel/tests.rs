@@ -32,12 +32,29 @@ struct Srv {
 }
 
 async fn start_server(open: &[&str], listen: &[&str]) -> Srv {
-    let client = PrivateKey::generate();
-    let policy = Policy::new(
-        &[AuthorizedKey {
-            key: client.public_key(),
+    let (srv, mut keys) = start_server_with_keys(1, open, listen).await;
+    Srv {
+        client: keys.remove(0),
+        ..srv
+    }
+}
+
+/// A server that authorizes `n` fresh keys; `Srv::client` is the first.
+async fn start_server_with_keys(
+    n: usize,
+    open: &[&str],
+    listen: &[&str],
+) -> (Srv, Vec<PrivateKey>) {
+    let keys: Vec<PrivateKey> = (0..n).map(|_| PrivateKey::generate()).collect();
+    let entries: Vec<AuthorizedKey> = keys
+        .iter()
+        .map(|k| AuthorizedKey {
+            key: k.public_key(),
             options: vec![],
-        }],
+        })
+        .collect();
+    let policy = Policy::new(
+        &entries,
         Permits {
             open: open.iter().map(|p| p.parse().unwrap()).collect(),
             listen: listen.iter().map(|p| p.parse().unwrap()).collect(),
@@ -54,11 +71,12 @@ async fn start_server(open: &[&str], listen: &[&str]) -> Srv {
     .unwrap();
     let (addr, pubkey) = (server.local_addr(), server.public_key());
     tokio::spawn(server.run());
-    Srv {
+    let srv = Srv {
         addr,
         pubkey,
-        client,
-    }
+        client: keys[0].clone(),
+    };
+    (srv, keys)
 }
 
 fn cfg(s: &Srv, conns: u32, local: &[String]) -> ClientConfig {
@@ -311,6 +329,81 @@ async fn a_host_over_the_dns_limit_is_a_protocol_error() {
             .flatten()
             .is_none()
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn sessions_per_key_are_limited() {
+    let srv = start_server(&[], &[]).await;
+    let mut held = Vec::new();
+    for _ in 0..8 {
+        held.push(TunnelClient::connect(cfg(&srv, 1, &[])).await.unwrap());
+    }
+    let err = match TunnelClient::connect(cfg(&srv, 1, &[])).await {
+        Ok(_) => panic!("a ninth session for one key was accepted"),
+        Err(e) => e,
+    };
+    assert!(format!("{err:#}").contains("as many sessions"), "{err:#}");
+    // A session's place is freed once it and its streams are gone.
+    drop(held.pop());
+    sleep(Duration::from_millis(300)).await;
+    TunnelClient::connect(cfg(&srv, 1, &[]))
+        .await
+        .expect("the freed place is taken again");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn sessions_in_total_are_limited() {
+    let (srv, keys) = start_server_with_keys(33, &[], &[]).await;
+    let mut held = Vec::new();
+    let mut refused = None;
+    'outer: for key in &keys {
+        for _ in 0..8 {
+            let mut c = cfg(&srv, 1, &[]);
+            c.key = key.clone();
+            match TunnelClient::connect(c).await {
+                Ok(client) => held.push(client),
+                Err(e) => {
+                    refused = Some(e);
+                    break 'outer;
+                }
+            }
+        }
+    }
+    let err = refused.expect("264 sessions over 33 keys must not all be accepted");
+    assert_eq!(held.len(), 256, "{err:#}");
+    assert!(format!("{err:#}").contains("as many sessions"), "{err:#}");
+}
+
+/// A session's streams share one connection budget: with 32 connections
+/// per stream, the seventeenth stream is refused at once.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn connections_per_session_are_budgeted() {
+    let echo = echo_server().await;
+    let srv = start_server(&["127.0.0.1:*"], &[]).await;
+    let (mut tx, mut rx, _keys) = raw_session(&srv).await;
+    for stream in 1..=17 {
+        tx.send(&TunnelMsg::Open {
+            stream,
+            host: "127.0.0.1".into(),
+            port: echo.port(),
+            conns: 32,
+        })
+        .await
+        .unwrap();
+    }
+    match timeout(Duration::from_secs(5), rx.recv())
+        .await
+        .unwrap()
+        .unwrap()
+    {
+        Some(TunnelMsg::Close {
+            stream: 17,
+            message,
+        }) => {
+            assert!(message.contains("512"), "{message}");
+        }
+        other => panic!("expected the seventeenth stream refused, got {other:?}"),
+    }
 }
 
 /// A stream keeps running after its control connection closed cleanly:

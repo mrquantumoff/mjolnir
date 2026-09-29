@@ -12,7 +12,7 @@ use anyhow::{Context, Result, anyhow, bail, ensure};
 use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{Notify, mpsc, oneshot, watch};
+use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore, mpsc, oneshot, watch};
 use tokio::task::JoinSet;
 use tokio::time::{Instant, timeout, timeout_at};
 
@@ -39,8 +39,16 @@ pub struct ServerConfig {
 
 /// Connections in their handshake at once. One more evicts one of them.
 const MAX_PENDING: usize = 256;
+/// Sessions the server holds at once, counting ones whose control
+/// connection has closed while their streams finish.
+const MAX_SESSIONS: usize = 256;
+/// Sessions one client key may hold at once.
+const MAX_SESSIONS_PER_KEY: usize = 8;
 /// Streams one session may have at once, counting ones still starting.
 const MAX_STREAMS: usize = 256;
+/// Stream connections one session may have at once, over all its streams:
+/// what bounds a session's sockets and buffers when streams are striped.
+const MAX_SESSION_CONNS: usize = 512;
 /// `-R` listeners one session may hold.
 const MAX_LISTENERS: usize = 64;
 /// Control messages queued for a client at once. A client that stops
@@ -67,8 +75,54 @@ struct Shared {
     pending: Mutex<Pending>,
     /// Out-of-order stream bytes held across every session.
     budget: Budget,
+    /// Places for sessions, held until a session and its streams are gone.
+    session_places: Arc<Semaphore>,
+    /// Live sessions per client key.
+    sessions_per_key: Mutex<HashMap<PublicKey, usize>>,
     /// Becomes true when the server stops.
     stop: watch::Sender<bool>,
+}
+
+/// A session's place among the server's and its key's sessions; dropping
+/// it frees both.
+struct SessionPlace {
+    _server: OwnedSemaphorePermit,
+    shared: Arc<Shared>,
+    key: PublicKey,
+}
+
+impl Drop for SessionPlace {
+    fn drop(&mut self) {
+        let mut per_key = self.shared.sessions_per_key.lock().unwrap();
+        if let Some(n) = per_key.get_mut(&self.key) {
+            *n -= 1;
+            if *n == 0 {
+                per_key.remove(&self.key);
+            }
+        }
+    }
+}
+
+impl Shared {
+    /// Takes a place for a session of `key`, or says why there is none.
+    fn place_session(self: &Arc<Self>, key: PublicKey) -> Result<SessionPlace, &'static str> {
+        let server = self
+            .session_places
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| "the server has as many sessions as it allows")?;
+        let mut per_key = self.sessions_per_key.lock().unwrap();
+        let mine = per_key.entry(key).or_insert(0);
+        if *mine >= MAX_SESSIONS_PER_KEY {
+            return Err("this key has as many sessions as the server allows");
+        }
+        *mine += 1;
+        Ok(SessionPlace {
+            _server: server,
+            shared: self.clone(),
+            key,
+        })
+    }
 }
 
 /// Connections in their handshake, oldest first. A full pool evicts a
@@ -173,6 +227,8 @@ impl TunnelServer {
                 sessions: Mutex::new(HashMap::new()),
                 pending: Mutex::new(Pending::default()),
                 budget: Budget::new(BUFFER_BUDGET),
+                session_places: Arc::new(Semaphore::new(MAX_SESSIONS)),
+                sessions_per_key: Mutex::new(HashMap::new()),
                 stop: watch::Sender::new(false),
             }),
         })
@@ -366,9 +422,20 @@ async fn control(
     let (r, w) = stream.into_split();
     let mut tx = CtrlTx::new(w, &keys, false);
     let rx = rx.with_reader(|()| BufReader::new(r));
+    let place = match shared.place_session(peer) {
+        Ok(place) => place,
+        Err(why) => {
+            tx.send(&TunnelMsg::Error {
+                message: why.into(),
+            })
+            .await?;
+            bail!("session from {from} (key {peer}) refused: {why}");
+        }
+    };
     let (ctrl, ctrl_rx) = mpsc::channel(CTRL_QUEUE);
     let route = proto::route(&keys);
     let session = Arc::new(Session {
+        _place: place,
         keys,
         cipher,
         peer,
@@ -380,6 +447,8 @@ async fn control(
         closing: watch::Sender::new(false),
         registered: Notify::new(),
         streams: AtomicUsize::new(0),
+        conns_in_use: AtomicUsize::new(0),
+        waiting: AtomicUsize::new(0),
         next_server_stream: AtomicU32::new(0),
     });
     // Registered before `Welcome` goes out, so a stream connection the
@@ -407,6 +476,8 @@ async fn control(
 }
 
 struct Session {
+    /// Held as long as the session or any of its streams lives.
+    _place: SessionPlace,
     keys: SessionKeys,
     cipher: Cipher,
     peer: PublicKey,
@@ -423,6 +494,10 @@ struct Session {
     registered: Notify,
     /// Streams starting or running.
     streams: AtomicUsize,
+    /// Stream connections those streams asked for.
+    conns_in_use: AtomicUsize,
+    /// Stream connections waiting in `attach` for their `Open`.
+    waiting: AtomicUsize,
     next_server_stream: AtomicU32,
 }
 
@@ -440,12 +515,25 @@ struct Slot {
     ready: oneshot::Sender<Vec<TcpStream>>,
 }
 
-/// Counts a stream as running until dropped.
-struct StreamGuard(Arc<Session>);
+/// Counts a stream and its connections as in use until dropped.
+struct StreamGuard {
+    session: Arc<Session>,
+    conns: usize,
+}
 
 impl Drop for StreamGuard {
     fn drop(&mut self) {
-        self.0.streams.fetch_sub(1, Relaxed);
+        self.session.streams.fetch_sub(1, Relaxed);
+        self.session.conns_in_use.fetch_sub(self.conns, Relaxed);
+    }
+}
+
+/// Counts a connection as waiting for its `Open` until dropped.
+struct Waiting<'a>(&'a Session);
+
+impl Drop for Waiting<'_> {
+    fn drop(&mut self) {
+        self.0.waiting.fetch_sub(1, Relaxed);
     }
 }
 
@@ -647,6 +735,8 @@ impl Session {
         let _ = self.ctrl.send(msg).await;
     }
 
+    /// Whether a stream of `conns` connections fits the session's limits.
+    /// Checked, not reserved: `register` under the slots lock counts it.
     fn may_start(&self, conns: u32) -> Result<(), String> {
         if conns == 0 || conns > MAX_CONNS {
             return Err(format!(
@@ -655,6 +745,11 @@ impl Session {
         }
         if self.streams.load(Relaxed) >= MAX_STREAMS {
             return Err(format!("at most {MAX_STREAMS} streams per session"));
+        }
+        if self.conns_in_use.load(Relaxed) + conns as usize > MAX_SESSION_CONNS {
+            return Err(format!(
+                "at most {MAX_SESSION_CONNS} stream connections per session, over all its streams"
+            ));
         }
         Ok(())
     }
@@ -672,6 +767,7 @@ impl Session {
         conns: u32,
     ) -> (StreamGuard, oneshot::Receiver<Vec<TcpStream>>) {
         self.streams.fetch_add(1, Relaxed);
+        self.conns_in_use.fetch_add(conns as usize, Relaxed);
         let (ready, rx) = oneshot::channel();
         slots.map.insert(
             stream,
@@ -681,15 +777,27 @@ impl Session {
                 ready,
             },
         );
-        (StreamGuard(self.clone()), rx)
+        (
+            StreamGuard {
+                session: self.clone(),
+                conns: conns as usize,
+            },
+            rx,
+        )
     }
 
     /// Adds a connection to its stream's slot; the last one completes the
     /// slot. A connection may beat its stream's `Open` here, so an unknown
-    /// client stream id above the highest seen waits for it.
+    /// client stream id above the highest seen waits for it, within the
+    /// session's connection limit.
     async fn attach(&self, stream: u32, conn: u32, socket: TcpStream) -> Result<()> {
         let deadline = Instant::now() + GATHER_WAIT;
         let mut socket = Some(socket);
+        let _waiting = Waiting(self);
+        ensure!(
+            self.waiting.fetch_add(1, Relaxed) < MAX_SESSION_CONNS,
+            "stream {stream}: too many connections are waiting for their Open"
+        );
         loop {
             let registered = self.registered.notified();
             tokio::pin!(registered);
