@@ -193,7 +193,11 @@ on high-latency links and on paths that throttle each connection. `-W
 HOST:PORT` carries one stream over stdin and stdout, for use as an ssh
 `ProxyCommand`; it exits 0 only once the server has written everything to
 the target. A stream that breaks resets the application's connection
-instead of ending it, so a cut-off download never looks complete.
+instead of ending it, so a cut-off download never looks complete. With
+`--reconnect`, the client sets up a new session whenever one ends,
+waiting 1 second at first and up to 60 seconds between attempts, and
+keeps its `-L` ports bound meanwhile. The first session must still
+succeed.
 Permissions, per-key `permitopen`, `permitlisten`, and `transfer` options,
 the server's limits, and the wire format are in
 [docs/TUNNEL.md](docs/TUNNEL.md).
@@ -300,8 +304,11 @@ not receive into a directory that other users can write to.
   attribute); times and owners only when asked for. Windows ACLs and
   extended attributes are not copied.
 - Tunnels: a stream fails if any one of its connections fails; there is no
-  retransmission above TCP. The client exits when its session ends and
-  does not reconnect on its own.
+  retransmission above TCP, and no stream outlives its session. The
+  client exits when its session ends unless run with `--reconnect`. After
+  a network loss that never closed the old session, a reconnect can take
+  about a minute: the server holds that session, and its `-R` ports,
+  until TCP keepalive gives up on it.
 - Private key files are stored unencrypted, protected only by file
   permissions.
 - A source that changes during a transfer is caught only by its size or

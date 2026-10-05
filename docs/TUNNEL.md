@@ -56,14 +56,32 @@ ssh -o ProxyCommand="mjolnir tunnel relay:7778 --key client.key --peer <KEY> -W 
 | `-W, --stdio HOST:PORT` | | carry one stream over stdin and stdout to `HOST:PORT` from the server; exits 0 once both directions have ended and the server has written everything to the target, and closes stdout as soon as the target's end arrives |
 | `-n, --connections N` | `1` | connections per stream, 1 to 32 |
 | `--cipher NAME` | `aes256gcm` | `aes256gcm` or `chacha20poly1305`, for stream frames |
+| `--reconnect` | off | when a session ends, set up a new one, as described below; not with `-W` |
 | `-v, --verbose` | off | log every stream |
 
 `BIND` defaults to `127.0.0.1`; an empty `BIND` or `*` means every
 interface (`0.0.0.0`). IPv6 addresses go in brackets: `[::1]:8080:web:80`.
 The client sets up every `-R` listener and binds every `-L` listener before
-it reports `tunnel up`, and exits with an error if any of them fails, or
-when the session ends. Run it under a supervisor (systemd, `autossh`-style
-loop) to reconnect.
+it reports `tunnel up`, and exits with an error if any of them fails. It
+also exits with an error when the session ends, unless run with
+`--reconnect`.
+
+With `--reconnect`, the first session must still succeed, so a wrong key,
+a refused permission, or a bad spec fails at once. After that, the client
+sets up a new session whenever one ends, and retries every attempt that
+fails, until Ctrl-C. It waits 1 second before the first attempt and
+doubles the wait after each failed one, up to 60 seconds. A session that
+stayed up for 60 seconds starts the waits over at 1 second. It logs one
+line when a session ends, one per failed attempt, and `tunnel up again`
+when a new session is up. Each new session asks for every `-R` listener
+again. The `-L` listeners stay bound on the same ports throughout, and
+while no session is up they reset every connection at once.
+
+A client that loses the network without closing its session leaves that
+session on the server, with its `-R` listeners and one of the key's 8
+session places, until TCP keepalive gives up on it, about a minute later.
+Until then, a reconnect can fail with the `-R` port in use or the key's
+session limit reached, and the client keeps retrying.
 
 `mjolnir tunnel-server` accepts clients:
 
@@ -290,7 +308,9 @@ streams and drops its listeners, but its running streams finish on their
 own terms. When it ends any other way, with an error, an `Error` message,
 or the server stopping, every stream of the session ends with it, and so
 do its streams' local connections, with a reset. Ctrl-C on either side
-resets the connections that side's streams carried before it exits.
+resets the connections that side's streams carried before it exits. No
+stream carries over to a client's next session: stream ids start again
+at 1, under the new session's keys.
 
 ### Limits
 
