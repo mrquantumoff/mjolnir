@@ -22,6 +22,7 @@ pub mod progress;
 pub mod recv;
 mod schedule;
 pub mod send;
+pub mod shutdown;
 pub mod tunnel;
 #[cfg(feature = "self-update")]
 pub mod update;

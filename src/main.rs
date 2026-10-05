@@ -14,7 +14,7 @@ use mjolnir::printable::escape;
 use mjolnir::tunnel::{self, Backoff, ForwardSpec, HostPort, Pattern, Permits, Policy};
 use mjolnir::{
     Cipher, Phase, PhaseTimes, PrivateKey, Progress, PublicKey, Receiver, RecvConfig, RecvReport,
-    SendConfig, load_authorized_entries, parse_size, transfer_keys, web,
+    SendConfig, load_authorized_entries, parse_size, shutdown, transfer_keys, web,
 };
 
 #[derive(Parser)]
@@ -250,8 +250,12 @@ fn run(cmd: Cmd) -> Result<()> {
             eprintln!("public key {}", receiver.public_key());
             eprintln!("listening on {}", receiver.local_addr());
             let progress = Arc::new(Progress::default());
+            shutdown::on_request({
+                let progress = progress.clone();
+                move || progress.cancel()
+            });
             let mut cpu_before = Duration::ZERO;
-            with_progress("received", &progress, || {
+            let served = with_progress("received", &progress, || {
                 receiver.serve(progress.clone(), |report| {
                     // Only the CPU spent since the previous transfer ended.
                     let cpu = process_cpu()
@@ -264,7 +268,10 @@ fn run(cmd: Cmd) -> Result<()> {
                         ControlFlow::Break(())
                     }
                 })
-            })?;
+            });
+            if !shutdown::is_requested() {
+                served?;
+            }
         }
         Cmd::Send {
             addr,
@@ -347,12 +354,10 @@ fn run(cmd: Cmd) -> Result<()> {
                     None => {
                         eprintln!("mjolnir: tunnel up");
                         if reconnect {
-                            client
-                                .run_reconnecting(Backoff::default(), interrupted())
-                                .await;
+                            client.run_reconnecting(Backoff::default(), stopped()).await;
                             Ok(())
                         } else {
-                            client.run_until(interrupted()).await
+                            client.run_until(stopped()).await
                         }
                     }
                 }
@@ -389,7 +394,7 @@ fn run(cmd: Cmd) -> Result<()> {
                 let server = tunnel::TunnelServer::bind(cfg).await?;
                 eprintln!("public key {}", server.public_key());
                 eprintln!("listening on {}", server.local_addr());
-                server.run_until(interrupted()).await
+                server.run_until(stopped()).await
             })?;
         }
         Cmd::Serve {
@@ -446,12 +451,15 @@ fn run(cmd: Cmd) -> Result<()> {
 
 const MIB: f64 = (1 << 20) as f64;
 
-/// Completes on Ctrl-C (or never, if the signal cannot be watched).
-async fn interrupted() {
-    if tokio::signal::ctrl_c().await.is_err() {
-        std::future::pending::<()>().await;
-    }
-    eprintln!("mjolnir: interrupted, closing");
+/// Completes on the shutdown request, which Ctrl-C makes from here on.
+async fn stopped() {
+    tokio::spawn(async {
+        if tokio::signal::ctrl_c().await.is_ok() {
+            eprintln!("mjolnir: interrupted, closing");
+            shutdown::request();
+        }
+    });
+    shutdown::requested().await
 }
 
 /// Runs `work` on a multi-threaded tokio runtime. Only the tunnel commands
