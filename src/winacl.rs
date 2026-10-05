@@ -2,12 +2,12 @@
 //! check that nobody but SYSTEM, Administrators, and TrustedInstaller can
 //! change what a service running as SYSTEM trusts.
 
-use std::ffi::{OsStr, c_void};
+use std::ffi::{OsStr, OsString, c_void};
 use std::fs;
 use std::io;
-use std::os::windows::ffi::OsStrExt;
+use std::os::windows::ffi::{OsStrExt, OsStringExt};
 use std::os::windows::fs::MetadataExt;
-use std::path::Path;
+use std::path::{Component, Path, PathBuf, Prefix};
 use std::ptr::null_mut;
 
 use anyhow::{Context, Result, bail};
@@ -27,8 +27,8 @@ use windows_sys::Win32::Security::{
 use windows_sys::Win32::Storage::FileSystem::{
     CreateDirectoryW, CreateFileW, DELETE, FILE_APPEND_DATA, FILE_ATTRIBUTE_REPARSE_POINT,
     FILE_DELETE_CHILD, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_DELETE,
-    FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_WRITE_DATA, OPEN_EXISTING, READ_CONTROL, WRITE_DAC,
-    WRITE_OWNER,
+    FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_WRITE_DATA, GetFinalPathNameByHandleW, OPEN_EXISTING,
+    READ_CONTROL, VOLUME_NAME_DOS, VOLUME_NAME_GUID, WRITE_DAC, WRITE_OWNER,
 };
 use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 
@@ -233,6 +233,45 @@ fn open_for_security(path: &Path) -> io::Result<fs::File> {
     Ok(unsafe { fs::File::from_raw_handle(handle) })
 }
 
+/// Where the open `file` is once every link above it is followed: `C:\...`
+/// or `\\server\share\...`, or `\\?\Volume{GUID}\...` on a volume with no
+/// drive letter.
+fn final_path(file: &fs::File) -> io::Result<PathBuf> {
+    use std::os::windows::io::AsRawHandle;
+    let get = |flags| {
+        let mut buf = vec![0u16; 512];
+        loop {
+            let len = unsafe {
+                GetFinalPathNameByHandleW(
+                    file.as_raw_handle(),
+                    buf.as_mut_ptr(),
+                    buf.len() as u32,
+                    flags,
+                )
+            } as usize;
+            match len {
+                0 => return Err(io::Error::last_os_error()),
+                len if len < buf.len() => {
+                    buf.truncate(len);
+                    return Ok(buf);
+                }
+                len => buf.resize(len, 0),
+            }
+        }
+    };
+    let wide = get(VOLUME_NAME_DOS).or_else(|_| get(VOLUME_NAME_GUID))?;
+    let path = PathBuf::from(OsString::from_wide(&wide));
+    let Some(Component::Prefix(prefix)) = path.components().next() else {
+        return Ok(path);
+    };
+    let plain = match prefix.kind() {
+        Prefix::VerbatimDisk(_) => wide[r"\\?\".len()..].to_vec(),
+        Prefix::VerbatimUNC(..) => [&wide[..2], &wide[r"\\?\UNC\".len()..]].concat(),
+        _ => return Ok(path),
+    };
+    Ok(OsString::from_wide(&plain).into())
+}
+
 /// The accounts other than SYSTEM, Administrators, and TrustedInstaller
 /// that can change `path`, add files to it if it is a folder, or replace
 /// it through a folder above it, each with where it can. Empty when there
@@ -245,9 +284,23 @@ pub(crate) fn outside_writers(path: &Path) -> Result<Vec<String>> {
     if meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
         bail!("{} is a link (a reparse point)", path.display());
     }
+    let resolved = open_for_security(&path)
+        .and_then(|file| final_path(&file))
+        .with_context(|| format!("resolving {}", path.display()))?;
+    let resolved = (!resolved.as_os_str().eq_ignore_ascii_case(&path)).then_some(resolved);
     let mut found = Vec::new();
+    // A folder above `path` is opened as the link it may be, so the chain
+    // of `path` says who can replace a junction, symlink, or mount point
+    // there, but not who can change the folders it leads to. The chain
+    // `path` resolves to says that. Links themselves stay allowed, since
+    // mounted volumes and relocated folders are legitimate.
     let levels = std::iter::once((path.as_path(), CHANGE))
-        .chain(path.ancestors().skip(1).map(|dir| (dir, REPLACE)));
+        .chain(path.ancestors().skip(1).map(|dir| (dir, REPLACE)))
+        .chain(
+            resolved
+                .iter()
+                .flat_map(|real| real.ancestors().skip(1).map(|dir| (dir, REPLACE))),
+        );
     for (at, rights) in levels {
         let file = open_for_security(at)
             .with_context(|| format!("reading the permissions of {}", at.display()))?;
@@ -325,7 +378,21 @@ mod tests {
     fn system_files_have_none() {
         let root = std::env::var_os("SystemRoot").unwrap();
         let system32 = Path::new(&root).join("System32");
-        for path in [system32.join("cmd.exe"), system32] {
+        // The spelling `final_path` gives on a volume with no drive letter.
+        let drive = system32.ancestors().last().unwrap();
+        let mut volume = [0u16; 64];
+        check_bool(unsafe {
+            windows_sys::Win32::Storage::FileSystem::GetVolumeNameForVolumeMountPointW(
+                wide(drive.as_os_str()).as_ptr(),
+                volume.as_mut_ptr(),
+                volume.len() as u32,
+            )
+        })
+        .unwrap();
+        let len = volume.iter().position(|&c| c == 0).unwrap();
+        let by_guid = PathBuf::from(OsString::from_wide(&volume[..len]))
+            .join(system32.strip_prefix(drive).unwrap());
+        for path in [system32.join("cmd.exe"), by_guid.join("cmd.exe"), system32] {
             assert_eq!(
                 outside_writers(&path).unwrap(),
                 Vec::<String>::new(),
@@ -334,19 +401,52 @@ mod tests {
         }
     }
 
-    #[test]
-    fn a_link_is_refused() {
-        let dir = tempfile::tempdir().unwrap();
-        let link = dir.path().join("link");
+    fn junction(link: &Path, target: &Path) {
         let status = Command::new("cmd")
             .args(["/C", "mklink", "/J"])
-            .arg(&link)
-            .arg(std::env::var_os("SystemRoot").unwrap())
+            .arg(link)
+            .arg(target)
             .stdout(Stdio::null())
             .status()
             .unwrap();
         assert!(status.success());
+    }
+
+    #[test]
+    fn a_link_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let link = dir.path().join("link");
+        junction(&link, Path::new(&std::env::var_os("SystemRoot").unwrap()));
         let err = format!("{:#}", outside_writers(&link).unwrap_err());
         assert!(err.contains("reparse point"), "{err}");
+    }
+
+    #[test]
+    fn a_junction_others_can_replace_is_refused_though_its_target_is_protected() {
+        let dir = tempfile::tempdir().unwrap();
+        let link = dir.path().join("link");
+        let root = std::env::var_os("SystemRoot").unwrap();
+        junction(&link, &Path::new(&root).join("System32"));
+        let found = outside_writers(&link.join("cmd.exe")).unwrap();
+        let on_link = format!(" on {}", link.display());
+        assert!(found.iter().any(|w| w.ends_with(&on_link)), "{found:?}");
+    }
+
+    #[test]
+    fn a_junction_into_a_folder_others_can_change_is_refused() {
+        let (links, targets) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let opened = targets.path().join("opened");
+        fs::create_dir_all(opened.join("sub")).unwrap();
+        fs::write(opened.join(r"sub\file"), "").unwrap();
+        icacls(&opened, &["/grant", "*S-1-1-0:(DC)"]);
+        let link = links.path().join("link");
+        junction(&link, &opened.join("sub"));
+        let found = outside_writers(&link.join("file")).unwrap();
+        assert!(
+            found
+                .iter()
+                .any(|w| w.contains("S-1-1-0) on ") && w.ends_with("opened")),
+            "{found:?}"
+        );
     }
 }
