@@ -60,15 +60,32 @@ const CTRL_QUEUE: usize = 64;
 /// An established session with its forwards set up. [`TunnelClient::run`]
 /// serves them until the session ends.
 pub struct TunnelClient {
+    session: Session,
+    local: LocalForwards,
+}
+
+/// One authenticated session, with every `-R` listener set up on the
+/// server.
+struct Session {
     shared: Arc<Shared>,
     rx: CtrlRx<BufReader<OwnedReadHalf>>,
     writer: tokio::task::JoinHandle<Result<()>>,
-    local: Vec<(TcpListener, HostPort)>,
     /// `-R` targets by listener id.
     remote: HashMap<u32, HostPort>,
     remote_addrs: Vec<String>,
     /// Control messages that arrived during setup, handled first by `run`.
     early: Vec<TunnelMsg>,
+}
+
+/// An accepted `-L` connection, its target, and the stream permit it holds.
+type Accepted = (TcpStream, SocketAddr, HostPort, OwnedSemaphorePermit);
+
+/// The `-L` listeners, each accepting on a task of its own into one queue
+/// that the session takes connections from.
+struct LocalForwards {
+    addrs: Vec<SocketAddr>,
+    accepted: mpsc::Receiver<Accepted>,
+    acceptors: JoinSet<()>,
 }
 
 struct Shared {
@@ -85,7 +102,6 @@ struct Shared {
     next_stream: Mutex<u32>,
     /// Bounded: a stream waits for room rather than piling requests up.
     ctrl: mpsc::Sender<TunnelMsg>,
-    local_streams: Arc<Semaphore>,
 }
 
 impl TunnelClient {
@@ -96,6 +112,107 @@ impl TunnelClient {
             (1..=MAX_CONNS).contains(&cfg.conns),
             "connections must be between 1 and {MAX_CONNS}"
         );
+        let session = Session::establish(&cfg).await?;
+        let local = LocalForwards::bind(&cfg.local, cfg.verbose).await?;
+        Ok(TunnelClient { session, local })
+    }
+
+    /// Where each `-L` forward listens, in the order given.
+    pub fn local_addrs(&self) -> Vec<SocketAddr> {
+        self.local.addrs.clone()
+    }
+
+    /// Where the server listens for each `-R` forward, in the order given.
+    pub fn remote_addrs(&self) -> &[String] {
+        &self.session.remote_addrs
+    }
+
+    /// Serves the forwards until the session ends, which is always an
+    /// error from this side's point of view.
+    pub async fn run(self) -> Result<()> {
+        self.run_with(std::future::pending()).await
+    }
+
+    /// Like [`TunnelClient::run`], but returns `Ok` once `stop` completes,
+    /// after resetting the connections its streams carried.
+    pub async fn run_until(self, stop: impl Future<Output = ()>) -> Result<()> {
+        self.run_with(async {
+            stop.await;
+            Ok(())
+        })
+        .await
+    }
+
+    /// Carries one stream to `target` over stdin and stdout, as `ssh -W`
+    /// does, and returns when it ends. Stdout is closed when the target's
+    /// end arrives, so whatever reads it sees that end without waiting for
+    /// stdin to finish too.
+    pub async fn stdio(self, target: HostPort) -> Result<Traffic> {
+        self.carry(target, tokio::io::stdin(), StdoutPipe::new())
+            .await
+    }
+
+    /// Carries one stream to `target` between `input` and `output`, and
+    /// returns when it ends: once both directions have ended and the server
+    /// has written everything sent to its side.
+    pub async fn carry<R, W>(self, target: HostPort, input: R, output: W) -> Result<Traffic>
+    where
+        R: AsyncRead + Unpin + Send + 'static,
+        W: AsyncWrite + Unpin + Send + 'static,
+    {
+        let shared = self.session.shared.clone();
+        let stream = async move {
+            let (id, crypto, conns) = shared.open(&target).await?;
+            pump(input, output, conns, crypto, shared.budget.clone())
+                .await
+                .with_context(|| format!("stream {id} to {target}"))
+        };
+        self.run_with(stream).await
+    }
+
+    /// Runs the session alongside `work`, returning when either ends.
+    async fn run_with<T>(self, work: impl Future<Output = Result<T>>) -> Result<T> {
+        let TunnelClient { session, mut local } = self;
+        let result = session.run_with(&mut local.accepted, work).await;
+        local.acceptors.shutdown().await;
+        result
+    }
+}
+
+impl LocalForwards {
+    async fn bind(specs: &[ForwardSpec], verbose: bool) -> Result<Self> {
+        let permits = Arc::new(Semaphore::new(MAX_LOCAL_STREAMS));
+        let (accepted_tx, accepted) = mpsc::channel(16);
+        let mut addrs = Vec::new();
+        let mut acceptors = JoinSet::new();
+        for spec in specs {
+            let listener = TcpListener::bind((spec.listen.host.as_str(), spec.listen.port))
+                .await
+                .with_context(|| format!("listening for -L {spec}"))?;
+            let addr = listener.local_addr()?;
+            if verbose {
+                eprintln!("mjolnir: forwarding {addr} -> server -> {}", spec.target);
+            }
+            addrs.push(addr);
+            acceptors.spawn(accept_local(
+                listener,
+                spec.target.clone(),
+                permits.clone(),
+                accepted_tx.clone(),
+            ));
+        }
+        Ok(LocalForwards {
+            addrs,
+            accepted,
+            acceptors,
+        })
+    }
+}
+
+impl Session {
+    /// Connects, authenticates, and asks the server for every `-R`
+    /// listener. Fails if any of them cannot be set up.
+    async fn establish(cfg: &ClientConfig) -> Result<Self> {
         let addrs: Vec<SocketAddr> = tokio::net::lookup_host(&cfg.addr)
             .await
             .with_context(|| format!("resolving {}", cfg.addr))?
@@ -168,24 +285,9 @@ impl TunnelClient {
             remote.insert(id, spec.target.clone());
         }
 
-        let mut local = Vec::new();
-        for spec in &cfg.local {
-            let listener = TcpListener::bind((spec.listen.host.as_str(), spec.listen.port))
-                .await
-                .with_context(|| format!("listening for -L {spec}"))?;
-            if cfg.verbose {
-                eprintln!(
-                    "mjolnir: forwarding {} -> server -> {}",
-                    listener.local_addr()?,
-                    spec.target
-                );
-            }
-            local.push((listener, spec.target.clone()));
-        }
-
         let (ctrl, ctrl_rx) = mpsc::channel(CTRL_QUEUE);
         let writer = tokio::spawn(write_control(tx, ctrl_rx));
-        Ok(TunnelClient {
+        Ok(Session {
             shared: Arc::new(Shared {
                 addrs,
                 route: proto::route(&keys),
@@ -196,80 +298,26 @@ impl TunnelClient {
                 budget: Budget::new(BUFFER_BUDGET),
                 next_stream: Mutex::new(0),
                 ctrl,
-                local_streams: Arc::new(Semaphore::new(MAX_LOCAL_STREAMS)),
             }),
             rx,
             writer,
-            local,
             remote,
             remote_addrs,
             early,
         })
     }
 
-    /// Where each `-L` forward listens, in the order given.
-    pub fn local_addrs(&self) -> Vec<SocketAddr> {
-        self.local
-            .iter()
-            .map(|(l, _)| l.local_addr().expect("bound listener has an address"))
-            .collect()
-    }
-
-    /// Where the server listens for each `-R` forward, in the order given.
-    pub fn remote_addrs(&self) -> &[String] {
-        &self.remote_addrs
-    }
-
-    /// Serves the forwards until the session ends, which is always an
-    /// error from this side's point of view.
-    pub async fn run(self) -> Result<()> {
-        self.run_with(std::future::pending()).await
-    }
-
-    /// Like [`TunnelClient::run`], but returns `Ok` once `stop` completes,
-    /// after resetting the connections its streams carried.
-    pub async fn run_until(self, stop: impl Future<Output = ()>) -> Result<()> {
-        self.run_with(async {
-            stop.await;
-            Ok(())
-        })
-        .await
-    }
-
-    /// Carries one stream to `target` over stdin and stdout, as `ssh -W`
-    /// does, and returns when it ends. Stdout is closed when the target's
-    /// end arrives, so whatever reads it sees that end without waiting for
-    /// stdin to finish too.
-    pub async fn stdio(self, target: HostPort) -> Result<Traffic> {
-        self.carry(target, tokio::io::stdin(), StdoutPipe::new())
-            .await
-    }
-
-    /// Carries one stream to `target` between `input` and `output`, and
-    /// returns when it ends: once both directions have ended and the server
-    /// has written everything sent to its side.
-    pub async fn carry<R, W>(self, target: HostPort, input: R, output: W) -> Result<Traffic>
-    where
-        R: AsyncRead + Unpin + Send + 'static,
-        W: AsyncWrite + Unpin + Send + 'static,
-    {
-        let shared = self.shared.clone();
-        let stream = async move {
-            let (id, crypto, conns) = shared.open(&target).await?;
-            pump(input, output, conns, crypto, shared.budget.clone())
-                .await
-                .with_context(|| format!("stream {id} to {target}"))
-        };
-        self.run_with(stream).await
-    }
-
-    /// Runs the session alongside `work`, returning when either ends.
-    async fn run_with<T>(self, work: impl Future<Output = Result<T>>) -> Result<T> {
-        let TunnelClient {
+    /// Runs the session alongside `work`, carrying the `-L` connections
+    /// taken from `accepted`, and returns when either ends.
+    async fn run_with<T>(
+        self,
+        accepted: &mut mpsc::Receiver<Accepted>,
+        work: impl Future<Output = Result<T>>,
+    ) -> Result<T> {
+        let Session {
             shared,
             mut rx,
             mut writer,
-            local,
             remote,
             early,
             ..
@@ -278,16 +326,6 @@ impl TunnelClient {
         // them all, and their guards reset the applications' connections,
         // before the process exits.
         let mut tasks = JoinSet::new();
-        let (accepted_tx, mut accepted) = mpsc::channel(16);
-        for (listener, target) in local {
-            tasks.spawn(accept_local(
-                listener,
-                target,
-                shared.local_streams.clone(),
-                accepted_tx.clone(),
-            ));
-        }
-        drop(accepted_tx);
         let mut last_incoming = None;
         // Reading is not cancellation safe, so it has a task of its own.
         let (in_tx, mut in_rx) = mpsc::channel(16 + early.len());
@@ -532,7 +570,7 @@ async fn accept_local(
     listener: TcpListener,
     target: HostPort,
     permits: Arc<Semaphore>,
-    accepted: mpsc::Sender<(TcpStream, SocketAddr, HostPort, OwnedSemaphorePermit)>,
+    accepted: mpsc::Sender<Accepted>,
 ) {
     loop {
         let Ok(permit) = permits.clone().acquire_owned().await else {
