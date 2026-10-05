@@ -181,15 +181,22 @@ fn require_protected(what: &str, path: &Path, fix: &str) -> Result<()> {
 }
 
 /// Creates the log's folder if it is missing, with an access list only
-/// SYSTEM and Administrators can change, and refuses a folder that anyone
-/// else can change or add files to.
-fn prepare_log_dir(log: &Path) -> Result<()> {
+/// SYSTEM and Administrators can change, and refuses an existing log or a
+/// folder that anyone else can change or add files to.
+fn prepare_log(log: &Path) -> Result<()> {
     let dir = log.parent().context("the log path has no folder")?;
     match fs::symlink_metadata(dir) {
         Err(e) if e.kind() == io::ErrorKind::NotFound => winacl::create_protected_dir(dir)
             .with_context(|| format!("creating {}", dir.display()))?,
         Err(e) => return Err(e).with_context(|| format!("reading {}", dir.display())),
         Ok(_) => {}
+    }
+    if fs::symlink_metadata(log).is_ok() {
+        require_protected(
+            "log",
+            log,
+            "delete it from an elevated terminal, and the service creates a new one",
+        )?;
     }
     require_protected(
         "log folder",
@@ -201,9 +208,9 @@ fn prepare_log_dir(log: &Path) -> Result<()> {
 
 /// Installs service `mjolnir-NAME` that runs this binary with `args` as
 /// LocalSystem, starting at boot unless `manual`, and restarting after a
-/// failure. Refuses what [`check_inputs`] refuses, and an unprotected log
-/// folder. Either the service ends up fully configured or it is not
-/// installed. It is not started.
+/// failure. Refuses what [`check_inputs`] refuses, and a log or log folder
+/// others can change. Either the service ends up fully configured or it is
+/// not installed. It is not started.
 pub fn install(
     name: &ServiceName,
     args: &[OsString],
@@ -217,7 +224,7 @@ pub fn install(
     }
     let manager = ScHandle(manager);
     check_inputs(inputs)?;
-    prepare_log_dir(log)?;
+    prepare_log(log)?;
     let exe = std::env::current_exe()?;
     let line = command_line(std::iter::once(exe.as_os_str()).chain(args.iter().map(AsRef::as_ref)));
     let start = if manual {
@@ -364,8 +371,8 @@ fn exit_reason(code: ServiceExitCode) -> Option<String> {
             format!("exit code {EXIT_FAILED}: the command failed or was refused; see its log")
         }
         ServiceExitCode::ServiceSpecific(EXIT_NO_LOG) => format!(
-            "exit code {EXIT_NO_LOG}: it could not open its log, or refused an unprotected \
-             log folder or a log path that is a link"
+            "exit code {EXIT_NO_LOG}: it could not open its log, or refused a log or log \
+             folder others can change, or a log path that is a link"
         ),
         ServiceExitCode::ServiceSpecific(code) => format!("exit code {code}"),
         ServiceExitCode::Win32(code) => format!(
@@ -554,14 +561,14 @@ fn serve(service: &str, cwd: &Path, log: &Path, command: impl FnOnce() -> Result
 }
 
 /// Opens the log for appending, creating it if missing, after
-/// [`prepare_log_dir`]. Refuses a log path that is a link.
+/// [`prepare_log`]. Refuses a log path that is a link.
 fn open_log(path: &Path) -> Result<File> {
     let is_link = |meta: fs::Metadata| meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0;
     let refuse = || anyhow!("log {} is a link (a reparse point)", path.display());
     if fs::symlink_metadata(path).is_ok_and(is_link) {
         return Err(refuse());
     }
-    prepare_log_dir(path)?;
+    prepare_log(path)?;
     let file = OpenOptions::new()
         .create(true)
         .append(true)
@@ -863,6 +870,27 @@ mod tests {
         let err = format!("{:#}", open_log(&dir.path().join("svc.log")).unwrap_err());
         assert!(
             err.contains("log folder") && err.contains("can be changed by"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn a_log_others_can_change_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("svc.log");
+        fs::write(&log, "").unwrap();
+        let status = std::process::Command::new("icacls")
+            .arg(&log)
+            .args(["/grant", "*S-1-1-0:W"])
+            .stdout(std::process::Stdio::null())
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let err = format!("{:#}", open_log(&log).unwrap_err());
+        let grant = format!("S-1-1-0) on {}", log.display());
+        assert!(
+            err.starts_with(&format!("log {} can be changed by", log.display()))
+                && err.contains(&grant),
             "{err}"
         );
     }

@@ -77,8 +77,9 @@ Stderr goes to `%ProgramData%\mjolnir\NAME.log`, or to the file `--log
 PATH` names. `install` creates a missing log folder owned by
 Administrators, with full control for SYSTEM and Administrators, read
 access for Users, and nothing inherited. It refuses a log folder that
-another account can change or add files to, and a log path that is a
-link. Each line starts with a UTC timestamp, and the file is appended to
+another account can change or add files to, an existing log file another
+account can change, and a log path that is a link. The service checks
+again each time it starts. Each line starts with a UTC timestamp, and the file is appended to
 across restarts. It holds the start lines, a summary per transfer,
 failed handshakes and sessions, and why the service stopped, but no
 per-second progress lines.
