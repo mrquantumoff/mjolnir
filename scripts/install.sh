@@ -2,10 +2,10 @@
 # Install a mjolnir release binary on Linux or macOS (x86_64 or aarch64).
 #
 # Downloads from the release's public URLs, so it needs no GitHub login or
-# token. If openssl is on PATH, the release's SHA256SUMS must carry a valid
-# signature by the release key below; without openssl only the checksum is
-# checked. The archive is checked against SHA256SUMS, and the binary must
-# report the version of the release's tag, before anything is installed.
+# token. The release's SHA256SUMS must carry a valid signature by the release
+# key below, checked with openssl, the archive must match SHA256SUMS, and the
+# binary must report the version of the release's tag, before anything is
+# installed.
 #
 # usage: scripts/install.sh
 #   MJOLNIR_VERSION      release tag to install, e.g. v0.1.0 (default: latest)
@@ -59,6 +59,7 @@ asset="mjolnir-$arch-$os.tar.gz"
 if command -v sha256sum >/dev/null; then sha256=(sha256sum); else sha256=(shasum -a 256); fi
 
 command -v curl >/dev/null || die "curl is required"
+command -v openssl >/dev/null || die "openssl is required to check the release signature"
 # Every file comes from the tag `latest` redirects to, so they cannot come
 # from different releases, and the binary's version can be checked against it.
 if [ "$version" = latest ]; then
@@ -80,12 +81,8 @@ for name in SHA256SUMS SHA256SUMS.sig "$asset"; do
     die "cannot download $name from $repo ($version)"
 done
 
-if command -v openssl >/dev/null; then
-  verify_signature "$tmp/SHA256SUMS" ||
-    die "SHA256SUMS does not match its signature SHA256SUMS.sig"
-else
-  echo "install: warning: openssl not found; checking only the checksum, not the release signature" >&2
-fi
+verify_signature "$tmp/SHA256SUMS" ||
+  die "SHA256SUMS does not match its signature SHA256SUMS.sig"
 
 (cd "$tmp" && grep -F "  $asset" SHA256SUMS | "${sha256[@]}" -c --status -) ||
   die "checksum mismatch for $asset"

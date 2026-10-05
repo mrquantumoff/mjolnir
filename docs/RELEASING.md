@@ -11,10 +11,9 @@ its `SHA256SUMS` line. They resolve `latest` through GitHub's
 binary is staged in the install directory and moved into place only after
 its `--version` reports the tag's version, so an older signed release served
 under a newer tag is refused and leaves the installed binary as it was.
-`install.ps1` verifies with .NET and always checks
-the signature. `install.sh` verifies with `openssl`; on a system without
-`openssl` it prints a warning and checks only the checksum, which guards
-against a corrupt download but not against a swapped release. Releases up
+`install.ps1` verifies the signature with .NET and `install.sh` with
+`openssl`, which it requires; install `openssl` first on a minimal system
+that lacks it. Releases up
 to v0.2.0 carry no signature, so the scripts refuse to install them.
 
 Both scripts read `MJOLNIR_VERSION` to install a specific tag instead of
