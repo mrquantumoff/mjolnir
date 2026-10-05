@@ -402,10 +402,21 @@ fn run(cmd: Cmd) -> Result<()> {
         #[cfg(feature = "self-update")]
         Cmd::Update { check } => {
             use mjolnir::update::{self, Outcome};
-            let releases = std::env::var("MJOLNIR_RELEASES_URL")
-                .unwrap_or_else(|_| update::RELEASES_URL.to_string());
+            // A mirror of the official releases sets only the URL; a fork
+            // that signs its own releases sets both.
+            let (releases, key) = match std::env::var("MJOLNIR_RELEASES_URL") {
+                Ok(releases) => (
+                    releases,
+                    std::env::var("MJOLNIR_RELEASE_KEY")
+                        .unwrap_or_else(|_| update::RELEASE_KEY.to_string()),
+                ),
+                Err(_) => (
+                    update::RELEASES_URL.to_string(),
+                    update::RELEASE_KEY.to_string(),
+                ),
+            };
             let current = env!("CARGO_PKG_VERSION");
-            match update::update(&releases, check)? {
+            match update::update(&releases, &key, check)? {
                 Outcome::UpToDate { latest } => {
                     println!("mjolnir {current} is up to date (latest release {latest})")
                 }

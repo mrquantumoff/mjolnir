@@ -1,9 +1,10 @@
 //! `mjolnir update`: replace the running binary with the latest release.
 //!
 //! The latest tag comes from the redirect GitHub serves for
-//! `releases/latest`, and the archive and `SHA256SUMS` from the public
-//! download URLs, so no API call, login, or token is involved. The archive
-//! must match its `SHA256SUMS` line, and the new binary must run
+//! `releases/latest`, and the archive, `SHA256SUMS`, and `SHA256SUMS.sig`
+//! from the public download URLs, so no API call, login, or token is
+//! involved. `SHA256SUMS` must carry a valid signature by [`RELEASE_KEY`],
+//! the archive must match its `SHA256SUMS` line, and the new binary must run
 //! `--version`, before it takes the old one's place.
 //!
 //! Downloads go through the system's curl and unpacking through its tar.
@@ -20,11 +21,22 @@ use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, anyhow, ensure};
+use base64::Engine;
+use base64::engine::general_purpose::STANDARD as B64;
+use p256::ecdsa::signature::Verifier;
+use p256::ecdsa::{Signature, VerifyingKey};
+use p256::pkcs8::DecodePublicKey;
 use sha2::{Digest, Sha256};
 
 /// Where releases are published. `MJOLNIR_RELEASES_URL` overrides it, for a
 /// fork or a mirror with the same layout.
 pub const RELEASES_URL: &str = "https://github.com/mrquantumoff/mjolnir/releases";
+
+/// The ECDSA P-256 key that signs `SHA256SUMS` in every release, as base64
+/// of its SubjectPublicKeyInfo DER. `MJOLNIR_RELEASE_KEY` overrides it, but
+/// only together with `MJOLNIR_RELEASES_URL`, for a fork that signs its own
+/// releases.
+pub const RELEASE_KEY: &str = "MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEfCWNtshHxuxy4XyVXfa/O62yS79tJXqzlChtlVlBGHkHoF470qqwhXnhR/tVxC2a6H/M7miFldxmAlr8R/G1BA==";
 
 /// This platform's release archive, if releases include one.
 pub const ASSET: Option<&str> = if cfg!(all(
@@ -64,9 +76,10 @@ pub enum Outcome {
 }
 
 /// Checks `releases` for a newer version and, unless `check_only`, installs
-/// it over the running executable.
-pub fn update(releases: &str, check_only: bool) -> Result<Outcome> {
+/// it over the running executable. `key` takes the form of [`RELEASE_KEY`].
+pub fn update(releases: &str, key: &str, check_only: bool) -> Result<Outcome> {
     let releases = releases.trim_end_matches('/');
+    let key = parse_key(key).context("cannot read the release key")?;
     let latest = latest_tag(releases)?;
     if parse_version(&latest)? <= parse_version(env!("CARGO_PKG_VERSION"))? {
         return Ok(Outcome::UpToDate { latest });
@@ -85,9 +98,8 @@ pub fn update(releases: &str, check_only: bool) -> Result<Outcome> {
     }
 
     let tmp = TempDir::new()?;
-    let archive = tmp.0.join(asset);
-    let sums = tmp.0.join("SHA256SUMS");
-    for (name, path) in [(asset, &archive), ("SHA256SUMS", &sums)] {
+    let download = |name: &str| -> Result<PathBuf> {
+        let path = tmp.0.join(name);
         let url = format!("{releases}/download/{latest}/{name}");
         curl(
             releases,
@@ -99,8 +111,14 @@ pub fn update(releases: &str, check_only: bool) -> Result<Outcome> {
             ],
         )
         .with_context(|| format!("cannot download {url}"))?;
-    }
-    verify(&archive, asset, &fs::read_to_string(&sums)?)?;
+        Ok(path)
+    };
+    let sums = fs::read(download("SHA256SUMS")?)?;
+    let signature = fs::read(download("SHA256SUMS.sig")?)?;
+    check_signature(&key, &sums, &signature)?;
+    let sums = String::from_utf8(sums).context("SHA256SUMS is not text")?;
+    let archive = download(asset)?;
+    verify(&archive, asset, &sums)?;
     run(Command::new(system_tool("tar"))
         .arg("-xf")
         .arg(&archive)
@@ -138,6 +156,21 @@ fn parse_version(text: &str) -> Result<[u64; 3]> {
     parts
         .try_into()
         .map_err(|_| anyhow!("version {text:?} is not MAJOR.MINOR.PATCH"))
+}
+
+fn parse_key(text: &str) -> Result<VerifyingKey> {
+    let der = B64.decode(text.trim())?;
+    VerifyingKey::from_public_key_der(&der).map_err(|e| anyhow!("not a P-256 public key: {e}"))
+}
+
+/// `signature` is DER, as `openssl dgst -sha256 -sign` writes it.
+fn check_signature(key: &VerifyingKey, sums: &[u8], signature: &[u8]) -> Result<()> {
+    let valid = Signature::from_der(signature).is_ok_and(|sig| key.verify(sums, &sig).is_ok());
+    ensure!(
+        valid,
+        "SHA256SUMS does not match its signature SHA256SUMS.sig"
+    );
+    Ok(())
 }
 
 fn verify(archive: &Path, asset: &str, sums: &str) -> Result<()> {

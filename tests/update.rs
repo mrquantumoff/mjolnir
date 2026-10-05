@@ -7,7 +7,11 @@ use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
+use base64::Engine;
+use base64::engine::general_purpose::STANDARD as B64;
 use mjolnir::update::ASSET;
+use p256::ecdsa::signature::Signer;
+use p256::ecdsa::{Signature, SigningKey};
 use sha2::{Digest, Sha256};
 
 const BIN: &str = if cfg!(windows) {
@@ -16,14 +20,38 @@ const BIN: &str = if cfg!(windows) {
     "mjolnir"
 };
 
+/// Signs the test releases in place of the real release key, which
+/// `MJOLNIR_RELEASE_KEY` replaces.
+fn signing_key() -> SigningKey {
+    SigningKey::from_bytes(&[0x42; 32].into()).unwrap()
+}
+
+/// The test key's public half as base64 SubjectPublicKeyInfo DER.
+fn public_key() -> String {
+    const P256_SPKI_PREFIX: [u8; 26] = [
+        0x30, 0x59, 0x30, 0x13, 0x06, 0x07, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x02, 0x01, 0x06, 0x08,
+        0x2a, 0x86, 0x48, 0xce, 0x3d, 0x03, 0x01, 0x07, 0x03, 0x42, 0x00,
+    ];
+    let point = signing_key().verifying_key().to_encoded_point(false);
+    B64.encode([&P256_SPKI_PREFIX[..], point.as_bytes()].concat())
+}
+
+/// A DER signature of `sums`, as `openssl dgst -sha256 -sign` writes it.
+fn sign(sums: &str) -> Vec<u8> {
+    let signature: Signature = signing_key().sign(sums.as_bytes());
+    signature.to_der().as_bytes().to_vec()
+}
+
 /// Serves `tag` as the latest release with `archive` as this platform's
-/// asset and `sums` as its SHA256SUMS; returns the releases base URL.
-fn serve(tag: &str, archive: Vec<u8>, sums: String) -> String {
+/// asset, `sums` as its SHA256SUMS, and `sig`, if any, as SHA256SUMS.sig;
+/// returns the releases base URL.
+fn serve(tag: &str, archive: Vec<u8>, sums: String, sig: Option<Vec<u8>>) -> String {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let base = format!("http://{}/releases", listener.local_addr().unwrap());
     let latest = format!("{base}/tag/{tag}");
     let asset_path = format!("/releases/download/{tag}/{}", ASSET.unwrap_or_default());
     let sums_path = format!("/releases/download/{tag}/SHA256SUMS");
+    let sig_path = format!("/releases/download/{tag}/SHA256SUMS.sig");
     let tag_path = format!("/releases/tag/{tag}");
     std::thread::spawn(move || {
         for stream in listener.incoming() {
@@ -44,6 +72,9 @@ fn serve(tag: &str, archive: Vec<u8>, sums: String) -> String {
                 p if p == tag_path => ("200 OK", String::new(), b""),
                 p if p == asset_path => ("200 OK", String::new(), &archive),
                 p if p == sums_path => ("200 OK", String::new(), sums.as_bytes()),
+                p if p == sig_path && sig.is_some() => {
+                    ("200 OK", String::new(), sig.as_deref().unwrap())
+                }
                 _ => ("404 Not Found", String::new(), b""),
             };
             let head = format!(
@@ -118,6 +149,7 @@ fn update(bin: &Path, base: &str, args: &[&str]) -> Output {
         .arg("update")
         .args(args)
         .env("MJOLNIR_RELEASES_URL", base)
+        .env("MJOLNIR_RELEASE_KEY", public_key())
         .output()
         .unwrap()
 }
@@ -156,7 +188,9 @@ fn update_installs_a_newer_release() {
         return;
     }
     let f = fixture();
-    let base = serve("v99.0.0", f.archive.clone(), sums_for(&f.archive));
+    let sums = sums_for(&f.archive);
+    let sig = sign(&sums);
+    let base = serve("v99.0.0", f.archive.clone(), sums, Some(sig));
     let before = file_id(&f.installed);
 
     let out = update(&f.installed, &base, &["--check"]);
@@ -190,19 +224,47 @@ fn update_installs_a_newer_release() {
     }
 }
 
+/// Offers `f`'s install a release of `sums` and `sig`, and checks that the
+/// update fails with `error` and leaves the installed binary in place.
+fn assert_refused(f: &Fixture, sums: String, sig: Option<Vec<u8>>, error: &str) {
+    let before = file_id(&f.installed);
+    let base = serve("v99.0.0", f.archive.clone(), sums, sig);
+    let out = update(&f.installed, &base, &[]);
+    assert!(!out.status.success());
+    assert!(text(&out).contains(error), "{}", text(&out));
+    assert_eq!(file_id(&f.installed), before);
+    assert!(others_in_install_dir(&f.installed).is_empty());
+}
+
 #[test]
 fn update_refuses_an_archive_that_fails_its_checksum() {
     if ASSET.is_none() {
         return;
     }
+    let sums = sums_for(b"something else");
+    let sig = sign(&sums);
+    assert_refused(&fixture(), sums, Some(sig), "checksum mismatch");
+}
+
+#[test]
+fn update_refuses_sums_that_fail_their_signature() {
+    if ASSET.is_none() {
+        return;
+    }
     let f = fixture();
-    let before = file_id(&f.installed);
-    let base = serve("v99.0.0", f.archive.clone(), sums_for(b"something else"));
-    let out = update(&f.installed, &base, &[]);
-    assert!(!out.status.success());
-    assert!(text(&out).contains("checksum mismatch"), "{}", text(&out));
-    assert_eq!(file_id(&f.installed), before);
-    assert!(others_in_install_dir(&f.installed).is_empty());
+    let signed = sign(&sums_for(b"something else"));
+    let error = "SHA256SUMS does not match its signature";
+    assert_refused(&f, sums_for(&f.archive), Some(signed), error);
+    assert_refused(&f, sums_for(&f.archive), Some(b"not DER".to_vec()), error);
+}
+
+#[test]
+fn update_refuses_a_release_without_a_signature() {
+    if ASSET.is_none() {
+        return;
+    }
+    let f = fixture();
+    assert_refused(&f, sums_for(&f.archive), None, "SHA256SUMS.sig");
 }
 
 #[test]
@@ -212,7 +274,7 @@ fn update_leaves_the_current_version_alone() {
     std::fs::copy(env!("CARGO_BIN_EXE_mjolnir"), &installed).unwrap();
     let before = std::fs::read(&installed).unwrap();
     let tag = format!("v{}", env!("CARGO_PKG_VERSION"));
-    let base = serve(&tag, Vec::new(), String::new());
+    let base = serve(&tag, Vec::new(), String::new(), None);
     let out = update(&installed, &base, &[]);
     assert!(out.status.success(), "{}", text(&out));
     assert!(text(&out).contains("is up to date"), "{}", text(&out));

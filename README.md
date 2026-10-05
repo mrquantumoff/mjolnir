@@ -43,14 +43,22 @@ in `target/release`.
 
 `mjolnir update` replaces the running binary with the latest release, and
 `mjolnir update --check` only reports whether one exists. It reads the
-latest tag from GitHub's `releases/latest` redirect, downloads this
-platform's archive and `SHA256SUMS` from the public release URLs with the
-system's `curl`, refuses an archive that does not match, unpacks it with the
-system's `tar`, and swaps the new binary in only after it runs `--version`.
-Windows 10 and later ship both tools; on Windows the old binary is moved to
-`mjolnir.exe.old` and deleted on the next run. It never downgrades, and it
-refuses on platforms that have no release build.
+latest tag from GitHub's `releases/latest` redirect and downloads
+`SHA256SUMS` and `SHA256SUMS.sig` from the public release URLs with the
+system's `curl`. It refuses the release unless `SHA256SUMS.sig` is a valid
+signature of `SHA256SUMS` by the release key built into the binary. Then it
+downloads this platform's archive, refuses it if it does not match its
+`SHA256SUMS` line, unpacks it with the system's `tar`, and swaps the new
+binary in only after it runs `--version`. Windows 10 and later ship both
+tools; on Windows the old binary is moved to `mjolnir.exe.old` and deleted
+on the next run. It never downgrades, and it refuses on platforms that have
+no release build.
+
 `MJOLNIR_RELEASES_URL` points it at a fork or mirror with the same layout.
+A mirror of the official releases needs nothing else. A fork that signs its
+own releases also sets `MJOLNIR_RELEASE_KEY` to its public key, in the
+format of `RELEASE_KEY` in [`src/update.rs`](src/update.rs). The binary
+ignores `MJOLNIR_RELEASE_KEY` unless `MJOLNIR_RELEASES_URL` is set.
 
 The updater is the `self-update` Cargo feature, on by default. Packagers who
 ship mjolnir through a package manager should build without it, which
