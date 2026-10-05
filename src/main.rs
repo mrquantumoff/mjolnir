@@ -88,7 +88,7 @@ enum Cmd {
         /// Chunk size, e.g. 256K, 1MiB, 4M (4 KiB to 64 MiB).
         #[arg(short = 'c', long, default_value = "1MiB", value_parser = parse_size)]
         chunk_size: u32,
-        #[arg(long, value_enum, default_value_t = Cipher::Aes256Gcm)]
+        #[arg(long, value_enum, default_value_t = Cipher::default())]
         cipher: Cipher,
         /// Workers that read and encrypt chunks (0 = one per core).
         #[arg(long, default_value_t = 0)]
@@ -132,7 +132,7 @@ enum Cmd {
         /// them.
         #[arg(short = 'n', long, default_value_t = 1)]
         connections: u32,
-        #[arg(long, value_enum, default_value_t = Cipher::Aes256Gcm)]
+        #[arg(long, value_enum, default_value_t = Cipher::default())]
         cipher: Cipher,
         /// When a session ends, set up a new one, waiting 1 s, doubling to
         /// 60 s, between attempts. The first session must still succeed.

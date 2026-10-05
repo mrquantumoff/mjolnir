@@ -59,13 +59,24 @@ impl FileHasher {
 pub const REJECTED: &str = "the receiver rejected the handshake (this sender's key is not authorized, \
      or --peer is not the receiver's public key)";
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize, clap::ValueEnum)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, clap::ValueEnum)]
 pub enum Cipher {
-    #[default]
     #[value(name = "aes256gcm")]
     Aes256Gcm,
     #[value(name = "chacha20poly1305")]
     ChaCha20Poly1305,
+}
+
+/// AES-256-GCM, unless this CPU cannot run it (see
+/// [`Cipher::ensure_supported`]).
+impl Default for Cipher {
+    fn default() -> Self {
+        if aes_instructions_present() {
+            Cipher::Aes256Gcm
+        } else {
+            Cipher::ChaCha20Poly1305
+        }
+    }
 }
 
 impl Cipher {

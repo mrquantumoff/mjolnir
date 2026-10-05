@@ -149,7 +149,7 @@ as `incoming/photos/...`.
 | `--peer KEY` | required | the receiver's public key |
 | `-n, --connections N` | `8` | parallel data connections, 1 to 256 |
 | `-c, --chunk-size SIZE` | `1MiB` | chunk size, 4 KiB to 64 MiB; accepts `64K`, `256KiB`, `1M`, `4MiB` |
-| `--cipher NAME` | `aes256gcm` | `aes256gcm` or `chacha20poly1305` |
+| `--cipher NAME` | `aes256gcm` | `aes256gcm` or `chacha20poly1305`; the default is `chacha20poly1305` on a Windows ARM64 CPU without the Cryptography Extension |
 | `--threads N` | `0` (one per core) | workers that read and encrypt chunks, at most 1024 |
 | `--hash` | off | after delivery, re-read every file and have the receiver compare chunk digests; mismatched chunks are sent again |
 | `--preserve LIST` | `perms` | metadata to copy: `none`, or any of `perms`, `times`, `owner` |
@@ -319,8 +319,9 @@ not receive into a directory that other users can write to.
   permissions.
 - Windows ARM64 builds run AES-256-GCM on the ARMv8 Cryptography Extension,
   with no software fallback. On a CPU without it, `send` and `tunnel`
-  refuse `--cipher aes256gcm`, and `recv` and `tunnel-server` refuse a
-  session that uses it. Use `--cipher chacha20poly1305` there.
+  default to `chacha20poly1305` and refuse `--cipher aes256gcm`, and `recv`
+  and `tunnel-server` refuse a session that uses it. Senders talking to
+  such a receiver need `--cipher chacha20poly1305`.
 - A source that changes during a transfer is caught only by its size or
   mtime, which the sender re-checks after every round. An in-place edit that
   keeps both, such as a tool that restores the mtime, goes out as a mix of

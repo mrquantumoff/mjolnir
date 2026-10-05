@@ -55,7 +55,7 @@ ssh -o ProxyCommand="mjolnir tunnel relay:7778 --key client.key --peer <KEY> -W 
 | `-R, --remote SPEC` | | `[BIND:]PORT:HOST:HOSTPORT`: the server listens on `BIND:PORT`; each connection reaches `HOST:HOSTPORT` from here; repeatable |
 | `-W, --stdio HOST:PORT` | | carry one stream over stdin and stdout to `HOST:PORT` from the server; exits 0 once both directions have ended and the server has written everything to the target, and closes stdout as soon as the target's end arrives |
 | `-n, --connections N` | `1` | connections per stream, 1 to 32 |
-| `--cipher NAME` | `aes256gcm` | `aes256gcm` or `chacha20poly1305`, for stream frames |
+| `--cipher NAME` | `aes256gcm` | `aes256gcm` or `chacha20poly1305`, for stream frames; the default is `chacha20poly1305` on a Windows ARM64 CPU without the Cryptography Extension |
 | `--reconnect` | off | when a session ends, set up a new one, as described below; not with `-W` |
 | `-v, --verbose` | off | log every stream |
 
