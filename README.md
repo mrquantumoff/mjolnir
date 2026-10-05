@@ -65,7 +65,8 @@ binary in only after it runs `--version`. Windows 10 and later ship both
 tools; on Windows the old binary is moved to `mjolnir.exe.old` and deleted
 on the next run. It never downgrades, and it refuses on platforms that have
 no release build. A running Windows service keeps the old binary until it
-restarts, so restart the service after `mjolnir update`.
+restarts, so restart the service after `mjolnir update`, which needs an
+elevated terminal when mjolnir lives under Program Files.
 
 `MJOLNIR_RELEASES_URL` points it at a fork or mirror with the same layout.
 A mirror of the official releases needs nothing else. A fork that signs its
@@ -115,7 +116,10 @@ existing file. On Unix the file has mode `0600`. On Windows it gets an
 access list of its own, inheriting nothing from its folder, that grants
 only your account, SYSTEM, and Administrators. Every command that reads a
 key refuses one that other accounts can read or change, and says how to
-restrict it (`chmod 600` or `icacls`).
+restrict it (`chmod 600` or `icacls`). On Windows, `keygen --system`
+instead writes a key owned by Administrators that only SYSTEM and
+Administrators can use, for a [Windows
+service](#running-as-a-windows-service); it needs an elevated terminal.
 
 `mjolnir pubkey --key PATH` prints the public key of an existing private
 key.
@@ -212,18 +216,37 @@ the server's limits, and the wire format are in
 receiver, a tunnel server, or a tunnel client. The command goes after
 `--` with its usual flags. It must be `recv --keep-listening`,
 `tunnel-server`, or `tunnel --reconnect`; without those flags a receiver
-would stop after one transfer and a client after one session. Run these
-from an elevated terminal (Run as administrator):
+would stop after one transfer and a client after one session.
+
+The service runs as SYSTEM, so mjolnir must live where only
+administrators can change it, and so must its key and authorized-keys
+files. In an elevated terminal (Run as administrator), install mjolnir
+under Program Files:
 
 ```powershell
-cd C:\mjolnir
+$env:MJOLNIR_INSTALL_DIR = "$env:ProgramFiles\mjolnir"
+irm https://raw.githubusercontent.com/mrquantumoff/mjolnir/master/scripts/install.ps1 | iex
+```
+
+Then, in a new elevated terminal, write the key, allow the sender, and
+install and start the service:
+
+```powershell
+mjolnir keygen --system --out $env:ProgramData\mjolnir\recv.key
+Set-Content $env:ProgramData\mjolnir\senders.txt "<SENDER_PUBLIC_KEY>"
+cd $env:ProgramData\mjolnir
 mjolnir service install inbox -- recv --keep-listening --key recv.key `
     --authorized senders.txt --out D:\incoming
+mjolnir service start inbox
+```
+
+A tunnel server and a tunnel client install the same way:
+
+```powershell
 mjolnir service install relay -- tunnel-server --key server.key `
     --authorized clients.txt --permit-open db.internal:5432
 mjolnir service install db -- tunnel relay.example:7778 --key client.key `
-    --peer <SERVER_PUBLIC_KEY> -L 15432:db.internal:5432 --reconnect
-mjolnir service start inbox
+    --peer "<SERVER_PUBLIC_KEY>" -L 15432:db.internal:5432 --reconnect
 ```
 
 A NAME is letters, digits, `-`, and `_`, and the service is
@@ -234,27 +257,36 @@ directory `install` ran in, so relative paths such as `--key recv.key`
 keep working. It starts at boot, or with `--manual` only on `mjolnir
 service start NAME`. `install` does not start it.
 
-`mjolnir service start NAME` and `stop NAME` start and stop it.
-`status NAME` prints its state, its PID while it runs, the command, and
-the log file. `uninstall NAME` stops it if it runs, then removes it.
-Install, uninstall, start, and stop need an elevated terminal and fail
-with "access denied" without one. `status` works from any terminal.
+`mjolnir service start NAME` and `stop NAME` start and stop it. `start`
+waits until the service runs and watches it for 2 more seconds; one that
+stops in that time is reported as failed, with its exit code and log
+file. `status NAME` prints its state, its PID while it runs, the
+command, and the log file. `uninstall NAME` stops it if it runs, then
+removes it. Install, uninstall, start, and stop need an elevated
+terminal and fail with "access denied" without one. `status` works from
+any terminal. An `install` that fails partway leaves no service behind.
 
 The service runs as LocalSystem, so it reads keys and writes files as
 SYSTEM. Received files take the access list of their `--out` directory.
-`install` refuses a key that LocalSystem would refuse, which includes a
-key `keygen` wrote, since that key also grants your account. The error
-names the `icacls` command that removes your account and keeps SYSTEM
-and Administrators; after it, read the key from an elevated terminal.
-SYSTEM runs the binary, so keep it in a directory only administrators
-can change, such as `C:\Program Files\mjolnir`, rather than the per-user
-folder `install.ps1` uses.
+`install` refuses, and the service refuses again each time it starts,
+when an account other than SYSTEM, Administrators, and TrustedInstaller
+can change the mjolnir binary or its folder, the key, or the
+authorized-keys file, or can replace one of them through a folder above
+it. The error names those accounts. `keygen --system` writes a key that
+passes, and creates its folder the same way if it is missing; read the
+key with `mjolnir pubkey` from an elevated terminal. A key `keygen`
+wrote without `--system` also grants your account, so `install` refuses
+it and names the `icacls` command that would fix it.
 
 Stderr goes to `%ProgramData%\mjolnir\NAME.log`, or to the file `--log
-PATH` names. Each line starts with a UTC timestamp, and the file is
-appended to across restarts. It holds the start lines, a summary per
-transfer, failed handshakes and sessions, and why the service stopped,
-but no per-second progress lines.
+PATH` names. `install` creates a missing log folder owned by
+Administrators, with full control for SYSTEM and Administrators, read
+access for Users, and nothing inherited. It refuses a log folder that
+another account can change or add files to, and a log path that is a
+link. Each line starts with a UTC timestamp, and the file is appended to
+across restarts. It holds the start lines, a summary per transfer,
+failed handshakes and sessions, and why the service stopped, but no
+per-second progress lines.
 
 `stop` ends the command the way Ctrl-C ends a tunnel: streams reset the
 connections they carried. A receiver cancels its transfer, which resumes
