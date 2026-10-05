@@ -125,6 +125,9 @@ jobs:
     permissions:
       contents: write
     steps:
+      # For the public release key in scripts/install.sh.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           path: dist
@@ -133,6 +136,33 @@ jobs:
       - name: Checksums
         working-directory: dist
         run: sha256sum mjolnir-* > SHA256SUMS
+
+      # Fails without the secret, so no release publishes unsigned. The check
+      # against the key in install.sh, which a unit test ties to the key in
+      # the binary, catches a secret that does not match what users trust.
+      - name: Sign
+        working-directory: dist
+        env:
+          RELEASE_SIGNING_KEY: ${{ secrets.RELEASE_SIGNING_KEY }}
+        run: |
+          if [ -z "$RELEASE_SIGNING_KEY" ]; then
+            echo "::error::the RELEASE_SIGNING_KEY secret is not set"
+            exit 1
+          fi
+          key="$RUNNER_TEMP/release-signing-key.pem"
+          trap 'rm -f "$key"' EXIT
+          (umask 077 && printf '%s\n' "$RELEASE_SIGNING_KEY" > "$key")
+          openssl dgst -sha256 -sign "$key" -out SHA256SUMS.sig SHA256SUMS
+          rm -f "$key"
+
+          release_key="$(sed -n 's/^release_key="\(.*\)"$/\1/p' "$GITHUB_WORKSPACE/scripts/install.sh")"
+          {
+            echo "-----BEGIN PUBLIC KEY-----"
+            echo "$release_key" | fold -w 64
+            echo "-----END PUBLIC KEY-----"
+          } > "$RUNNER_TEMP/release-key.pub.pem"
+          openssl dgst -sha256 -verify "$RUNNER_TEMP/release-key.pub.pem" \
+            -signature SHA256SUMS.sig SHA256SUMS
 
       - name: Publish
         env:

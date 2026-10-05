@@ -373,8 +373,26 @@ git push origin v0.2.0
 ```
 
 The release holds `mjolnir-<target>.tar.gz` for Linux and macOS,
-`mjolnir-<target>.zip` for Windows, and a `SHA256SUMS` file covering them,
-which is the layout the install scripts and `mjolnir update` expect.
+`mjolnir-<target>.zip` for Windows, a `SHA256SUMS` file covering them, and
+`SHA256SUMS.sig`, which is the layout the install scripts and
+`mjolnir update` expect.
+
+The release job signs `SHA256SUMS` with the ECDSA P-256 private key in the
+repository secret `RELEASE_SIGNING_KEY`, a PEM file such as
+`openssl ecparam -name prime256v1 -genkey -noout` writes. It writes the key
+to a file only the runner's user can read, signs, and deletes the file.
+Then it checks the signature against the public key in
+[`scripts/install.sh`](scripts/install.sh), so a secret that does not match
+the key users have fails the release. Without the secret the job fails and
+nothing is published. The public key appears in `scripts/install.sh`,
+`scripts/install.ps1`, and `RELEASE_KEY` in [`src/update.rs`](src/update.rs),
+and a unit test fails if the three differ. To rotate the key, generate a new
+one, put its base64 SubjectPublicKeyInfo DER
+(`openssl pkey -in key.pem -pubout -outform DER | openssl base64 -A`) in all
+three places, and
+replace the secret. Binaries released before the rotation trust only the old
+key, so `mjolnir update` refuses later releases until reinstalled with the
+scripts.
 
 ## License
 
