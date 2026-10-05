@@ -131,7 +131,7 @@ jobs:
     # A known-vulnerable dependency stops the release.
     needs: [build, audit]
     # Only a pushed tag publishes. A manual run started on a tag has the same
-    # ref, and the README promises that manual runs publish nothing.
+    # ref, and docs/RELEASING.md promises that manual runs publish nothing.
     if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     permissions:

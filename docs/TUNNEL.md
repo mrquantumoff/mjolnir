@@ -102,7 +102,7 @@ holds its port, even on another address, since Windows would otherwise let
 `127.0.0.1:P` take the loopback traffic of a service on `0.0.0.0:P`.
 
 Either side can run as a Windows service or a systemd unit; see [Running
-as a Windows service](../README.md#running-as-a-windows-service).
+as a Windows service](SERVICE.md).
 
 ## Permissions
 
