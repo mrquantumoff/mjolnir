@@ -540,12 +540,11 @@ fn run_service(cmd: ServiceCmd) -> Result<()> {
                 "--cwd".into(),
                 std::env::current_dir()?.into(),
                 "--log".into(),
-                log.into(),
+                log.clone().into(),
                 "--".into(),
             ];
             args.extend(command);
-            let exe = std::env::current_exe()?;
-            service::install(&name, &exe, &args, service_key(&parsed), manual)?;
+            service::install(&name, &args, &service_inputs(&parsed), &log, manual)?;
             println!(
                 "installed service {}; start it with `mjolnir service start {}`",
                 name.service(),
@@ -569,16 +568,14 @@ fn run_service(cmd: ServiceCmd) -> Result<()> {
             if let Some(failure) = status.failure {
                 println!("last stop: {failure}");
             }
-            match Cli::try_parse_from(&status.command).map(|cli| cli.cmd) {
-                Ok(Cmd::Service(ServiceCmd::Run {
-                    cwd, log, command, ..
-                })) => {
+            match installed_run(&status.command) {
+                Some((cwd, log, command)) => {
                     let command = service::command_line(command.iter().map(AsRef::as_ref));
                     println!("command: mjolnir {}", command.display());
                     println!("directory: {}", cwd.display());
                     println!("log: {}", log.display());
                 }
-                _ => {
+                None => {
                     let line = service::command_line(status.command.iter().map(AsRef::as_ref));
                     println!("command line: {}", line.display());
                 }
@@ -594,7 +591,9 @@ fn run_service(cmd: ServiceCmd) -> Result<()> {
             log,
             command,
         } => service::run(&name, cwd, log, move || {
-            run(parse_service_command(&command)?, false)
+            let cmd = parse_service_command(&command)?;
+            service::check_inputs(&service_inputs(&cmd))?;
+            run(cmd, false)
         })?,
     }
     Ok(())
@@ -625,10 +624,34 @@ fn parse_service_command(args: &[OsString]) -> Result<Cmd> {
 }
 
 #[cfg(windows)]
-fn service_key(cmd: &Cmd) -> &std::path::Path {
+fn service_inputs(cmd: &Cmd) -> service::Inputs<'_> {
     match cmd {
-        Cmd::Recv { key, .. } | Cmd::Tunnel { key, .. } | Cmd::TunnelServer { key, .. } => key,
+        Cmd::Recv {
+            key, authorized, ..
+        }
+        | Cmd::TunnelServer {
+            key, authorized, ..
+        } => service::Inputs {
+            key,
+            authorized: authorized.as_deref(),
+        },
+        Cmd::Tunnel { key, .. } => service::Inputs {
+            key,
+            authorized: None,
+        },
         _ => unreachable!("parse_service_command accepts only these"),
+    }
+}
+
+/// The `service run` arguments of a service's command line, if `install`
+/// wrote it: the directory, the log, and the command.
+#[cfg(windows)]
+fn installed_run(command_line: &[OsString]) -> Option<(PathBuf, PathBuf, Vec<OsString>)> {
+    match Cli::try_parse_from(command_line).ok()?.cmd {
+        Cmd::Service(ServiceCmd::Run {
+            cwd, log, command, ..
+        }) => Some((cwd, log, command)),
+        _ => None,
     }
 }
 
@@ -852,7 +875,7 @@ mod tests {
             "tunnel h:7778 --key k.key --peer PEER -L 1:db:5432 --reconnect",
         ] {
             let cmd = parse(ok).unwrap_or_else(|e| panic!("{ok}: {e:#}"));
-            assert_eq!(service_key(&cmd), std::path::Path::new("k.key"));
+            assert_eq!(service_inputs(&cmd).key, std::path::Path::new("k.key"));
         }
         for (bad, says) in [
             ("recv --key k.key", "--keep-listening"),

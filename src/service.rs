@@ -6,6 +6,7 @@ use std::ffi::{OsStr, OsString};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufRead, BufReader, Write};
 use std::os::windows::ffi::{OsStrExt, OsStringExt};
+use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
 use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
 use std::path::{Path, PathBuf};
 use std::ptr::{null, null_mut};
@@ -29,6 +30,9 @@ use windows_sys::Win32::Foundation::{
     ERROR_SERVICE_MARKED_FOR_DELETE, ERROR_SERVICE_NEVER_STARTED, ERROR_SERVICE_NOT_ACTIVE, HANDLE,
     LocalFree,
 };
+use windows_sys::Win32::Storage::FileSystem::{
+    FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_OPEN_REPARSE_POINT,
+};
 use windows_sys::Win32::System::Console::{GetStdHandle, STD_ERROR_HANDLE, SetStdHandle};
 use windows_sys::Win32::System::Pipes::CreatePipe;
 use windows_sys::Win32::System::Services::{
@@ -38,7 +42,7 @@ use windows_sys::Win32::System::Services::{
 };
 use windows_sys::Win32::UI::Shell::CommandLineToArgvW;
 
-use crate::{PrivateKey, printable, shutdown};
+use crate::{PrivateKey, printable, shutdown, winacl};
 
 /// After a failure the service manager restarts the service this long
 /// later, up to `RESTARTS` times until a day passes without a failure.
@@ -89,15 +93,96 @@ impl ServiceName {
     }
 }
 
-/// Installs service `mjolnir-NAME` that runs `exe` with `args` as
+/// What a service's command trusts besides this binary: its private key
+/// and, for `recv` and `tunnel-server`, its authorized-keys file.
+pub struct Inputs<'a> {
+    pub key: &'a Path,
+    pub authorized: Option<&'a Path>,
+}
+
+const PROTECTED: &str = "accounts other than SYSTEM, Administrators, and TrustedInstaller";
+
+/// Refuses what a service running as SYSTEM must not trust: this binary
+/// or its folder, the key, or the authorized-keys file, when an account
+/// outside SYSTEM, Administrators, and TrustedInstaller can change it, and
+/// a key LocalSystem would refuse to read.
+pub fn check_inputs(inputs: &Inputs) -> Result<()> {
+    let exe = std::env::current_exe()?;
+    let folder = exe.parent().context("the binary has no folder")?;
+    let mut writers = winacl::outside_writers(&exe)?;
+    writers.extend(winacl::outside_writers(folder)?);
+    if !writers.is_empty() {
+        bail!(
+            "mjolnir runs as SYSTEM from {}, which {PROTECTED} can change ({}); install it \
+             under Program Files from an elevated terminal with \
+             `$env:MJOLNIR_INSTALL_DIR = \"$env:ProgramFiles\\mjolnir\"; irm \
+             https://raw.githubusercontent.com/mrquantumoff/mjolnir/master/scripts/install.ps1 \
+             | iex`, then install the service with that copy",
+            exe.display(),
+            writers.join("; ")
+        );
+    }
+    PrivateKey::check_for_local_system(inputs.key).context(
+        "the service runs as LocalSystem, which would refuse this key; write a new one with \
+         `mjolnir keygen --system --out PATH` from an elevated terminal, or restrict this one",
+    )?;
+    require_protected(
+        "private key",
+        inputs.key,
+        "write a new one with `mjolnir keygen --system --out PATH` from an elevated terminal, \
+         in a folder only administrators can change, such as %ProgramData%\\mjolnir",
+    )?;
+    if let Some(authorized) = inputs.authorized {
+        require_protected(
+            "authorized keys file",
+            authorized,
+            "keep it in a folder only administrators can change, such as \
+             %ProgramData%\\mjolnir, and write it from an elevated terminal",
+        )?;
+    }
+    Ok(())
+}
+
+fn require_protected(what: &str, path: &Path, fix: &str) -> Result<()> {
+    let writers = winacl::outside_writers(path)?;
+    if !writers.is_empty() {
+        bail!(
+            "{what} {} can be changed by {PROTECTED} ({}); {fix}",
+            path.display(),
+            writers.join("; ")
+        );
+    }
+    Ok(())
+}
+
+/// Creates the log's folder if it is missing, with an access list only
+/// SYSTEM and Administrators can change, and refuses a folder that anyone
+/// else can change or add files to.
+fn prepare_log_dir(log: &Path) -> Result<()> {
+    let dir = log.parent().context("the log path has no folder")?;
+    match fs::symlink_metadata(dir) {
+        Err(e) if e.kind() == io::ErrorKind::NotFound => winacl::create_protected_dir(dir)
+            .with_context(|| format!("creating {}", dir.display()))?,
+        Err(e) => return Err(e).with_context(|| format!("reading {}", dir.display())),
+        Ok(_) => {}
+    }
+    require_protected(
+        "log folder",
+        dir,
+        "move it aside and install again, which creates it with an access list only SYSTEM \
+         and Administrators can change, or pass --log in a folder only they can change",
+    )
+}
+
+/// Installs service `mjolnir-NAME` that runs this binary with `args` as
 /// LocalSystem, starting at boot unless `manual`, and restarting after a
-/// failure. `key` is the private key the command loads, which must pass the
-/// key check as LocalSystem. The service is not started.
+/// failure. Refuses what [`check_inputs`] refuses, and an unprotected log
+/// folder. It is not started.
 pub fn install(
     name: &ServiceName,
-    exe: &Path,
     args: &[OsString],
-    key: &Path,
+    inputs: &Inputs,
+    log: &Path,
     manual: bool,
 ) -> Result<()> {
     let manager = unsafe { OpenSCManagerW(null(), null(), SC_MANAGER_CREATE_SERVICE) };
@@ -105,8 +190,9 @@ pub fn install(
         return Err(explain(name, io::Error::last_os_error().into()));
     }
     let manager = ScHandle(manager);
-    PrivateKey::check_for_local_system(key)
-        .context("the service runs as LocalSystem, which would refuse its key")?;
+    check_inputs(inputs)?;
+    prepare_log_dir(log)?;
+    let exe = std::env::current_exe()?;
     let line = command_line(std::iter::once(exe.as_os_str()).chain(args.iter().map(AsRef::as_ref)));
     let start = if manual {
         SERVICE_DEMAND_START
@@ -224,8 +310,13 @@ pub fn status(name: &ServiceName) -> Result<Status> {
 
 fn exit_reason(code: ServiceExitCode) -> Option<&'static str> {
     match code {
-        ServiceExitCode::ServiceSpecific(EXIT_FAILED) => Some("the command failed; see its log"),
-        ServiceExitCode::ServiceSpecific(EXIT_NO_LOG) => Some("it could not open its log file"),
+        ServiceExitCode::ServiceSpecific(EXIT_FAILED) => {
+            Some("the command failed or was refused; see its log")
+        }
+        ServiceExitCode::ServiceSpecific(EXIT_NO_LOG) => Some(
+            "it could not open its log, or refused an unprotected log folder or a log path \
+             that is a link",
+        ),
         ServiceExitCode::Win32(0 | ERROR_SERVICE_NEVER_STARTED) => None,
         _ => Some("the process ended without reporting why; see its log"),
     }
@@ -375,7 +466,7 @@ fn serve(service: &str, cwd: &Path, log: &Path, command: impl FnOnce() -> Result
             process_id: None,
         });
     };
-    let Ok(log) = Log::start(log) else {
+    let Ok(log) = open_log(log).and_then(Log::start) else {
         report(
             ServiceState::Stopped,
             ServiceExitCode::ServiceSpecific(EXIT_NO_LOG),
@@ -409,16 +500,26 @@ fn serve(service: &str, cwd: &Path, log: &Path, command: impl FnOnce() -> Result
     report(ServiceState::Stopped, exit);
 }
 
-/// Opens the log for appending, creating it and its folder if missing.
+/// Opens the log for appending, creating it if missing, after
+/// [`prepare_log_dir`]. Refuses a log path that is a link.
 fn open_log(path: &Path) -> Result<File> {
-    if let Some(dir) = path.parent() {
-        fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
+    let is_link = |meta: fs::Metadata| meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0;
+    let refuse = || anyhow!("log {} is a link (a reparse point)", path.display());
+    if fs::symlink_metadata(path).is_ok_and(is_link) {
+        return Err(refuse());
     }
-    OpenOptions::new()
+    prepare_log_dir(path)?;
+    let file = OpenOptions::new()
         .create(true)
         .append(true)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
         .open(path)
-        .with_context(|| format!("opening log {}", path.display()))
+        .with_context(|| format!("opening log {}", path.display()))?;
+    // A link swapped in after the first look.
+    if is_link(file.metadata()?) {
+        return Err(refuse());
+    }
+    Ok(file)
 }
 
 /// Stderr pointed at a pipe that a thread copies into the log file a line
@@ -431,8 +532,7 @@ struct Log {
 }
 
 impl Log {
-    fn start(path: &Path) -> Result<Log> {
-        let file = open_log(path)?;
+    fn start(file: File) -> Result<Log> {
         let (mut read, mut write) = (null_mut(), null_mut());
         if unsafe { CreatePipe(&mut read, &mut write, null(), 0) } == 0 {
             return Err(io::Error::last_os_error().into());
@@ -625,7 +725,8 @@ mod tests {
         let path = dir.path().join(r"log dir\test.log");
         fs::create_dir(path.parent().unwrap()).unwrap();
         fs::write(&path, "earlier\n").unwrap();
-        let log = Log::start(&path).unwrap();
+        let file = OpenOptions::new().append(true).open(&path).unwrap();
+        let log = Log::start(file).unwrap();
         io::stderr().write_all(b"from the test\n").unwrap();
         thread::spawn(|| io::stderr().write_all(b"from a thread\nunfinished"))
             .join()
@@ -642,6 +743,51 @@ mod tests {
         {
             assert!(line.ends_with(&format!("Z {want}")), "{line}");
         }
+    }
+
+    #[test]
+    fn a_log_that_is_a_link_or_behind_one_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let junction = |link: &Path| {
+            let status = std::process::Command::new("cmd")
+                .args(["/C", "mklink", "/J"])
+                .arg(link)
+                .arg(dir.path())
+                .stdout(std::process::Stdio::null())
+                .status()
+                .unwrap();
+            assert!(status.success());
+        };
+        junction(&dir.path().join("svc.log"));
+        junction(&dir.path().join("logs"));
+        for log in ["svc.log", r"logs\svc.log"] {
+            let err = format!("{:#}", open_log(&dir.path().join(log)).unwrap_err());
+            assert!(err.contains("reparse point"), "{log}: {err}");
+        }
+    }
+
+    #[test]
+    fn a_binary_under_a_user_folder_is_refused() {
+        let err = check_inputs(&Inputs {
+            key: Path::new("unused.key"),
+            authorized: None,
+        })
+        .unwrap_err();
+        let err = format!("{err:#}");
+        assert!(
+            err.contains("runs as SYSTEM") && err.contains("MJOLNIR_INSTALL_DIR"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn an_unprotected_log_folder_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let err = format!("{:#}", open_log(&dir.path().join("svc.log")).unwrap_err());
+        assert!(
+            err.contains("log folder") && err.contains("can be changed by"),
+            "{err}"
+        );
     }
 
     #[test]

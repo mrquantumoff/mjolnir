@@ -1,27 +1,56 @@
-//! Reading and writing Windows access lists.
+//! Reading and writing Windows access lists: the key-file checks, and the
+//! check that nobody but SYSTEM, Administrators, and TrustedInstaller can
+//! change what a service running as SYSTEM trusts.
 
 use std::ffi::{OsStr, c_void};
+use std::fs;
 use std::io;
 use std::os::windows::ffi::OsStrExt;
+use std::os::windows::fs::MetadataExt;
 use std::path::Path;
 use std::ptr::null_mut;
 
-use windows_sys::Win32::Foundation::{CloseHandle, ERROR_SUCCESS, HANDLE, LocalFree};
+use anyhow::{Context, Result, bail};
+use windows_sys::Win32::Foundation::{
+    CloseHandle, ERROR_SUCCESS, GENERIC_ALL, GENERIC_WRITE, HANDLE, INVALID_HANDLE_VALUE, LocalFree,
+};
 use windows_sys::Win32::Security::Authorization::{
     ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW, GetSecurityInfo,
     SDDL_REVISION_1, SE_FILE_OBJECT,
 };
 use windows_sys::Win32::Security::{
     ACCESS_ALLOWED_ACE, ACE_HEADER, ACL, DACL_SECURITY_INFORMATION, GetAce, GetTokenInformation,
-    INHERIT_ONLY_ACE, INHERITED_ACE, LookupAccountSidW, PSECURITY_DESCRIPTOR, PSID,
-    SECURITY_ATTRIBUTES, TOKEN_QUERY, TOKEN_USER, TokenUser,
+    INHERIT_ONLY_ACE, INHERITED_ACE, IsWellKnownSid, LookupAccountSidW, OWNER_SECURITY_INFORMATION,
+    PSECURITY_DESCRIPTOR, PSID, SECURITY_ATTRIBUTES, TOKEN_QUERY, TOKEN_USER, TokenUser,
+    WinBuiltinAdministratorsSid, WinLocalSystemSid,
 };
-use windows_sys::Win32::Storage::FileSystem::CreateDirectoryW;
+use windows_sys::Win32::Storage::FileSystem::{
+    CreateDirectoryW, CreateFileW, DELETE, FILE_APPEND_DATA, FILE_ATTRIBUTE_REPARSE_POINT,
+    FILE_DELETE_CHILD, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_DELETE,
+    FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_WRITE_DATA, OPEN_EXISTING, READ_CONTROL, WRITE_DAC,
+    WRITE_OWNER,
+};
 use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 
 /// `ACCESS_ALLOWED_ACE_TYPE` and `ACCESS_ALLOWED_CALLBACK_ACE_TYPE`,
 /// which share the `ACCESS_ALLOWED_ACE` layout.
 const ALLOW_TYPES: [u8; 2] = [0, 9];
+const TRUSTED_INSTALLER: &str = "S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464";
+const OWNER_RIGHTS: &str = "S-1-3-4";
+
+/// Rights on a file that change it, or on a folder that change or add to
+/// what it holds.
+const CHANGE: u32 = FILE_WRITE_DATA
+    | FILE_APPEND_DATA
+    | FILE_DELETE_CHILD
+    | DELETE
+    | WRITE_DAC
+    | WRITE_OWNER
+    | GENERIC_WRITE
+    | GENERIC_ALL;
+/// Rights on a folder above a path that let an account move what the path
+/// names aside and put something else there.
+const REPLACE: u32 = FILE_DELETE_CHILD | DELETE | WRITE_DAC | WRITE_OWNER | GENERIC_ALL;
 
 /// Memory the system allocated with `LocalAlloc`.
 pub(crate) struct Local(pub(crate) *mut c_void);
@@ -118,21 +147,23 @@ pub(crate) fn descriptor(sddl: &str) -> io::Result<Local> {
     Ok(Local(sd))
 }
 
-/// The DACL of an open handle, which points into `_sd`.
+/// The owner and DACL of an open handle; both point into `_sd`.
 pub(crate) struct Security {
+    pub(crate) owner: PSID,
     pub(crate) dacl: *mut ACL,
     _sd: Local,
 }
 
 impl Security {
     pub(crate) fn of(handle: HANDLE) -> io::Result<Security> {
-        let (mut dacl, mut sd): (*mut ACL, PSECURITY_DESCRIPTOR) = (null_mut(), null_mut());
+        let (mut owner, mut dacl, mut sd): (PSID, *mut ACL, PSECURITY_DESCRIPTOR) =
+            (null_mut(), null_mut(), null_mut());
         let err = unsafe {
             GetSecurityInfo(
                 handle,
                 SE_FILE_OBJECT,
-                DACL_SECURITY_INFORMATION,
-                null_mut(),
+                OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
+                &mut owner,
                 null_mut(),
                 &mut dacl,
                 null_mut(),
@@ -143,6 +174,7 @@ impl Security {
             return Err(io::Error::from_raw_os_error(err as i32));
         }
         Ok(Security {
+            owner,
             dacl,
             _sd: Local(sd),
         })
@@ -172,6 +204,79 @@ impl Security {
     }
 }
 
+/// SYSTEM, Administrators, or TrustedInstaller.
+fn is_admin(sid: PSID) -> io::Result<bool> {
+    Ok(unsafe {
+        IsWellKnownSid(sid, WinLocalSystemSid) != 0
+            || IsWellKnownSid(sid, WinBuiltinAdministratorsSid) != 0
+    } || sid_string(sid)? == TRUSTED_INSTALLER)
+}
+
+/// Opens `path` itself, not what a link there points to, to read its
+/// security.
+fn open_for_security(path: &Path) -> io::Result<fs::File> {
+    use std::os::windows::io::FromRawHandle;
+    let handle = unsafe {
+        CreateFileW(
+            wide(path.as_os_str()).as_ptr(),
+            READ_CONTROL,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            null_mut(),
+            OPEN_EXISTING,
+            FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
+            null_mut(),
+        )
+    };
+    if handle == INVALID_HANDLE_VALUE {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(unsafe { fs::File::from_raw_handle(handle) })
+}
+
+/// The accounts other than SYSTEM, Administrators, and TrustedInstaller
+/// that can change `path`, add files to it if it is a folder, or replace
+/// it through a folder above it, each with where it can. Empty when there
+/// are none. Refuses a path that is itself a link.
+pub(crate) fn outside_writers(path: &Path) -> Result<Vec<String>> {
+    use std::os::windows::io::AsRawHandle;
+    let path = std::path::absolute(path)?;
+    let meta =
+        fs::symlink_metadata(&path).with_context(|| format!("reading {}", path.display()))?;
+    if meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+        bail!("{} is a link (a reparse point)", path.display());
+    }
+    let mut found = Vec::new();
+    let levels = std::iter::once((path.as_path(), CHANGE))
+        .chain(path.ancestors().skip(1).map(|dir| (dir, REPLACE)));
+    for (at, rights) in levels {
+        let file = open_for_security(at)
+            .with_context(|| format!("reading the permissions of {}", at.display()))?;
+        let security = Security::of(file.as_raw_handle())?;
+        let mut note = |who: String| {
+            let entry = format!("{who} on {}", at.display());
+            if !found.contains(&entry) {
+                found.push(entry);
+            }
+        };
+        let owner_trusted = is_admin(security.owner)?;
+        if !owner_trusted {
+            note(format!("owner {}", account(security.owner)?));
+        }
+        let Some(allowed) = security.allowed()? else {
+            note("everyone (no access list)".into());
+            continue;
+        };
+        for (sid, mask, _) in allowed {
+            // OWNER RIGHTS grants whoever owns it, judged above.
+            let owner_rights = sid_string(sid)? == OWNER_RIGHTS;
+            if mask & rights != 0 && !is_admin(sid)? && !(owner_rights && owner_trusted) {
+                note(account(sid)?);
+            }
+        }
+    }
+    Ok(found)
+}
+
 /// Creates the folder `dir`, owned by Administrators, with an access list
 /// that inherits nothing: full control for SYSTEM and Administrators, read
 /// and execute for Users. Setting that owner needs an elevated process.
@@ -183,4 +288,65 @@ pub(crate) fn create_protected_dir(dir: &Path) -> io::Result<()> {
         bInheritHandle: 0,
     };
     check_bool(unsafe { CreateDirectoryW(wide(dir.as_os_str()).as_ptr(), &attrs) })
+}
+
+#[cfg(test)]
+mod tests {
+    use std::process::{Command, Stdio};
+
+    use super::*;
+
+    fn icacls(path: &Path, args: &[&str]) {
+        let status = Command::new("icacls")
+            .arg(path)
+            .args(args)
+            .stdout(Stdio::null())
+            .status()
+            .unwrap();
+        assert!(status.success());
+    }
+
+    #[test]
+    fn a_file_everyone_can_write_has_outside_writers() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("authorized.txt");
+        fs::write(&path, "").unwrap();
+        icacls(&path, &["/grant", "*S-1-1-0:W"]);
+        let found = outside_writers(&path).unwrap();
+        assert!(
+            found
+                .iter()
+                .any(|w| w.contains("S-1-1-0") && w.contains("authorized.txt")),
+            "{found:?}"
+        );
+    }
+
+    #[test]
+    fn system_files_have_none() {
+        let root = std::env::var_os("SystemRoot").unwrap();
+        let system32 = Path::new(&root).join("System32");
+        for path in [system32.join("cmd.exe"), system32] {
+            assert_eq!(
+                outside_writers(&path).unwrap(),
+                Vec::<String>::new(),
+                "{path:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_link_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let link = dir.path().join("link");
+        let status = Command::new("cmd")
+            .args(["/C", "mklink", "/J"])
+            .arg(&link)
+            .arg(std::env::var_os("SystemRoot").unwrap())
+            .stdout(Stdio::null())
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let err = format!("{:#}", outside_writers(&link).unwrap_err());
+        assert!(err.contains("reparse point"), "{err}");
+    }
 }
