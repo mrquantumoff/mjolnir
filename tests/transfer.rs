@@ -1,8 +1,9 @@
 use std::fs;
 use std::net::SocketAddr;
+use std::ops::ControlFlow;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::atomic::Ordering::Relaxed;
+use std::sync::{Arc, mpsc};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime};
 
@@ -69,11 +70,18 @@ fn start_receiver(key: PrivateKey, authorized: Vec<PublicKey>, out: &Path) -> Ru
 }
 
 fn start(cfg: RecvConfig) -> RunningReceiver {
+    start_serving(cfg, ControlFlow::Break)
+}
+
+fn start_serving(
+    cfg: RecvConfig,
+    each: impl FnMut(RecvReport) -> ControlFlow<RecvReport> + std::marker::Send + 'static,
+) -> RunningReceiver {
     let receiver = Receiver::bind(cfg).unwrap();
     let progress = Arc::new(Progress::default());
     let (addr, public) = (receiver.local_addr(), receiver.public_key());
     let p = progress.clone();
-    let handle = thread::spawn(move || receiver.run(p));
+    let handle = thread::spawn(move || receiver.serve(p, each));
     RunningReceiver {
         addr,
         public,
@@ -82,12 +90,42 @@ fn start(cfg: RecvConfig) -> RunningReceiver {
     }
 }
 
+/// A receiver that keeps serving and sends each finished transfer's report
+/// down the returned channel.
+fn start_listening(cfg: RecvConfig) -> (RunningReceiver, mpsc::Receiver<RecvReport>) {
+    let (tx, reports) = mpsc::channel();
+    let rx = start_serving(cfg, move |report| {
+        tx.send(report).unwrap();
+        ControlFlow::Continue(())
+    });
+    (rx, reports)
+}
+
+fn next_report(reports: &mpsc::Receiver<RecvReport>) -> RecvReport {
+    reports
+        .recv_timeout(Duration::from_secs(10))
+        .expect("a report for the finished transfer")
+}
+
+/// Cancels a listening receiver, which must end with `Cancelled::Local`
+/// and must not have reported a transfer the test did not take.
+fn stop_listening(rx: RunningReceiver, reports: mpsc::Receiver<RecvReport>) {
+    rx.progress.cancel();
+    let err = rx.join().unwrap_err();
+    assert_eq!(
+        err.downcast_ref::<Cancelled>(),
+        Some(&Cancelled::Local),
+        "{err:#}"
+    );
+    assert_eq!(reports.try_iter().count(), 0, "one report per transfer");
+}
+
 impl RunningReceiver {
     fn join(self) -> Result<RecvReport> {
         self.handle.join().unwrap()
     }
 
-    /// Still serving after a failed session: back to `Connecting` once the
+    /// Still serving after a session: back to `Connecting` once the
     /// session winds down, and still there a moment later. Winding down
     /// takes one socket poll, but a loaded runner can stretch that past any
     /// fixed sleep, so wait for the phase rather than for a set time.
@@ -275,6 +313,122 @@ fn wrong_pinned_receiver_key_fails_and_receiver_keeps_waiting() {
     Send::to(sk, rx.public).run(rx.addr, &[&file]).unwrap();
     rx.join().unwrap();
     assert_file_eq(&file, &out.path().join("f.bin"));
+}
+
+#[test]
+fn a_listening_receiver_serves_one_transfer_after_another() {
+    let src = TempDir::new().unwrap();
+    let first = src.path().join("first");
+    write(&first.join("a.bin"), &noise(300_000, 20));
+    write(&first.join("sub/b.bin"), &noise(5 * CHUNK as usize, 21));
+    let second = src.path().join("second.bin");
+    write(&second, &noise(200_003, 22));
+    let out = TempDir::new().unwrap();
+    let (rk, _) = keypair();
+    let (alice, alice_pub) = keypair();
+    let (bob, bob_pub) = keypair();
+    let mut cfg = recv_config(rk, vec![alice_pub, bob_pub], out.path());
+    cfg.force = true;
+    let (rx, reports) = start_listening(cfg);
+
+    Send::to(alice.clone(), rx.public)
+        .run(rx.addr, &[&first])
+        .unwrap();
+    let report = next_report(&reports);
+    assert_eq!((report.peer, report.files), (alice_pub, 2));
+    rx.assert_waiting();
+
+    Send::to(bob, rx.public).run(rx.addr, &[&second]).unwrap();
+    let report = next_report(&reports);
+    assert_eq!((report.peer, report.files), (bob_pub, 1));
+    rx.assert_waiting();
+    assert_eq!(tree(out.path()), tree(src.path()));
+
+    write(&first.join("a.bin"), &noise(250_000, 23));
+    Send::to(alice, rx.public).run(rx.addr, &[&first]).unwrap();
+    let report = next_report(&reports);
+    assert_eq!((report.peer, report.files), (alice_pub, 2));
+    rx.assert_waiting();
+    assert_eq!(tree(out.path()), tree(src.path()));
+
+    stop_listening(rx, reports);
+}
+
+#[test]
+fn a_listening_receiver_outlives_failed_sessions() {
+    let src = TempDir::new().unwrap();
+    let (a, b) = (src.path().join("a.bin"), src.path().join("b.bin"));
+    write(&a, &noise(100_000, 24));
+    write(&b, &noise(120_000, 25));
+    let out = TempDir::new().unwrap();
+    let (rk, _) = keypair();
+    let (good, good_pub) = keypair();
+    let (bad, _) = keypair();
+    let (rx, reports) = start_listening(recv_config(rk, vec![good_pub], out.path()));
+
+    Send::to(good.clone(), rx.public)
+        .run(rx.addr, &[&a])
+        .unwrap();
+    next_report(&reports);
+    rx.assert_waiting();
+
+    let err = Send::to(bad, rx.public).run(rx.addr, &[&b]).unwrap_err();
+    assert_eq!(err.to_string(), REJECTED);
+    rx.assert_waiting();
+    let err = Send::to(good.clone(), rx.public)
+        .run(rx.addr, &[&a])
+        .unwrap_err();
+    assert!(format!("{err:#}").contains("already exists"), "{err:#}");
+    rx.assert_waiting();
+
+    Send::to(good, rx.public).run(rx.addr, &[&b]).unwrap();
+    assert_eq!(next_report(&reports).files, 1);
+    rx.assert_waiting();
+    assert_eq!(tree(out.path()), tree(src.path()));
+
+    stop_listening(rx, reports);
+}
+
+#[test]
+fn a_listening_receiver_resumes_an_interrupted_transfer() {
+    let src = TempDir::new().unwrap();
+    let small = src.path().join("small.bin");
+    write(&small, &noise(70_000, 26));
+    let big = big_source(&src, 32);
+    let total_chunks = (32u64 << 20) / u64::from(CHUNK);
+    let out = TempDir::new().unwrap();
+    let (rk, _) = keypair();
+    let (sk, spub) = keypair();
+    let (rx, reports) = start_listening(recv_config(rk, vec![spub], out.path()));
+    let mut send = Send::to(sk, rx.public);
+    send.connections = 4;
+
+    send.run(rx.addr, &[&small]).unwrap();
+    next_report(&reports);
+    rx.assert_waiting();
+
+    let progress = Arc::new(Progress::default());
+    let cancelled = cancel_when(progress.clone(), 8 << 20);
+    let err = mjolnir::send(send.config(rx.addr, &[&big]), progress).unwrap_err();
+    cancelled.join().unwrap();
+    assert_eq!(
+        err.downcast_ref::<Cancelled>(),
+        Some(&Cancelled::Local),
+        "{err:#}"
+    );
+    rx.assert_waiting();
+
+    let sent = send.run(rx.addr, &[&big]).unwrap();
+    let received = next_report(&reports);
+    assert!(
+        sent.chunks_sent < total_chunks && received.chunks_received < total_chunks,
+        "resumed run moved {} of {total_chunks} chunks",
+        received.chunks_received
+    );
+    rx.assert_waiting();
+    assert_eq!(tree(out.path()), tree(src.path()));
+
+    stop_listening(rx, reports);
 }
 
 /// The staging directory a transfer of `file` from `sender` into `out` uses.

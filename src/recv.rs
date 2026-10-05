@@ -6,6 +6,7 @@ use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
 use std::io::{self, BufReader, ErrorKind, Read, Write};
 use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream};
+use std::ops::ControlFlow;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering::Relaxed};
 use std::sync::mpsc::{self, RecvTimeoutError};
@@ -91,7 +92,7 @@ pub fn recv(cfg: RecvConfig, progress: Arc<Progress>) -> Result<RecvReport> {
     Receiver::bind(cfg)?.run(progress)
 }
 
-/// A bound, not yet running receiver. Serves exactly one transfer.
+/// A bound, not yet running receiver.
 pub struct Receiver {
     listener: TcpListener,
     cfg: RecvConfig,
@@ -162,17 +163,29 @@ impl Receiver {
         self.cfg.key.public_key()
     }
 
-    /// Blocks until the transfer finishes, fails, or is cancelled.
+    /// Blocks until one transfer finishes, or until cancelled.
     pub fn run(self, progress: Arc<Progress>) -> Result<RecvReport> {
-        progress.conclude(self.run_inner(&progress))
+        self.serve(progress, ControlFlow::Break)
     }
 
-    /// Serves sessions until one completes. Handshakes run on their own
-    /// threads, so a slow or hostile peer cannot hold up a real sender. A
-    /// failed handshake or a failed session is logged and the receiver
-    /// waits for the next sender; only a finished transfer or a local
-    /// cancel returns.
-    fn run_inner(&self, progress: &Arc<Progress>) -> Result<RecvReport> {
+    /// Serves transfers one after another and hands each finished one's
+    /// report to `each`, until `each` breaks or the receiver is cancelled.
+    pub fn serve<B>(
+        self,
+        progress: Arc<Progress>,
+        each: impl FnMut(RecvReport) -> ControlFlow<B>,
+    ) -> Result<B> {
+        progress.conclude(self.serve_inner(&progress, each))
+    }
+
+    /// Handshakes run on their own threads, so a slow or hostile peer
+    /// cannot hold up a real sender. A failed handshake or a failed session
+    /// is logged and the receiver waits for the next sender.
+    fn serve_inner<B>(
+        &self,
+        progress: &Arc<Progress>,
+        mut each: impl FnMut(RecvReport) -> ControlFlow<B>,
+    ) -> Result<B> {
         let (done_tx, done_rx) = mpsc::channel::<Handshaken>();
         let permits = Permits::new(MAX_PENDING_HANDSHAKES);
         let authorized = Arc::new(self.cfg.authorized.clone());
@@ -222,11 +235,16 @@ impl Receiver {
             let h = match done_rx.recv_timeout(wait) {
                 Ok(h) => h,
                 Err(RecvTimeoutError::Timeout) => continue,
-                Err(RecvTimeoutError::Disconnected) => unreachable!("run_inner holds a sender"),
+                Err(RecvTimeoutError::Disconnected) => unreachable!("serve_inner holds a sender"),
             };
             let peer = h.peer;
             match self.session(h, progress) {
-                Ok(report) => return Ok(report),
+                Ok(report) => {
+                    progress.set_phase(Phase::Done);
+                    if let ControlFlow::Break(b) = each(report) {
+                        return Ok(b);
+                    }
+                }
                 Err(e) if progress.is_cancelled() => return Err(e),
                 Err(e) => {
                     let e = printable::escape(&format!("{e:#}")).into_owned();
