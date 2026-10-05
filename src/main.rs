@@ -551,10 +551,16 @@ fn run_service(cmd: ServiceCmd) -> Result<()> {
                 name.as_str()
             );
         }
-        ServiceCmd::Start { name } => {
-            let pid = service::start(&name)?;
-            println!("{} is running, PID {pid}", name.service());
-        }
+        ServiceCmd::Start { name } => match service::start(&name) {
+            Ok(pid) => println!("{} is running, PID {pid}", name.service()),
+            Err(e) => {
+                let installed = service::status(&name).ok();
+                match installed.and_then(|s| installed_run(&s.command)) {
+                    Some((_, log, _)) => bail!("{e:#}; its log is {}", log.display()),
+                    None => return Err(e),
+                }
+            }
+        },
         ServiceCmd::Stop { name } => match service::stop(&name)? {
             true => println!("{} stopped", name.service()),
             false => println!("{} was not running", name.service()),

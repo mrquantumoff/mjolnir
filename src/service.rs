@@ -31,13 +31,13 @@ use windows_sys::Win32::Foundation::{
     LocalFree,
 };
 use windows_sys::Win32::Storage::FileSystem::{
-    FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_OPEN_REPARSE_POINT,
+    DELETE, FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_OPEN_REPARSE_POINT,
 };
 use windows_sys::Win32::System::Console::{GetStdHandle, STD_ERROR_HANDLE, SetStdHandle};
 use windows_sys::Win32::System::Pipes::CreatePipe;
 use windows_sys::Win32::System::Services::{
-    CloseServiceHandle, CreateServiceW, OpenSCManagerW, SC_HANDLE, SC_MANAGER_CREATE_SERVICE,
-    SERVICE_AUTO_START, SERVICE_DEMAND_START, SERVICE_ERROR_NORMAL, SERVICE_QUERY_STATUS,
+    CloseServiceHandle, CreateServiceW, DeleteService, OpenSCManagerW, SC_HANDLE,
+    SC_MANAGER_CREATE_SERVICE, SERVICE_AUTO_START, SERVICE_DEMAND_START, SERVICE_ERROR_NORMAL,
     SERVICE_WIN32_OWN_PROCESS,
 };
 use windows_sys::Win32::UI::Shell::CommandLineToArgvW;
@@ -53,6 +53,8 @@ const FAILURE_RESET: Duration = Duration::from_secs(24 * 60 * 60);
 const STOP_WAIT: Duration = Duration::from_secs(10);
 /// How long `start`, `stop`, and `uninstall` wait for the service.
 const SETTLE: Duration = Duration::from_secs(30);
+/// How long `start` keeps watching a running service for a quick failure.
+const EARLY_STOP: Duration = Duration::from_secs(2);
 
 /// Service-specific exit codes.
 const EXIT_FAILED: u32 = 1;
@@ -177,7 +179,8 @@ fn prepare_log_dir(log: &Path) -> Result<()> {
 /// Installs service `mjolnir-NAME` that runs this binary with `args` as
 /// LocalSystem, starting at boot unless `manual`, and restarting after a
 /// failure. Refuses what [`check_inputs`] refuses, and an unprotected log
-/// folder. It is not started.
+/// folder. Either the service ends up fully configured or it is not
+/// installed. It is not started.
 pub fn install(
     name: &ServiceName,
     args: &[OsString],
@@ -207,7 +210,7 @@ pub fn install(
             manager.0,
             wide(name.service().as_ref()).as_ptr(),
             wide(format!("mjolnir {}", name.0).as_ref()).as_ptr(),
-            SERVICE_QUERY_STATUS,
+            DELETE,
             SERVICE_WIN32_OWN_PROCESS,
             start,
             SERVICE_ERROR_NORMAL,
@@ -222,21 +225,27 @@ pub fn install(
     if service.is_null() {
         return Err(explain(name, io::Error::last_os_error().into()));
     }
-    drop(ScHandle(service));
-    let restart = ServiceAction {
-        action_type: ServiceActionType::Restart,
-        delay: RESTART_DELAY,
-    };
-    let service = open(name, ServiceAccess::CHANGE_CONFIG | ServiceAccess::START)?;
-    service.update_failure_actions(ServiceFailureActions {
-        reset_period: ServiceFailureResetPeriod::After(FAILURE_RESET),
-        reboot_msg: None,
-        command: None,
-        actions: Some(vec![restart; RESTARTS]),
-    })?;
-    // Otherwise only a crash counts as a failure, not a stop with an error.
-    service.set_failure_actions_on_non_crash_failures(true)?;
-    Ok(())
+    let created = ScHandle(service);
+    let configured = (|| -> Result<()> {
+        let restart = ServiceAction {
+            action_type: ServiceActionType::Restart,
+            delay: RESTART_DELAY,
+        };
+        let service = open(name, ServiceAccess::CHANGE_CONFIG | ServiceAccess::START)?;
+        service.update_failure_actions(ServiceFailureActions {
+            reset_period: ServiceFailureResetPeriod::After(FAILURE_RESET),
+            reboot_msg: None,
+            command: None,
+            actions: Some(vec![restart; RESTARTS]),
+        })?;
+        // Otherwise only a crash counts as a failure, not a stop with an error.
+        service.set_failure_actions_on_non_crash_failures(true)?;
+        Ok(())
+    })();
+    if configured.is_err() {
+        unsafe { DeleteService(created.0) };
+    }
+    configured
 }
 
 /// Starts the service and waits until it runs. Returns its PID.
@@ -247,13 +256,18 @@ pub fn start(name: &ServiceName) -> Result<u32> {
     {
         return Err(explain(name, e.into()));
     }
-    let status = settle(&service, |s| s != ServiceState::StartPending)?;
+    let mut status = settle(&service, |s| s != ServiceState::StartPending)?;
+    let watch_until = Instant::now() + EARLY_STOP;
+    while status.current_state == ServiceState::Running && Instant::now() < watch_until {
+        thread::sleep(Duration::from_millis(100));
+        status = service.query_status()?;
+    }
     match status.process_id {
         Some(pid) if status.current_state == ServiceState::Running => Ok(pid),
         _ => bail!(
-            "{} stopped right after it started: {}",
+            "{} stopped right after it started ({})",
             name.service(),
-            exit_reason(status.exit_code).unwrap_or("no reason given")
+            exit_reason(status.exit_code).unwrap_or_else(|| "no reason given".into())
         ),
     }
 }
@@ -277,7 +291,7 @@ pub struct Status {
     pub state: &'static str,
     pub pid: Option<u32>,
     /// Why a stopped service last stopped, if not because it was asked to.
-    pub failure: Option<&'static str>,
+    pub failure: Option<String>,
     /// The command line the service manager runs, split into arguments.
     pub command: Vec<OsString>,
 }
@@ -308,18 +322,22 @@ pub fn status(name: &ServiceName) -> Result<Status> {
     })
 }
 
-fn exit_reason(code: ServiceExitCode) -> Option<&'static str> {
-    match code {
+fn exit_reason(code: ServiceExitCode) -> Option<String> {
+    Some(match code {
+        ServiceExitCode::Win32(0 | ERROR_SERVICE_NEVER_STARTED) => return None,
         ServiceExitCode::ServiceSpecific(EXIT_FAILED) => {
-            Some("the command failed or was refused; see its log")
+            format!("exit code {EXIT_FAILED}: the command failed or was refused; see its log")
         }
-        ServiceExitCode::ServiceSpecific(EXIT_NO_LOG) => Some(
-            "it could not open its log, or refused an unprotected log folder or a log path \
-             that is a link",
+        ServiceExitCode::ServiceSpecific(EXIT_NO_LOG) => format!(
+            "exit code {EXIT_NO_LOG}: it could not open its log, or refused an unprotected \
+             log folder or a log path that is a link"
         ),
-        ServiceExitCode::Win32(0 | ERROR_SERVICE_NEVER_STARTED) => None,
-        _ => Some("the process ended without reporting why; see its log"),
-    }
+        ServiceExitCode::ServiceSpecific(code) => format!("exit code {code}"),
+        ServiceExitCode::Win32(code) => format!(
+            "Windows error {code}: {}",
+            io::Error::from_raw_os_error(code as i32)
+        ),
+    })
 }
 
 fn open(name: &ServiceName, access: ServiceAccess) -> Result<Service> {
