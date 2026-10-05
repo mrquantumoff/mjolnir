@@ -37,7 +37,7 @@ mod unix {
 }
 
 #[cfg(windows)]
-pub(super) use windows::{check, create};
+pub(super) use windows::{check, check_for_local_system, create};
 
 #[cfg(windows)]
 mod windows {
@@ -59,10 +59,10 @@ mod windows {
         GetSecurityInfo, SDDL_REVISION_1, SE_FILE_OBJECT,
     };
     use windows_sys::Win32::Security::{
-        ACCESS_ALLOWED_ACE, ACE_HEADER, ACL, DACL_SECURITY_INFORMATION, EqualSid, GetAce,
-        GetTokenInformation, INHERIT_ONLY_ACE, INHERITED_ACE, IsWellKnownSid, LookupAccountSidW,
-        PSID, SECURITY_ATTRIBUTES, TOKEN_QUERY, TOKEN_USER, TokenUser, WinBuiltinAdministratorsSid,
-        WinLocalSystemSid,
+        ACCESS_ALLOWED_ACE, ACE_HEADER, ACL, CreateWellKnownSid, DACL_SECURITY_INFORMATION,
+        EqualSid, GetAce, GetTokenInformation, INHERIT_ONLY_ACE, INHERITED_ACE, IsWellKnownSid,
+        LookupAccountSidW, PSID, SECURITY_ATTRIBUTES, SECURITY_MAX_SID_SIZE, TOKEN_QUERY,
+        TOKEN_USER, TokenUser, WinBuiltinAdministratorsSid, WinLocalSystemSid,
     };
     use windows_sys::Win32::Storage::FileSystem::{
         CREATE_NEW, CreateFileW, FILE_APPEND_DATA, FILE_ATTRIBUTE_NORMAL, FILE_READ_DATA,
@@ -211,6 +211,27 @@ mod windows {
     /// Fails when an allow entry in the file's DACL gives an account other
     /// than this user, SYSTEM, or Administrators a right in `SENSITIVE`.
     pub(in crate::keys) fn check(file: &File, path: &Path) -> Result<()> {
+        check_for(file, path, CurrentUser::get()?.sid())
+    }
+
+    /// [`check`] as a process running as LocalSystem would make it.
+    pub(in crate::keys) fn check_for_local_system(file: &File, path: &Path) -> Result<()> {
+        let mut sid = [0u8; SECURITY_MAX_SID_SIZE as usize];
+        let mut len = SECURITY_MAX_SID_SIZE;
+        check_bool(unsafe {
+            CreateWellKnownSid(
+                WinLocalSystemSid,
+                null_mut(),
+                sid.as_mut_ptr().cast(),
+                &mut len,
+            )
+        })?;
+        check_for(file, path, sid.as_mut_ptr().cast())
+    }
+
+    /// Fails when an allow entry in the file's DACL gives an account other
+    /// than `reader`, SYSTEM, or Administrators a right in `SENSITIVE`.
+    fn check_for(file: &File, path: &Path, reader: PSID) -> Result<()> {
         let mut dacl: *mut ACL = null_mut();
         let mut sd = null_mut();
         let err = unsafe {
@@ -230,7 +251,6 @@ mod windows {
                 .with_context(|| format!("reading the permissions of {}", path.display()));
         }
         let _free = Local(sd);
-        let user = CurrentUser::get()?;
         let fix = |explicit: &[String]| {
             let sids: String = explicit.iter().map(|sid| format!(" \"*{sid}\"")).collect();
             let remove = match explicit {
@@ -240,7 +260,7 @@ mod windows {
             format!(
                 "restrict it with `icacls \"{}\" /inheritance:r /grant:r \"*{}:F\"{remove}`",
                 path.display(),
-                sid_string(user.sid()).unwrap_or_default()
+                sid_string(reader).unwrap_or_default()
             )
         };
         if dacl.is_null() {
@@ -263,7 +283,7 @@ mod windows {
             let allow = unsafe { &*ace.cast::<ACCESS_ALLOWED_ACE>() };
             let sid: PSID = (&raw const allow.SidStart).cast_mut().cast();
             let trusted = unsafe {
-                EqualSid(sid, user.sid()) != 0
+                EqualSid(sid, reader) != 0
                     || IsWellKnownSid(sid, WinLocalSystemSid) != 0
                     || IsWellKnownSid(sid, WinBuiltinAdministratorsSid) != 0
             };

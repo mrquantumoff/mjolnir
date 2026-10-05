@@ -22,6 +22,8 @@ pub mod progress;
 pub mod recv;
 mod schedule;
 pub mod send;
+#[cfg(windows)]
+pub mod service;
 pub mod shutdown;
 pub mod tunnel;
 #[cfg(feature = "self-update")]

@@ -1,3 +1,5 @@
+#[cfg(windows)]
+use std::ffi::OsString;
 use std::net::SocketAddr;
 use std::ops::ControlFlow;
 use std::path::PathBuf;
@@ -11,6 +13,8 @@ use clap::{Parser, Subcommand};
 use mjolnir::filemap::{ApplyPolicy, Preserve};
 use mjolnir::keys::AuthorizedKey;
 use mjolnir::printable::escape;
+#[cfg(windows)]
+use mjolnir::service::{self, ServiceName};
 use mjolnir::tunnel::{self, Backoff, ForwardSpec, HostPort, Pattern, Permits, Policy};
 use mjolnir::{
     Cipher, Phase, PhaseTimes, PrivateKey, Progress, PublicKey, Receiver, RecvConfig, RecvReport,
@@ -187,18 +191,66 @@ enum Cmd {
         #[arg(long)]
         check: bool,
     },
+    /// Run recv, tunnel-server, or tunnel as a Windows service.
+    #[cfg(windows)]
+    #[command(subcommand)]
+    Service(ServiceCmd),
+}
+
+#[cfg(windows)]
+#[derive(Subcommand)]
+enum ServiceCmd {
+    /// Install a service that runs the command after `--`.
+    ///
+    /// The service is `mjolnir-NAME`. It runs as LocalSystem, in the
+    /// current directory, and starts at boot.
+    Install {
+        /// Letters, digits, `-`, and `_`.
+        name: ServiceName,
+        /// Log file [default: %ProgramData%\mjolnir\NAME.log]
+        #[arg(long)]
+        log: Option<PathBuf>,
+        /// Start only on `mjolnir service start`, not at boot.
+        #[arg(long)]
+        manual: bool,
+        /// `recv --keep-listening`, `tunnel-server`, or `tunnel --reconnect`,
+        /// with their arguments.
+        #[arg(last = true, required = true, value_name = "COMMAND")]
+        command: Vec<OsString>,
+    },
+    /// Start an installed service.
+    Start { name: ServiceName },
+    /// Stop a running service.
+    Stop { name: ServiceName },
+    /// Print a service's state, PID, command, and log file.
+    Status { name: ServiceName },
+    /// Stop a service if it runs, then remove it.
+    Uninstall { name: ServiceName },
+    /// What the service manager starts.
+    #[command(hide = true)]
+    Run {
+        name: ServiceName,
+        #[arg(long)]
+        cwd: PathBuf,
+        #[arg(long)]
+        log: PathBuf,
+        #[arg(last = true, required = true)]
+        command: Vec<OsString>,
+    },
 }
 
 fn main() {
     #[cfg(all(feature = "self-update", windows))]
     mjolnir::update::remove_leftover();
-    if let Err(e) = run(Cli::parse().cmd) {
+    if let Err(e) = run(Cli::parse().cmd, true) {
         eprintln!("mjolnir: error: {}", escape(&format!("{e:#}")));
         std::process::exit(1);
     }
 }
 
-fn run(cmd: Cmd) -> Result<()> {
+/// Runs `cmd`, printing transfer progress about once a second if
+/// `progress_lines`.
+fn run(cmd: Cmd, progress_lines: bool) -> Result<()> {
     match cmd {
         Cmd::Keygen { out } => {
             let key = PrivateKey::generate();
@@ -255,7 +307,7 @@ fn run(cmd: Cmd) -> Result<()> {
                 move || progress.cancel()
             });
             let mut cpu_before = Duration::ZERO;
-            let served = with_progress("received", &progress, || {
+            let served = with_progress("received", &progress, progress_lines, || {
                 receiver.serve(progress.clone(), |report| {
                     // Only the CPU spent since the previous transfer ended.
                     let cpu = process_cpu()
@@ -300,7 +352,9 @@ fn run(cmd: Cmd) -> Result<()> {
                 follow_symlinks: !no_follow_symlinks,
             };
             let progress = Arc::new(Progress::default());
-            let report = with_progress("sent", &progress, || mjolnir::send(cfg, progress.clone()))?;
+            let report = with_progress("sent", &progress, progress_lines, || {
+                mjolnir::send(cfg, progress.clone())
+            })?;
             summary(
                 "sent",
                 report.bytes_sent,
@@ -445,8 +499,120 @@ fn run(cmd: Cmd) -> Result<()> {
                 }
             }
         }
+        #[cfg(windows)]
+        Cmd::Service(cmd) => run_service(cmd)?,
     }
     Ok(())
+}
+
+#[cfg(windows)]
+fn run_service(cmd: ServiceCmd) -> Result<()> {
+    match cmd {
+        ServiceCmd::Install {
+            name,
+            log,
+            manual,
+            command,
+        } => {
+            let parsed = parse_service_command(&command)?;
+            let log = std::path::absolute(log.unwrap_or_else(|| name.default_log()))?;
+            let mut args: Vec<OsString> = vec![
+                "service".into(),
+                "run".into(),
+                name.as_str().into(),
+                "--cwd".into(),
+                std::env::current_dir()?.into(),
+                "--log".into(),
+                log.into(),
+                "--".into(),
+            ];
+            args.extend(command);
+            let exe = std::env::current_exe()?;
+            service::install(&name, &exe, &args, service_key(&parsed), manual)?;
+            println!(
+                "installed service {}; start it with `mjolnir service start {}`",
+                name.service(),
+                name.as_str()
+            );
+        }
+        ServiceCmd::Start { name } => {
+            let pid = service::start(&name)?;
+            println!("{} is running, PID {pid}", name.service());
+        }
+        ServiceCmd::Stop { name } => match service::stop(&name)? {
+            true => println!("{} stopped", name.service()),
+            false => println!("{} was not running", name.service()),
+        },
+        ServiceCmd::Status { name } => {
+            let status = service::status(&name)?;
+            match status.pid {
+                Some(pid) => println!("{}: {}, PID {pid}", name.service(), status.state),
+                None => println!("{}: {}", name.service(), status.state),
+            }
+            if let Some(failure) = status.failure {
+                println!("last stop: {failure}");
+            }
+            match Cli::try_parse_from(&status.command).map(|cli| cli.cmd) {
+                Ok(Cmd::Service(ServiceCmd::Run {
+                    cwd, log, command, ..
+                })) => {
+                    let command = service::command_line(command.iter().map(AsRef::as_ref));
+                    println!("command: mjolnir {}", command.display());
+                    println!("directory: {}", cwd.display());
+                    println!("log: {}", log.display());
+                }
+                _ => {
+                    let line = service::command_line(status.command.iter().map(AsRef::as_ref));
+                    println!("command line: {}", line.display());
+                }
+            }
+        }
+        ServiceCmd::Uninstall { name } => {
+            service::uninstall(&name)?;
+            println!("removed {}", name.service());
+        }
+        ServiceCmd::Run {
+            name,
+            cwd,
+            log,
+            command,
+        } => service::run(&name, cwd, log, move || {
+            run(parse_service_command(&command)?, false)
+        })?,
+    }
+    Ok(())
+}
+
+/// Parses the command a service runs, refusing one that would end on its
+/// own, after which the service would just show as stopped.
+#[cfg(windows)]
+fn parse_service_command(args: &[OsString]) -> Result<Cmd> {
+    let cli = Cli::try_parse_from(std::iter::once(OsString::from("mjolnir")).chain(args.to_vec()))
+        .map_err(|e| {
+            eprint!("{}", e.render());
+            anyhow::anyhow!("the service command does not parse")
+        })?;
+    match cli.cmd {
+        Cmd::Recv {
+            keep_listening: false,
+            ..
+        } => bail!("a recv service needs --keep-listening, or it stops after one transfer"),
+        Cmd::Tunnel {
+            reconnect: false, ..
+        } => bail!("a tunnel service needs --reconnect, or it stops when its first session ends"),
+        cmd @ (Cmd::Recv { .. } | Cmd::Tunnel { .. } | Cmd::TunnelServer { .. }) => Ok(cmd),
+        _ => bail!(
+            "a service runs `recv --keep-listening`, `tunnel-server`, or `tunnel --reconnect`"
+        ),
+    }
+}
+
+#[cfg(windows)]
+fn service_key(cmd: &Cmd) -> &std::path::Path {
+    match cmd {
+        Cmd::Recv { key, .. } | Cmd::Tunnel { key, .. } | Cmd::TunnelServer { key, .. } => key,
+        _ => unreachable!("parse_service_command accepts only these"),
+    }
 }
 
 const MIB: f64 = (1 << 20) as f64;
@@ -474,12 +640,17 @@ fn block_on<T>(work: impl Future<Output = Result<T>>) -> Result<T> {
     result
 }
 
-/// Runs `work` on a thread and prints progress to stderr about once a second.
+/// Runs `work`, if `lines` on a thread while printing progress to stderr
+/// about once a second.
 fn with_progress<T: Send>(
     verb: &str,
     progress: &Progress,
+    lines: bool,
     work: impl FnOnce() -> Result<T> + Send,
 ) -> Result<T> {
+    if !lines {
+        return work();
+    }
     thread::scope(|s| {
         let worker = s.spawn(work);
         let mut last = (Instant::now(), 0u64);
@@ -643,4 +814,49 @@ fn summary(
         phases.hash.as_secs_f64(),
         phases.finalize.as_secs_f64()
     );
+}
+
+#[cfg(all(test, windows))]
+mod tests {
+    use super::*;
+
+    fn parse(line: &str) -> Result<Cmd> {
+        let peer = PrivateKey::generate().public_key();
+        let line = line.replace("PEER", &peer.to_string());
+        parse_service_command(&line.split(' ').map(OsString::from).collect::<Vec<_>>())
+    }
+
+    #[test]
+    fn services_run_only_commands_that_keep_running() {
+        for ok in [
+            "recv --key k.key --allow PEER --keep-listening",
+            "recv -k --key k.key --out D:/in",
+            "tunnel-server --key k.key --allow PEER --permit-open db:5432",
+            "tunnel h:7778 --key k.key --peer PEER -L 1:db:5432 --reconnect",
+        ] {
+            let cmd = parse(ok).unwrap_or_else(|e| panic!("{ok}: {e:#}"));
+            assert_eq!(service_key(&cmd), std::path::Path::new("k.key"));
+        }
+        for (bad, says) in [
+            ("recv --key k.key", "--keep-listening"),
+            (
+                "tunnel h:7778 --key k.key --peer PEER -R 1:h:2",
+                "--reconnect",
+            ),
+            ("send h:7777 --key k.key --peer PEER file", "tunnel-server"),
+            ("keygen", "tunnel-server"),
+            ("service status x", "tunnel-server"),
+            ("recv --key k.key --kep-listening", "does not parse"),
+            (
+                "tunnel h:7778 --key k.key --peer PEER -W h:22 --reconnect",
+                "does not parse",
+            ),
+        ] {
+            let Err(err) = parse(bad) else {
+                panic!("{bad}: accepted")
+            };
+            let err = format!("{err:#}");
+            assert!(err.contains(says), "{bad}: {err}");
+        }
+    }
 }

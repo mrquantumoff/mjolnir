@@ -121,6 +121,15 @@ impl PrivateKey {
         Self::from_base64(&text).with_context(|| format!("parsing private key {}", path.display()))
     }
 
+    /// Fails unless [`PrivateKey::load`] would accept the key file at `path`
+    /// in a process running as LocalSystem, as a Windows service does.
+    #[cfg(windows)]
+    pub fn check_for_local_system(path: &Path) -> Result<()> {
+        let file =
+            File::open(path).with_context(|| format!("reading private key {}", path.display()))?;
+        private_file::check_for_local_system(&file, path)
+    }
+
     /// Writes the key as base64 plus a newline. Refuses to overwrite an
     /// existing file. Only this user can open it: mode 0600 on Unix, and on
     /// Windows a DACL that inherits nothing and grants only this user,
@@ -438,6 +447,24 @@ mod tests {
         std::fs::write(&plain, B64.encode([7u8; 32])).unwrap();
         let err = format!("{:#}", PrivateKey::load(&plain).unwrap_err());
         assert!(err.contains("S-1-1-0") && err.contains("icacls"), "{err}");
+    }
+
+    /// A key `save` wrote grants this user, which LocalSystem must refuse,
+    /// and the fix keeps SYSTEM while removing the user.
+    #[cfg(windows)]
+    #[test]
+    fn saved_key_is_refused_for_local_system() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("k.key");
+        PrivateKey::generate().save(&path).unwrap();
+        let err = format!(
+            "{:#}",
+            PrivateKey::check_for_local_system(&path).unwrap_err()
+        );
+        assert!(
+            err.contains("/grant:r \"*S-1-5-18:F\" /remove \"*S-1-5-"),
+            "{err}"
+        );
     }
 
     #[test]
