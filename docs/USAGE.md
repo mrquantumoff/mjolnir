@@ -23,7 +23,7 @@ transfer after another:
 | `--authorized FILE` | | allowed sender keys, one `[options] <base64> [comment]` per line; `#` comments and blank lines are ignored. A line with tunnel options (see [Tunnels](TUNNEL.md)) sends files only if it also says `transfer` |
 | `--allow KEY` | | allow one sender key; repeatable |
 | `--listen ADDR` | `0.0.0.0:7777` | address to listen on |
-| `--out DIR` | `.` | where files land |
+| `--out DIR` | `.` | where files land, created if missing |
 | `--force` | off | overwrite existing files; without it a file that appears at the destination during the transfer fails the transfer instead of being replaced |
 | `--no-verify` | off | skip reading every chunk back before finishing |
 | `--threads N` | `0` (one per core) | workers that decrypt, write, and verify chunks, at most 1024 |

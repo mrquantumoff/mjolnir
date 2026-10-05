@@ -775,11 +775,11 @@ pub mod testing {
     }
 }
 
-/// Prepares every target: takes the output directory's lock, creates the
-/// transfer's staging directory and every directory the offer lists,
-/// resumes part files whose state is valid, treats files that an
-/// interrupted finalization already renamed into place as committed, and
-/// starts everything else from scratch.
+/// Prepares every target: creates a missing output directory, takes its
+/// lock, creates the transfer's staging directory and every directory the
+/// offer lists, resumes part files whose state is valid, treats files that
+/// an interrupted finalization already renamed into place as committed,
+/// and starts everything else from scratch.
 fn prepare_targets(
     out: &Path,
     m: &Manifest,
@@ -788,6 +788,7 @@ fn prepare_targets(
 ) -> Result<(Store, Vec<Target>)> {
     let out = crate::names::local_dir(out);
     let root = out.join(STAGING_DIR);
+    fs::create_dir_all(&out).with_context(|| format!("creating {}", out.display()))?;
     fsops::create_private_dir(&root).with_context(|| format!("creating {}", root.display()))?;
     let lock = fsops::open_private(&root.join("lock"), true)?;
     ensure!(

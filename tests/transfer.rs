@@ -1251,6 +1251,21 @@ fn empty_directories_arrive() {
 }
 
 #[test]
+fn a_missing_nested_output_directory_is_created() {
+    let src = TempDir::new().unwrap();
+    let file = src.path().join("file.bin");
+    write(&file, &noise(5000, 17));
+    let base = TempDir::new().unwrap();
+    let out = base.path().join("not/yet");
+    let (rk, _) = keypair();
+    let (sk, spub) = keypair();
+    let rx = start_receiver(rk, vec![spub], &out);
+    Send::to(sk, rx.public).run(rx.addr, &[&file]).unwrap();
+    rx.join().unwrap();
+    assert_file_eq(&file, &out.join("file.bin"));
+}
+
+#[test]
 fn hash_check_reports_equal_file_hashes() {
     let src = TempDir::new().unwrap();
     let data = src.path().join("data");
