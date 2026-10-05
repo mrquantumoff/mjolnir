@@ -336,6 +336,15 @@ Apple silicon runner, so their tests do not run. It runs only for tags that star
 publishing anything. Every action it uses is pinned to a commit SHA, and
 the toolchain to an exact Rust release.
 
+[`.github/workflows/audit.yml`](.github/workflows/audit.yml) runs
+[cargo-deny](https://github.com/EmbarkStudios/cargo-deny) with
+[`deny.toml`](deny.toml). It fails on a dependency with a known
+vulnerability or an unsound advisory, an unmaintained direct dependency, a
+license outside the allow-list, or a source other than crates.io. It runs
+on pushes to `master`, on pull requests, and weekly, since advisories
+appear without any change here. The release job waits for it, so a tag with
+a flagged dependency publishes nothing.
+
 Pushing a `v` tag builds and publishes a release from that tag:
 
 ```sh

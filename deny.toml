@@ -1,0 +1,30 @@
+# cargo-deny configuration; CI runs `cargo deny check` from
+# .github/workflows/audit.yml.
+
+[advisories]
+# Vulnerability advisories always fail the check, and so do unsound ones
+# anywhere in the tree. An unmaintained advisory fails it only for a direct
+# dependency, which can be replaced here; this cargo-deny has no warn level
+# for it. A yanked version only warns.
+unsound = "all"
+unmaintained = "workspace"
+yanked = "warn"
+ignore = []
+
+[licenses]
+allow = [
+    "Apache-2.0",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "MIT",
+    "Unicode-3.0",
+]
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
