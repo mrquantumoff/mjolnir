@@ -69,7 +69,7 @@ also exits with an error when the session ends, unless run with
 With `--reconnect`, the first session must still succeed, so a wrong key,
 a refused permission, or a bad spec fails at once. After that, the client
 sets up a new session whenever one ends, and retries every attempt that
-fails, until Ctrl-C. It waits 1 second before the first attempt and
+fails, until Ctrl-C or a service stop. It waits 1 second before the first attempt and
 doubles the wait after each failed one, up to 60 seconds. A session that
 stayed up for 60 seconds starts the waits over at 1 second. It logs one
 line when a session ends, one per failed attempt, and `tunnel up again`
@@ -100,6 +100,9 @@ most 8 per client key; a session's place is freed once it and its streams
 are gone. On Windows a `-R` listener is refused when any socket already
 holds its port, even on another address, since Windows would otherwise let
 `127.0.0.1:P` take the loopback traffic of a service on `0.0.0.0:P`.
+
+Either side can run as a Windows service or a systemd unit; see [Running
+as a Windows service](../README.md#running-as-a-windows-service).
 
 ## Permissions
 
@@ -308,8 +311,8 @@ When the control connection closes cleanly, the session takes no new
 streams and drops its listeners, but its running streams finish on their
 own terms. When it ends any other way, with an error, an `Error` message,
 or the server stopping, every stream of the session ends with it, and so
-do its streams' local connections, with a reset. Ctrl-C on either side
-resets the connections that side's streams carried before it exits. No
+do its streams' local connections, with a reset. Ctrl-C or a service
+stop on either side resets the connections that side's streams carried before it exits. No
 stream carries over to a client's next session: stream ids start again
 at 1, under the new session's keys.
 

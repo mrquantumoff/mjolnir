@@ -64,7 +64,8 @@ downloads this platform's archive, refuses it if it does not match its
 binary in only after it runs `--version`. Windows 10 and later ship both
 tools; on Windows the old binary is moved to `mjolnir.exe.old` and deleted
 on the next run. It never downgrades, and it refuses on platforms that have
-no release build.
+no release build. A running Windows service keeps the old binary until it
+restarts, so restart the service after `mjolnir update`.
 
 `MJOLNIR_RELEASES_URL` points it at a fork or mirror with the same layout.
 A mirror of the official releases needs nothing else. A fork that signs its
@@ -164,6 +165,9 @@ local web UI; see [docs/WEB.md](docs/WEB.md).
 `mjolnir update [--check]` updates the binary from the latest GitHub
 release; see [Updating](#updating).
 
+On Windows, `mjolnir service` runs a receiver or a tunnel as a Windows
+service; see [Running as a Windows service](#running-as-a-windows-service).
+
 ## Tunnels
 
 A `tunnel-server` carries TCP connections for authorized clients. The
@@ -201,6 +205,87 @@ succeed.
 Permissions, per-key `permitopen`, `permitlisten`, and `transfer` options,
 the server's limits, and the wire format are in
 [docs/TUNNEL.md](docs/TUNNEL.md).
+
+## Running as a Windows service
+
+`mjolnir service` runs one long-running command as a Windows service: a
+receiver, a tunnel server, or a tunnel client. The command goes after
+`--` with its usual flags. It must be `recv --keep-listening`,
+`tunnel-server`, or `tunnel --reconnect`; without those flags a receiver
+would stop after one transfer and a client after one session. Run these
+from an elevated terminal (Run as administrator):
+
+```powershell
+cd C:\mjolnir
+mjolnir service install inbox -- recv --keep-listening --key recv.key `
+    --authorized senders.txt --out D:\incoming
+mjolnir service install relay -- tunnel-server --key server.key `
+    --authorized clients.txt --permit-open db.internal:5432
+mjolnir service install db -- tunnel relay.example:7778 --key client.key `
+    --peer <SERVER_PUBLIC_KEY> -L 15432:db.internal:5432 --reconnect
+mjolnir service start inbox
+```
+
+A NAME is letters, digits, `-`, and `_`, and the service is
+`mjolnir-NAME`, shown as `mjolnir NAME`. `install` parses the command the
+same way the CLI does, so a typo fails at install rather than at start.
+The service runs this binary from where it was installed, in the
+directory `install` ran in, so relative paths such as `--key recv.key`
+keep working. It starts at boot, or with `--manual` only on `mjolnir
+service start NAME`. `install` does not start it.
+
+`mjolnir service start NAME` and `stop NAME` start and stop it.
+`status NAME` prints its state, its PID while it runs, the command, and
+the log file. `uninstall NAME` stops it if it runs, then removes it.
+Install, uninstall, start, and stop need an elevated terminal and fail
+with "access denied" without one. `status` works from any terminal.
+
+The service runs as LocalSystem, so it reads keys and writes files as
+SYSTEM. Received files take the access list of their `--out` directory.
+`install` refuses a key that LocalSystem would refuse, which includes a
+key `keygen` wrote, since that key also grants your account. The error
+names the `icacls` command that removes your account and keeps SYSTEM
+and Administrators; after it, read the key from an elevated terminal.
+SYSTEM runs the binary, so keep it in a directory only administrators
+can change, such as `C:\Program Files\mjolnir`, rather than the per-user
+folder `install.ps1` uses.
+
+Stderr goes to `%ProgramData%\mjolnir\NAME.log`, or to the file `--log
+PATH` names. Each line starts with a UTC timestamp, and the file is
+appended to across restarts. It holds the start lines, a summary per
+transfer, failed handshakes and sessions, and why the service stopped,
+but no per-second progress lines.
+
+`stop` ends the command the way Ctrl-C ends a tunnel: streams reset the
+connections they carried. A receiver cancels its transfer, which resumes
+from staging when the sender retries. When the command fails on its own,
+for example because its port is taken or a client's first session fails,
+the service stops with an error and the service manager starts it again
+10 seconds later. It does this up to 3 times, and the count starts over
+after a day without a failure. A stop you ask for is not a failure.
+
+Linux needs no subcommand: systemd runs the same commands. Save a unit
+such as `/etc/systemd/system/mjolnir-inbox.service` and run `systemctl
+enable --now mjolnir-inbox`:
+
+```ini
+[Unit]
+Description=mjolnir inbox
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+ExecStart=/usr/local/bin/mjolnir recv --keep-listening --key /etc/mjolnir/recv.key --authorized /etc/mjolnir/senders.txt --out /srv/incoming
+Restart=on-failure
+KillSignal=SIGINT
+
+[Install]
+WantedBy=multi-user.target
+```
+
+`KillSignal=SIGINT` makes `systemctl stop` act as Ctrl-C does, so a
+tunnel resets its streams' connections instead of closing them as if
+they had ended.
 
 ## How it works
 
@@ -280,8 +365,9 @@ not receive into a directory that other users can write to.
 - A `recv` process receives one transfer at a time. It keeps listening
   through failed handshakes and failed sessions and exits after one
   transfer completes, or with `--keep-listening` runs until you stop it
-  with Ctrl-C. Ctrl-C ends it at once, even mid-transfer; the interrupted
-  transfer resumes from staging when the sender retries. A later transfer
+  with Ctrl-C or stop its service. Either ends it at once, even
+  mid-transfer; the interrupted transfer resumes from staging when the
+  sender retries. A later transfer
   of a file that already arrived fails without `--force`. The
   `--authorized` file is read once at start, so restart the receiver to
   revoke a key. One session at a time may receive into an output
