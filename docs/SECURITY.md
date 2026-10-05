@@ -31,4 +31,9 @@ opened without following reparse points, so a junction swapped into a
 parent between that check and the open is not caught; the guarantee there
 covers links present when the check runs. File data and new directories
 follow symlinks that already exist under `--out` on every platform. Do
-not receive into a directory that other users can write to.
+not receive into a directory that other users can write to. A Windows
+service checks who can change its `--out` folder, or the nearest folder
+above it that exists, but not the folders under it. Do not grant other
+accounts write access anywhere under a service's `--out`. A subfolder
+they can change could be swapped for a junction that redirects the
+receiver's writes as SYSTEM.
