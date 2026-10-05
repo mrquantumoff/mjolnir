@@ -7,7 +7,7 @@ use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use anyhow::{Result, bail};
+use anyhow::{Result, anyhow, bail};
 use clap::{Parser, Subcommand};
 
 use mjolnir::filemap::{ApplyPolicy, Preserve};
@@ -421,12 +421,22 @@ fn run(cmd: Cmd, progress_lines: bool) -> Result<()> {
             block_on(async move {
                 let stop = stopped();
                 tokio::pin!(stop);
+                // A -W stream cut short by a stop is a failure: its exit
+                // status tells ssh whether everything was carried.
+                let carrying = stdio.is_some();
+                let stopped_early = move || match carrying {
+                    true => Err(anyhow!("interrupted")),
+                    false => Ok(()),
+                };
                 let client = tokio::select! {
                     client = tunnel::TunnelClient::connect(cfg) => client?,
-                    () = &mut stop => return Ok(()),
+                    () = &mut stop => return stopped_early(),
                 };
                 match stdio {
-                    Some(target) => client.stdio(target).await.map(drop),
+                    Some(target) => tokio::select! {
+                        carried = client.stdio(target) => carried.map(drop),
+                        () = &mut stop => stopped_early(),
+                    },
                     None => {
                         eprintln!("mjolnir: tunnel up");
                         if reconnect {
