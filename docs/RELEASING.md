@@ -29,9 +29,11 @@ system's `curl`. It refuses the release unless `SHA256SUMS.sig` is a valid
 signature of `SHA256SUMS` by the release key built into the binary. Then it
 downloads this platform's archive, refuses it if it does not match its
 `SHA256SUMS` line, unpacks it with the system's `tar`, and swaps the new
-binary in only after it runs `--version`. Windows 10 and later ship both
-tools; on Windows the old binary is moved to `mjolnir.exe.old` and deleted
-on the next run. It never downgrades, and it refuses on platforms that have
+binary in only after its `--version` reports the tag's version, so an
+older signed release served under a newer tag is refused. Windows 10 and
+later ship both tools; on Windows the old binary is moved to
+`mjolnir.exe.old` and deleted on the next run. It never downgrades, and it
+refuses on platforms that have
 no release build. A running Windows service keeps the old binary until it
 restarts, so restart the service after `mjolnir update`, which needs an
 elevated terminal when mjolnir lives under Program Files.

@@ -99,16 +99,16 @@ fn tar() -> PathBuf {
 }
 
 /// An install directory holding a copy of the built binary, and a release
-/// archive holding another copy. The copies are identical, since altering
-/// a signed macOS binary stops it from running, so the tests tell them apart
-/// by file identity instead.
+/// archive. The archive holds another copy, or with `reporting`, a binary
+/// that only prints `mjolnir VERSION`, since altering the built binary would
+/// stop a signed macOS binary from running.
 struct Fixture {
     _dir: tempfile::TempDir,
     installed: PathBuf,
     archive: Vec<u8>,
 }
 
-fn fixture() -> Fixture {
+fn fixture(reporting: Option<&str>) -> Fixture {
     let dir = tempfile::tempdir().unwrap();
     let installed = dir.path().join("install").join(BIN);
     std::fs::create_dir(installed.parent().unwrap()).unwrap();
@@ -116,7 +116,23 @@ fn fixture() -> Fixture {
 
     let staging = dir.path().join("staging");
     std::fs::create_dir(&staging).unwrap();
-    std::fs::copy(env!("CARGO_BIN_EXE_mjolnir"), staging.join(BIN)).unwrap();
+    match reporting {
+        Some(version) => {
+            let src = dir.path().join("release.rs");
+            let main = format!(r#"fn main() {{ println!("mjolnir {version}"); }}"#);
+            std::fs::write(&src, main).unwrap();
+            let status = Command::new("rustc")
+                .arg(&src)
+                .arg("-o")
+                .arg(staging.join(BIN))
+                .status()
+                .unwrap();
+            assert!(status.success(), "rustc failed");
+        }
+        None => {
+            std::fs::copy(env!("CARGO_BIN_EXE_mjolnir"), staging.join(BIN)).unwrap();
+        }
+    }
     let archive_path = dir.path().join(ASSET.unwrap());
     let flags = if cfg!(windows) { "-a -cf" } else { "-czf" };
     let status = Command::new(tar())
@@ -187,7 +203,7 @@ fn update_installs_a_newer_release() {
     if ASSET.is_none() {
         return;
     }
-    let f = fixture();
+    let f = fixture(Some("99.0.0"));
     let sums = sums_for(&f.archive);
     let sig = sign(&sums);
     let base = serve("v99.0.0", f.archive.clone(), sums, Some(sig));
@@ -205,10 +221,21 @@ fn update_installs_a_newer_release() {
 
     let out = update(&f.installed, &base, &[]);
     assert!(out.status.success(), "{}", text(&out));
-    assert!(text(&out).contains("installed mjolnir "), "{}", text(&out));
+    assert!(
+        text(&out).contains("installed mjolnir 99.0.0"),
+        "{}",
+        text(&out)
+    );
+    let version = Command::new(&f.installed)
+        .arg("--version")
+        .output()
+        .unwrap();
+    assert_eq!(text(&version).trim(), "mjolnir 99.0.0");
     let leftovers = others_in_install_dir(&f.installed);
     if cfg!(windows) {
         assert_eq!(leftovers, ["mjolnir.exe.old"]);
+        // The stand-in release cannot clean up after itself; a real build can.
+        std::fs::copy(env!("CARGO_BIN_EXE_mjolnir"), &f.installed).unwrap();
         let out = Command::new(&f.installed)
             .arg("--version")
             .output()
@@ -219,7 +246,6 @@ fn update_installs_a_newer_release() {
             "the next run removes the old binary"
         );
     } else {
-        assert_ne!(file_id(&f.installed), before, "the binary was replaced");
         assert!(leftovers.is_empty(), "{leftovers:?}");
     }
 }
@@ -243,7 +269,7 @@ fn update_refuses_an_archive_that_fails_its_checksum() {
     }
     let sums = sums_for(b"something else");
     let sig = sign(&sums);
-    assert_refused(&fixture(), sums, Some(sig), "checksum mismatch");
+    assert_refused(&fixture(None), sums, Some(sig), "checksum mismatch");
 }
 
 #[test]
@@ -251,7 +277,7 @@ fn update_refuses_sums_that_fail_their_signature() {
     if ASSET.is_none() {
         return;
     }
-    let f = fixture();
+    let f = fixture(None);
     let signed = sign(&sums_for(b"something else"));
     let error = "SHA256SUMS does not match its signature";
     assert_refused(&f, sums_for(&f.archive), Some(signed), error);
@@ -263,8 +289,24 @@ fn update_refuses_a_release_without_a_signature() {
     if ASSET.is_none() {
         return;
     }
-    let f = fixture();
+    let f = fixture(None);
     assert_refused(&f, sums_for(&f.archive), None, "SHA256SUMS.sig");
+}
+
+/// An older release's signed files, served under a newer tag.
+#[test]
+fn update_refuses_a_binary_older_than_its_tag() {
+    if ASSET.is_none() {
+        return;
+    }
+    let f = fixture(None);
+    let sums = sums_for(&f.archive);
+    let sig = sign(&sums);
+    let error = format!(
+        "the release's binary reports version {}, not 99.0.0",
+        env!("CARGO_PKG_VERSION")
+    );
+    assert_refused(&f, sums, Some(sig), &error);
 }
 
 #[test]

@@ -4,8 +4,10 @@
 //! `releases/latest`, and the archive, `SHA256SUMS`, and `SHA256SUMS.sig`
 //! from the public download URLs, so no API call, login, or token is
 //! involved. `SHA256SUMS` must carry a valid signature by [`RELEASE_KEY`],
-//! the archive must match its `SHA256SUMS` line, and the new binary must run
-//! `--version`, before it takes the old one's place.
+//! the archive must match its `SHA256SUMS` line, and the new binary's
+//! `--version` must report the tag's version, before it takes the old one's
+//! place. The signature does not cover the tag, so that last check is what
+//! stops an older signed release served under a newer tag.
 //!
 //! Downloads go through the system's curl and unpacking through its tar.
 //! Windows 10 and later ship both in System32.
@@ -126,7 +128,7 @@ pub fn update(releases: &str, key: &str, check_only: bool) -> Result<Outcome> {
         .arg(&tmp.0)
         .arg(BIN))
     .with_context(|| format!("cannot unpack {asset}"))?;
-    let version = replace(&exe, &tmp.0.join(BIN))?;
+    let version = replace(&exe, &tmp.0.join(BIN), &latest)?;
     Ok(Outcome::Updated { version, path: exe })
 }
 
@@ -192,20 +194,24 @@ fn verify(archive: &Path, asset: &str, sums: &str) -> Result<()> {
     Ok(())
 }
 
-/// Stages `new` beside `exe`, checks that it runs, and swaps it in. Staging
-/// in the install directory keeps the final rename on one file system, and
-/// runs the check from there rather than from a temp directory that may be
-/// mounted noexec.
-fn replace(exe: &Path, new: &Path) -> Result<String> {
+/// Stages `new` beside `exe`, checks that it runs and reports version
+/// `tag`, and swaps it in. Staging in the install directory keeps the final
+/// rename on one file system, and runs the check from there rather than
+/// from a temp directory that may be mounted noexec.
+fn replace(exe: &Path, new: &Path, tag: &str) -> Result<String> {
     let staged = sibling(exe, ".new");
     fs::copy(new, &staged).with_context(|| format!("cannot write {}", staged.display()))?;
     let result = run(Command::new(&staged).arg("--version"))
         .context("the downloaded binary does not run on this host")
         .and_then(|out| {
             let version = String::from_utf8_lossy(&out).trim().to_string();
+            let reported = version
+                .strip_prefix("mjolnir ")
+                .ok_or_else(|| anyhow!("the downloaded binary is not mjolnir"))?;
+            let wanted = tag.strip_prefix('v').unwrap_or(tag);
             ensure!(
-                version.starts_with("mjolnir "),
-                "the downloaded binary is not mjolnir"
+                parse_version(reported).ok() == Some(parse_version(tag)?),
+                "the release's binary reports version {reported}, not {wanted}"
             );
             swap(exe, &staged).with_context(|| format!("cannot replace {}", exe.display()))?;
             Ok(version)
