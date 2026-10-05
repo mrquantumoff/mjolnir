@@ -1,7 +1,9 @@
 use std::fs;
+use std::io::{BufRead, BufReader};
 use std::net::SocketAddr;
 use std::ops::ControlFlow;
 use std::path::{Path, PathBuf};
+use std::process::Stdio;
 use std::sync::atomic::Ordering::Relaxed;
 use std::sync::{Arc, mpsc};
 use std::thread::{self, JoinHandle};
@@ -429,6 +431,84 @@ fn a_listening_receiver_resumes_an_interrupted_transfer() {
     assert_eq!(tree(out.path()), tree(src.path()));
 
     stop_listening(rx, reports);
+}
+
+/// `mjolnir recv --keep-listening` as a subprocess: each transfer's summary
+/// prints whole, then the receiver says it is waiting again.
+#[test]
+fn recv_keep_listening_prints_each_summary_and_waits() {
+    let dir = TempDir::new().unwrap();
+    let file = dir.path().join("f.bin");
+    write(&file, &noise(300_000, 27));
+    let folder = dir.path().join("folder");
+    write(&folder.join("g.bin"), &noise(100_000, 28));
+    let out = dir.path().join("out");
+    fs::create_dir(&out).unwrap();
+    let key_path = dir.path().join("r.key");
+    PrivateKey::generate().save(&key_path).unwrap();
+    let (alice, alice_pub) = keypair();
+    let (bob, bob_pub) = keypair();
+    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_mjolnir"))
+        .args(["recv", "--listen", "127.0.0.1:0", "--keep-listening"])
+        .arg("--key")
+        .arg(&key_path)
+        .arg("--out")
+        .arg(&out)
+        .args(["--allow", &alice_pub.to_string()])
+        .args(["--allow", &bob_pub.to_string()])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let (tx, lines) = mpsc::channel();
+    let stderr = BufReader::new(child.stderr.take().unwrap());
+    thread::spawn(move || {
+        for line in stderr.lines() {
+            if tx.send(line.unwrap()).is_err() {
+                break;
+            }
+        }
+    });
+    let next = || {
+        lines
+            .recv_timeout(Duration::from_secs(30))
+            .expect("recv printed a line")
+    };
+    let public: PublicKey = next().strip_prefix("public key ").unwrap().parse().unwrap();
+    let addr: SocketAddr = next()
+        .strip_prefix("listening on ")
+        .unwrap()
+        .parse()
+        .unwrap();
+
+    let mut seen = Vec::new();
+    for (key, path) in [(alice, &file), (bob, &folder)] {
+        Send::to(key, public).run(addr, &[path]).unwrap();
+        loop {
+            let line = next();
+            let waiting = line == "waiting for the next sender";
+            seen.push(line);
+            if waiting {
+                break;
+            }
+        }
+    }
+    child.kill().unwrap();
+    child.wait().unwrap();
+
+    let summaries: Vec<usize> = (0..seen.len())
+        .filter(|&i| seen[i].starts_with("received ") && seen[i].contains(" bytes ("))
+        .collect();
+    assert_eq!(summaries.len(), 2, "{seen:#?}");
+    for (&i, peer) in summaries.iter().zip([alice_pub, bob_pub]) {
+        assert!(seen[i].ends_with(&format!("from {peer})")), "{seen:#?}");
+        assert!(seen[i - 1].starts_with("cpu "), "{seen:#?}");
+        assert!(seen[i + 1].starts_with("transfer "), "{seen:#?}");
+        assert_eq!(seen[i + 2], "waiting for the next sender", "{seen:#?}");
+    }
+    assert_file_eq(&file, &out.join("f.bin"));
+    assert_file_eq(&folder.join("g.bin"), &out.join("folder/g.bin"));
 }
 
 /// The staging directory a transfer of `file` from `sender` into `out` uses.

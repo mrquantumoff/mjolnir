@@ -119,7 +119,8 @@ restrict it (`chmod 600` or `icacls`).
 `mjolnir pubkey --key PATH` prints the public key of an existing private
 key.
 
-`mjolnir recv` receives one transfer:
+`mjolnir recv` receives one transfer, or with `--keep-listening` one
+transfer after another:
 
 | Flag | Default | Meaning |
 |---|---|---|
@@ -133,6 +134,7 @@ key.
 | `--threads N` | `0` (one per core) | workers that decrypt, write, and verify chunks, at most 1024 |
 | `--allow-owner` | off | apply file owners from the sender (only as root, on Unix) |
 | `--allow-special-bits` | off | keep setuid, setgid, and sticky bits from the sender |
+| `-k, --keep-listening` | off | after a transfer, print its summary and wait for the next sender instead of exiting |
 
 At least one of `--authorized` or `--allow` is required. On start the
 receiver prints its public key and listen address.
@@ -265,10 +267,16 @@ not receive into a directory that other users can write to.
 - No relay or NAT traversal. The sender must reach the receiver's port
   directly. (A tunnel client must likewise reach the tunnel server, but
   `-R` then serves connections back through it.)
-- One transfer per `recv` process. The receiver keeps listening through
-  failed handshakes and failed sessions and exits after one transfer
-  completes. One session at a time may receive into an output directory;
-  a second receiver pointed at the same `--out` refuses its session.
+- A `recv` process receives one transfer at a time. It keeps listening
+  through failed handshakes and failed sessions and exits after one
+  transfer completes, or with `--keep-listening` runs until you stop it
+  with Ctrl-C. Ctrl-C ends it at once, even mid-transfer; the interrupted
+  transfer resumes from staging when the sender retries. A later transfer
+  of a file that already arrived fails without `--force`. The
+  `--authorized` file is read once at start, so restart the receiver to
+  revoke a key. One session at a time may receive into an output
+  directory; a second receiver pointed at the same `--out` refuses its
+  session.
 - The receiver keeps `<out>/.mjolnir-staging/` with a lock file, and
   under it one directory per interrupted transfer (keyed by sender key,
   chunk size, and the files' paths, sizes, and mtimes). Re-running the

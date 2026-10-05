@@ -1,4 +1,5 @@
 use std::net::SocketAddr;
+use std::ops::ControlFlow;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::thread;
@@ -12,8 +13,8 @@ use mjolnir::keys::AuthorizedKey;
 use mjolnir::printable::escape;
 use mjolnir::tunnel::{self, ForwardSpec, HostPort, Pattern, Permits, Policy};
 use mjolnir::{
-    Cipher, Phase, PhaseTimes, PrivateKey, Progress, PublicKey, Receiver, RecvConfig, SendConfig,
-    load_authorized_entries, parse_size, transfer_keys, web,
+    Cipher, Phase, PhaseTimes, PrivateKey, Progress, PublicKey, Receiver, RecvConfig, RecvReport,
+    SendConfig, load_authorized_entries, parse_size, transfer_keys, web,
 };
 
 #[derive(Parser)]
@@ -38,7 +39,7 @@ enum Cmd {
         #[arg(long)]
         key: PathBuf,
     },
-    /// Receive one transfer from an authorized sender.
+    /// Receive a transfer from an authorized sender.
     Recv {
         #[arg(long)]
         key: PathBuf,
@@ -68,6 +69,9 @@ enum Cmd {
         /// Keep setuid, setgid, and sticky bits from the sender's map.
         #[arg(long)]
         allow_special_bits: bool,
+        /// After a transfer, wait for the next sender instead of exiting.
+        #[arg(short = 'k', long)]
+        keep_listening: bool,
     },
     /// Send files or directories to a receiver.
     Send {
@@ -210,6 +214,7 @@ fn run(cmd: Cmd) -> Result<()> {
             threads,
             allow_owner,
             allow_special_bits,
+            keep_listening,
         } => {
             if let Some(path) = authorized {
                 let entries = load_authorized_entries(&path)?;
@@ -241,29 +246,21 @@ fn run(cmd: Cmd) -> Result<()> {
             eprintln!("public key {}", receiver.public_key());
             eprintln!("listening on {}", receiver.local_addr());
             let progress = Arc::new(Progress::default());
-            let report = with_progress("received", &progress, || receiver.run(progress.clone()))?;
-            summary(
-                "received",
-                report.bytes_received,
-                report.elapsed,
-                report.phase_times,
-                &format!(
-                    "{} files, {} chunks, {} duplicates, {} repaired, {} stale, {}, {} rounds, from {}",
-                    report.files,
-                    report.chunks_received,
-                    report.duplicate_chunks,
-                    report.repaired_chunks,
-                    report.stale_chunks,
-                    if report.verified {
-                        "verified"
+            let mut cpu_before = Duration::ZERO;
+            with_progress("received", &progress, || {
+                receiver.serve(progress.clone(), |report| {
+                    // Only the CPU spent since the previous transfer ended.
+                    let cpu = process_cpu()
+                        .map(|now| now.saturating_sub(std::mem::replace(&mut cpu_before, now)));
+                    received(&report, cpu);
+                    if keep_listening {
+                        eprintln!("waiting for the next sender");
+                        ControlFlow::Continue(())
                     } else {
-                        "not verified"
-                    },
-                    report.rounds,
-                    report.peer
-                ),
-            );
-            report_files(report.hashed, &report.file_hashes, &report.warnings);
+                        ControlFlow::Break(())
+                    }
+                })
+            })?;
         }
         Cmd::Send {
             addr,
@@ -297,6 +294,7 @@ fn run(cmd: Cmd) -> Result<()> {
                 "sent",
                 report.bytes_sent,
                 report.elapsed,
+                process_cpu(),
                 report.phase_times,
                 &format!(
                     "{} files, {} chunks, {} resent, {} rounds, receiver {}",
@@ -471,6 +469,10 @@ fn with_progress<T: Send>(
             if now - last.0 < Duration::from_secs(1) {
                 continue;
             }
+            // Held from the snapshot to its line, so a progress line taken
+            // before a transfer ended never prints after the summary the
+            // worker prints for it.
+            let _stderr = std::io::stderr().lock();
             let p = progress.snapshot();
             if matches!(
                 p.phase,
@@ -563,9 +565,42 @@ fn report_files(hashed: bool, file_hashes: &[(String, String)], warnings: &[Stri
     }
 }
 
-fn summary(verb: &str, bytes: u64, elapsed: Duration, phases: PhaseTimes, detail: &str) {
+fn received(report: &RecvReport, cpu: Option<Duration>) {
+    summary(
+        "received",
+        report.bytes_received,
+        report.elapsed,
+        cpu,
+        report.phase_times,
+        &format!(
+            "{} files, {} chunks, {} duplicates, {} repaired, {} stale, {}, {} rounds, from {}",
+            report.files,
+            report.chunks_received,
+            report.duplicate_chunks,
+            report.repaired_chunks,
+            report.stale_chunks,
+            if report.verified {
+                "verified"
+            } else {
+                "not verified"
+            },
+            report.rounds,
+            report.peer
+        ),
+    );
+    report_files(report.hashed, &report.file_hashes, &report.warnings);
+}
+
+fn summary(
+    verb: &str,
+    bytes: u64,
+    elapsed: Duration,
+    cpu: Option<Duration>,
+    phases: PhaseTimes,
+    detail: &str,
+) {
     let secs = elapsed.as_secs_f64();
-    if let Some(cpu) = process_cpu() {
+    if let Some(cpu) = cpu {
         let peak = peak_memory().map_or(String::new(), |b| {
             format!(", peak memory {:.1} MiB", b as f64 / MIB)
         });
