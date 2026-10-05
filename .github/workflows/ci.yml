@@ -89,6 +89,18 @@ jobs:
           echo "aese: $aese, pmull: $pmull"
           [ "$aese" -gt 0 ] && [ "$pmull" -gt 0 ]
 
+      # Without the `aes` target feature the Windows binary still holds some
+      # AESE (built but never chosen) and at most one PMULL; with it, dozens.
+      - name: Check for ARMv8 AES and PMULL code (Windows)
+        if: matrix.target == 'aarch64-pc-windows-msvc'
+        shell: bash
+        run: |
+          llvm-objdump -d target/${{ matrix.target }}/release/mjolnir.exe > "$RUNNER_TEMP/disasm"
+          aese="$(grep -cw aese "$RUNNER_TEMP/disasm" || true)"
+          pmull="$(grep -cw pmull "$RUNNER_TEMP/disasm" || true)"
+          echo "aese: $aese, pmull: $pmull"
+          [ "$aese" -gt 0 ] && [ "$pmull" -ge 8 ]
+
       - name: Package (Linux, macOS)
         if: runner.os != 'Windows'
         run: |

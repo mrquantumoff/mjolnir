@@ -317,6 +317,10 @@ not receive into a directory that other users can write to.
   until TCP keepalive gives up on it.
 - Private key files are stored unencrypted, protected only by file
   permissions.
+- Windows ARM64 builds run AES-256-GCM on the ARMv8 Cryptography Extension,
+  with no software fallback. On a CPU without it, `send` and `tunnel`
+  refuse `--cipher aes256gcm`, and `recv` and `tunnel-server` refuse a
+  session that uses it. Use `--cipher chacha20poly1305` there.
 - A source that changes during a transfer is caught only by its size or
   mtime, which the sender re-checks after every round. An in-place edit that
   keeps both, such as a tool that restores the mtime, goes out as a mix of

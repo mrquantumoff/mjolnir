@@ -165,6 +165,7 @@ impl TunnelClient {
             (1..=MAX_CONNS).contains(&cfg.conns),
             "connections must be between 1 and {MAX_CONNS}"
         );
+        cfg.cipher.ensure_supported()?;
         let session = Session::establish(&cfg).await?;
         let local = LocalForwards::bind(&cfg.local, cfg.verbose).await?;
         Ok(TunnelClient {

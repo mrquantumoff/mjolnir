@@ -221,9 +221,10 @@ builds the same manifest, so it reports the collision before it connects.
 chunks.
 
 `cipher` is `Aes256Gcm` (default; AES-NI and CLMUL are detected at run
-time on x86-64, and ARMv8 AES and PMULL on aarch64 Linux and macOS, while
-Windows ARM64 builds use software AES because the cipher crates have no
-CPU-feature detection there)
+time on x86-64, and ARMv8 AES and PMULL on aarch64 Linux and macOS.
+Windows ARM64 builds always use ARMv8 AES and PMULL, since the cipher
+crates cannot detect them there, so a receiver whose CPU lacks them
+rejects the Offer with an error naming `--cipher chacha20poly1305`)
 or `ChaCha20Poly1305`.
 
 ### Session flow

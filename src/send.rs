@@ -253,6 +253,7 @@ fn run(cfg: &SendConfig, progress: &Progress) -> Result<SendReport> {
         "connections must be between 1 and {MAX_DATA_CONNECTIONS}"
     );
     check_threads(cfg.threads)?;
+    cfg.cipher.ensure_supported()?;
     let chunk_size = ChunkSize::new(cfg.chunk_size)?;
     let captured = filemap::capture(&cfg.paths, cfg.preserve, cfg.follow_symlinks)?;
     let paths: Vec<PathBuf> = captured.files.iter().map(|f| f.source.clone()).collect();

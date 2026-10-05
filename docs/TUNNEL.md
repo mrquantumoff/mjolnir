@@ -210,7 +210,8 @@ Only then does it register the session under its `route` and answer
 `Welcome`; the session is registered before `Welcome` goes out, so a
 stream connection opened on seeing it always finds the session. A session
 that would exceed the server's or its key's limit is answered with `Error`
-instead.
+instead, as is a `Hello` naming AES-256-GCM to a Windows ARM64 server whose
+CPU lacks the ARMv8 Cryptography Extension.
 
 The server queues at most 64 control messages for a client. A client that
 stops reading its control connection is not read either once that queue

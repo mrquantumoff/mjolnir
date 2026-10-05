@@ -331,6 +331,9 @@ impl Receiver {
             ),
             other => return Err(unexpected(other, "Offer")),
         };
+        cipher
+            .ensure_supported()
+            .context("the receiver cannot use this cipher")?;
         let (store, targets) =
             prepare_targets(&self.cfg.out_dir, &manifest, &peer, self.cfg.force)?;
         let pool = Pool::new(resolve_threads(self.cfg.threads));

@@ -4,12 +4,16 @@
 # the Cryptography Extension falls back to the software backend, so the
 # binary still runs everywhere.
 #
-# Windows has no run-time detection in these versions: there the ARMv8 code
-# is built but only used when the `aes` target feature is on at compile
-# time, which would crash CPUs that lack it, so Windows ARM64 keeps the
-# software backend.
-#
-# CI builds read this file too; its aarch64 Linux job checks that the
-# release binary contains AESE and PMULL instructions.
+# CI builds read this file too; its aarch64 Linux and Windows jobs check
+# that the release binary contains AESE and PMULL instructions.
 [target.'cfg(target_arch = "aarch64")']
 rustflags = ["--cfg", "aes_armv8", "--cfg", "polyval_armv8"]
+
+# Windows has no run-time detection in these versions, so there the ARMv8
+# backends are used only when the `aes` target feature is on at compile
+# time, and then on every CPU. Cipher::ensure_supported asks Windows whether
+# the CPU has the Cryptography Extension before AES-256-GCM is chosen or
+# accepted, so a CPU without it gets an error instead of an illegal
+# instruction. Cargo joins these flags with the ones above.
+[target.aarch64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+aes"]

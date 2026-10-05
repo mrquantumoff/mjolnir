@@ -68,6 +68,33 @@ pub enum Cipher {
     ChaCha20Poly1305,
 }
 
+impl Cipher {
+    /// Fails for AES-256-GCM where this build would run instructions the
+    /// CPU lacks. Windows ARM64 builds use the ARMv8 Cryptography Extension
+    /// without checking for it (see `.cargo/config.toml`).
+    pub fn ensure_supported(self) -> Result<()> {
+        ensure!(
+            self != Cipher::Aes256Gcm || aes_instructions_present(),
+            "this CPU lacks the ARMv8 Cryptography Extension, which AES-256-GCM needs in \
+             Windows ARM64 builds; use --cipher chacha20poly1305"
+        );
+        Ok(())
+    }
+}
+
+#[cfg(all(windows, target_arch = "aarch64", target_feature = "aes"))]
+fn aes_instructions_present() -> bool {
+    use windows_sys::Win32::System::Threading::{
+        IsProcessorFeaturePresent, PF_ARM_V8_CRYPTO_INSTRUCTIONS_AVAILABLE,
+    };
+    unsafe { IsProcessorFeaturePresent(PF_ARM_V8_CRYPTO_INSTRUCTIONS_AVAILABLE) != 0 }
+}
+
+#[cfg(not(all(windows, target_arch = "aarch64", target_feature = "aes")))]
+fn aes_instructions_present() -> bool {
+    true
+}
+
 enum AnyAead {
     Aes(Box<Aes256Gcm>),
     ChaCha(Box<ChaCha20Poly1305>),
@@ -85,7 +112,12 @@ fn nonce(counter: u64) -> [u8; 12] {
 }
 
 impl FrameKey {
+    /// Panics if `cipher` is not supported here; callers check it with
+    /// [`Cipher::ensure_supported`] where it is chosen or accepted.
     pub fn new(cipher: Cipher, key: &[u8; 32]) -> Self {
+        if let Err(e) = cipher.ensure_supported() {
+            panic!("{e}");
+        }
         FrameKey(match cipher {
             Cipher::Aes256Gcm => AnyAead::Aes(Box::new(Aes256Gcm::new(key.into()))),
             Cipher::ChaCha20Poly1305 => {

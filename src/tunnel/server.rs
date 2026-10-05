@@ -433,6 +433,14 @@ async fn control(
     let (r, w) = stream.into_split();
     let mut tx = CtrlTx::new(w, &keys, false);
     let rx = rx.with_reader(|()| BufReader::new(r));
+    if let Err(e) = cipher.ensure_supported() {
+        let why = format!("the server cannot use this cipher: {e}");
+        tx.send(&TunnelMsg::Error {
+            message: why.clone(),
+        })
+        .await?;
+        bail!("session from {from} (key {peer}) refused: {why}");
+    }
     let place = match shared.place_session(peer) {
         Ok(place) => place,
         Err(why) => {
