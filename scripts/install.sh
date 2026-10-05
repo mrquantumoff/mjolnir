@@ -4,8 +4,8 @@
 # Downloads from the release's public URLs, so it needs no GitHub login or
 # token. If openssl is on PATH, the release's SHA256SUMS must carry a valid
 # signature by the release key below; without openssl only the checksum is
-# checked. The archive is checked against SHA256SUMS before anything is
-# installed.
+# checked. The archive is checked against SHA256SUMS, and the binary must
+# report the version of the release's tag, before anything is installed.
 #
 # usage: scripts/install.sh
 #   MJOLNIR_VERSION      release tag to install, e.g. v0.1.0 (default: latest)
@@ -36,6 +36,14 @@ verify_signature() {
   openssl dgst -sha256 -verify "$1.pem" -signature "$1.sig" "$1" >/dev/null 2>&1
 }
 
+# Dies unless the binary $1 reports the version of tag $2.
+check_version() {
+  local got
+  got="$("$1" --version 2>/dev/null)" || die "the release's binary does not run"
+  [ "$got" = "mjolnir ${2#v}" ] ||
+    die "the release's binary reports version ${got#mjolnir }, not ${2#v}"
+}
+
 case "$(uname -s)" in
   Linux) os=unknown-linux-gnu ;;
   Darwin) os=apple-darwin ;;
@@ -51,14 +59,21 @@ asset="mjolnir-$arch-$os.tar.gz"
 if command -v sha256sum >/dev/null; then sha256=(sha256sum); else sha256=(shasum -a 256); fi
 
 command -v curl >/dev/null || die "curl is required"
+# Every file comes from the tag `latest` redirects to, so they cannot come
+# from different releases, and the binary's version can be checked against it.
 if [ "$version" = latest ]; then
-  base="https://github.com/$repo/releases/latest/download"
-else
-  base="https://github.com/$repo/releases/download/$version"
+  latest="$(curl -fsSLI --proto '=https' --retry 2 -o /dev/null -w '%{url_effective}' \
+    "https://github.com/$repo/releases/latest")" || die "cannot find the latest release of $repo"
+  case "$latest" in
+    */releases/tag/?*) version="${latest##*/releases/tag/}" ;;
+    *) die "$repo has no latest release" ;;
+  esac
 fi
+base="https://github.com/$repo/releases/download/$version"
 
 tmp="$(mktemp -d)"
-trap 'rm -rf "$tmp"' EXIT
+staged="$install_dir/mjolnir.new"
+trap 'rm -rf "$tmp"; rm -f "$staged"' EXIT
 
 for name in SHA256SUMS SHA256SUMS.sig "$asset"; do
   curl -fsSL --proto '=https' --retry 2 -o "$tmp/$name" "$base/$name" ||
@@ -76,7 +91,11 @@ fi
   die "checksum mismatch for $asset"
 tar -xzf "$tmp/$asset" -C "$tmp" mjolnir
 mkdir -p "$install_dir"
-install -m 755 "$tmp/mjolnir" "$install_dir/mjolnir"
+# Staged beside its destination rather than in the temp directory, which
+# may be mounted noexec.
+install -m 755 "$tmp/mjolnir" "$staged"
+check_version "$staged" "$version"
+mv -f "$staged" "$install_dir/mjolnir"
 
 echo "installed $("$install_dir/mjolnir" --version) to $install_dir/mjolnir"
 case ":$PATH:" in

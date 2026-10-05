@@ -6,7 +6,12 @@ Each release holds a `SHA256SUMS` file and `SHA256SUMS.sig`, an ECDSA P-256
 signature of it. The release's public key is written into both scripts and
 into the binary. The scripts check the signature first and refuse the
 release if it is missing or does not verify, then check the archive against
-its `SHA256SUMS` line. `install.ps1` verifies with .NET and always checks
+its `SHA256SUMS` line. They resolve `latest` through GitHub's
+`releases/latest` redirect and download every file from that tag. The new
+binary is staged in the install directory and moved into place only after
+its `--version` reports the tag's version, so an older signed release served
+under a newer tag is refused and leaves the installed binary as it was.
+`install.ps1` verifies with .NET and always checks
 the signature. `install.sh` verifies with `openssl`; on a system without
 `openssl` it prints a warning and checks only the checksum, which guards
 against a corrupt download but not against a swapped release. Releases up
