@@ -33,9 +33,9 @@ use sha2::{Digest, Sha256};
 pub const RELEASES_URL: &str = "https://github.com/mrquantumoff/mjolnir/releases";
 
 /// The ECDSA P-256 key that signs `SHA256SUMS` in every release, as base64
-/// of its SubjectPublicKeyInfo DER. `MJOLNIR_RELEASE_KEY` overrides it, but
-/// only together with `MJOLNIR_RELEASES_URL`, for a fork that signs its own
-/// releases.
+/// of its SubjectPublicKeyInfo DER. The install scripts carry the same
+/// string. `MJOLNIR_RELEASE_KEY` overrides it, but only together with
+/// `MJOLNIR_RELEASES_URL`, for a fork that signs its own releases.
 pub const RELEASE_KEY: &str = "MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEfCWNtshHxuxy4XyVXfa/O62yS79tJXqzlChtlVlBGHkHoF470qqwhXnhR/tVxC2a6H/M7miFldxmAlr8R/G1BA==";
 
 /// This platform's release archive, if releases include one.
@@ -304,5 +304,21 @@ impl TempDir {
 impl Drop for TempDir {
     fn drop(&mut self) {
         let _ = fs::remove_dir_all(&self.0);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn install_scripts_carry_the_release_key() {
+        parse_key(RELEASE_KEY).unwrap();
+        for (name, script) in [
+            ("install.sh", include_str!("../scripts/install.sh")),
+            ("install.ps1", include_str!("../scripts/install.ps1")),
+        ] {
+            assert!(script.contains(RELEASE_KEY), "{name} has another key");
+        }
     }
 }

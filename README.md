@@ -14,8 +14,18 @@ connections; see [Tunnels](#tunnels).
 
 Releases ship prebuilt binaries for Linux, macOS, and Windows on x86_64
 and aarch64. The install scripts download the latest one from the release's
-public URLs, check it against the release's `SHA256SUMS`, and install it. No
-GitHub account, login, or token is needed.
+public URLs, check it, and install it. No GitHub account, login, or token is
+needed.
+
+Each release holds a `SHA256SUMS` file and `SHA256SUMS.sig`, an ECDSA P-256
+signature of it. The release's public key is written into both scripts and
+into the binary. The scripts check the signature first and refuse the
+release if it is missing or does not verify, then check the archive against
+its `SHA256SUMS` line. `install.ps1` verifies with .NET and always checks
+the signature. `install.sh` verifies with `openssl`; on a system without
+`openssl` it prints a warning and checks only the checksum, which guards
+against a corrupt download but not against a swapped release. Releases up
+to v0.2.0 carry no signature, so the scripts refuse to install them.
 
 On Linux and macOS, [`scripts/install.sh`](scripts/install.sh) installs to
 `~/.local/bin`:
@@ -32,9 +42,11 @@ irm https://raw.githubusercontent.com/mrquantumoff/mjolnir/master/scripts/instal
 ```
 
 Both scripts read `MJOLNIR_VERSION` to install a specific tag instead of
-the latest, and `MJOLNIR_INSTALL_DIR` to install somewhere else. From a
-checkout, run either script directly; `install.ps1` also takes `-Version`
-and `-InstallDir`.
+the latest, and `MJOLNIR_INSTALL_DIR` to install somewhere else.
+`MJOLNIR_REPO` downloads from a fork instead, and `MJOLNIR_RELEASE_KEY` then
+replaces the release key with the fork's; the scripts ignore it for the
+default repository. From a checkout, run either script directly;
+`install.ps1` also takes `-Version`, `-InstallDir`, and `-Repo`.
 
 To build from source instead, run `cargo build --release`; the binary lands
 in `target/release`.
