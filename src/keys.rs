@@ -135,8 +135,39 @@ impl PrivateKey {
     /// Windows a DACL that inherits nothing and grants only this user,
     /// SYSTEM, and Administrators.
     pub fn save(&self, path: &Path) -> Result<()> {
-        let mut file = private_file::create(path)
+        let file = private_file::create(path)
             .with_context(|| format!("creating key file {}", path.display()))?;
+        self.write_to(file)
+    }
+
+    /// Like [`PrivateKey::save`], but for a Windows service running as
+    /// SYSTEM: the file is owned by Administrators and only SYSTEM and
+    /// Administrators can use it. A missing folder for it is created with
+    /// an access list only they can change. Needs an elevated process.
+    #[cfg(windows)]
+    pub fn save_for_system(&self, path: &Path) -> Result<()> {
+        // Setting Administrators as the owner is what fails unelevated.
+        let elevated = |e: std::io::Error| match e.raw_os_error() {
+            Some(1307) => {
+                anyhow!("`keygen --system` needs an elevated terminal (Run as administrator)")
+            }
+            _ => e.into(),
+        };
+        if let Some(dir) = path.parent()
+            && !dir.as_os_str().is_empty()
+            && !dir.exists()
+        {
+            crate::winacl::create_protected_dir(dir)
+                .map_err(elevated)
+                .with_context(|| format!("creating {}", dir.display()))?;
+        }
+        let file = private_file::create_for_system(path)
+            .map_err(elevated)
+            .with_context(|| format!("creating key file {}", path.display()))?;
+        self.write_to(file)
+    }
+
+    fn write_to(&self, mut file: File) -> Result<()> {
         let text = Zeroizing::new(B64.encode(self.0.as_slice()));
         writeln!(file, "{}", text.as_str())?;
         file.sync_all()?;
@@ -447,6 +478,26 @@ mod tests {
         std::fs::write(&plain, B64.encode([7u8; 32])).unwrap();
         let err = format!("{:#}", PrivateKey::load(&plain).unwrap_err());
         assert!(err.contains("S-1-1-0") && err.contains("icacls"), "{err}");
+    }
+
+    /// Elevated, the key loads both here and as LocalSystem; otherwise
+    /// setting its owner fails and says why.
+    #[cfg(windows)]
+    #[test]
+    fn key_for_system_is_usable_by_system_and_administrators() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(r"new dir\k.key");
+        let key = PrivateKey::generate();
+        match key.save_for_system(&path) {
+            Ok(()) => {
+                PrivateKey::check_for_local_system(&path).unwrap();
+                assert_eq!(PrivateKey::load(&path).unwrap().0, key.0);
+            }
+            Err(e) => {
+                let err = format!("{e:#}");
+                assert!(err.contains("elevated terminal"), "{err}");
+            }
+        }
     }
 
     /// A key `save` wrote grants this user, which LocalSystem must refuse,

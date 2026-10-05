@@ -37,6 +37,11 @@ enum Cmd {
     Keygen {
         #[arg(long, default_value = "mjolnir.key")]
         out: PathBuf,
+        /// Let only SYSTEM and Administrators use the key, as a Windows
+        /// service needs. Run it from an elevated terminal.
+        #[cfg(windows)]
+        #[arg(long)]
+        system: bool,
     },
     /// Print the public key of an existing private key file.
     Pubkey {
@@ -252,9 +257,21 @@ fn main() {
 /// `progress_lines`.
 fn run(cmd: Cmd, progress_lines: bool) -> Result<()> {
     match cmd {
-        Cmd::Keygen { out } => {
+        Cmd::Keygen {
+            out,
+            #[cfg(windows)]
+            system,
+        } => {
             let key = PrivateKey::generate();
-            key.save(&out)?;
+            #[cfg(windows)]
+            let save = if system {
+                PrivateKey::save_for_system
+            } else {
+                PrivateKey::save
+            };
+            #[cfg(not(windows))]
+            let save = PrivateKey::save;
+            save(&key, &out)?;
             eprintln!("wrote private key to {}", out.display());
             println!("{}", key.public_key());
         }

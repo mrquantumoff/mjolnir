@@ -29,6 +29,8 @@ pub mod tunnel;
 #[cfg(feature = "self-update")]
 pub mod update;
 pub mod web;
+#[cfg(windows)]
+mod winacl;
 pub mod wire;
 
 pub use crypto::Cipher;
