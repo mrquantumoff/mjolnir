@@ -3,15 +3,17 @@
 
 use std::io::ErrorKind;
 use std::net::SocketAddr;
+use std::sync::Arc;
 use std::time::Duration;
 
 use mjolnir::keys::{AuthorizedKey, KeyOption};
 use mjolnir::tunnel::{
-    ClientConfig, ForwardSpec, Permits, Policy, ServerConfig, TunnelClient, TunnelServer,
+    Backoff, ClientConfig, ForwardSpec, Permits, Policy, ServerConfig, TunnelClient, TunnelServer,
 };
 use mjolnir::{Cipher, PrivateKey};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::Notify;
 use tokio::task::JoinHandle;
 use tokio::time::timeout;
 
@@ -607,4 +609,241 @@ async fn stdio_closes_stdout_when_the_target_ends() {
         .unwrap()
         .unwrap();
     assert!(status.success(), "{status}");
+}
+
+/// Waits short enough for a test, and never started over.
+const QUICK: Backoff = Backoff {
+    initial: Duration::from_millis(50),
+    max: Duration::from_millis(500),
+    stable: Duration::from_secs(3600),
+};
+
+/// A server that runs until [`Running::stop`].
+struct Running {
+    addr: SocketAddr,
+    stop: Arc<Notify>,
+    serving: JoinHandle<()>,
+}
+
+async fn start(listen: SocketAddr, key: &PrivateKey, policy: &Policy) -> Running {
+    let server = TunnelServer::bind(ServerConfig {
+        listen,
+        key: key.clone(),
+        policy: policy.clone(),
+        verbose: true,
+    })
+    .await
+    .unwrap();
+    let addr = server.local_addr();
+    let stop = Arc::new(Notify::new());
+    let serving = tokio::spawn({
+        let stop = stop.clone();
+        async move {
+            server
+                .run_until(async move { stop.notified().await })
+                .await
+                .unwrap()
+        }
+    });
+    Running {
+        addr,
+        stop,
+        serving,
+    }
+}
+
+impl Running {
+    async fn stop(self) {
+        self.stop.notify_one();
+        timeout(LIMIT, self.serving).await.unwrap().unwrap();
+    }
+}
+
+/// A port nothing listens on at the moment.
+async fn free_port() -> u16 {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    listener.local_addr().unwrap().port()
+}
+
+/// Round trips through `addr` until one comes back intact.
+async fn round_trip_eventually(addr: SocketAddr, data: &[u8]) {
+    timeout(LIMIT, async {
+        loop {
+            if let Ok(got) = round_trip(addr, data).await
+                && got == data
+            {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("{addr} never forwarded again"));
+}
+
+/// A connection to `addr` must be reset at once, not left waiting.
+async fn expect_reset_at_once(addr: SocketAddr) {
+    let ended = timeout(Duration::from_secs(5), async {
+        let mut s = TcpStream::connect(addr).await?;
+        let mut buf = [0u8; 16];
+        s.read(&mut buf).await
+    })
+    .await
+    .expect("a local connection waited while no session was up");
+    assert_eq!(ended.unwrap_err().kind(), ErrorKind::ConnectionReset);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_reconnecting_client_forwards_again_after_the_server_restarts() {
+    let echo = echo_server().await;
+    let (client_key, server_key) = (PrivateKey::generate(), PrivateKey::generate());
+    let policy = Policy::new(
+        &plain(&client_key),
+        permits(&["127.0.0.1:*"], &["127.0.0.1:*"]),
+    )
+    .unwrap();
+    let server = start("127.0.0.1:0".parse().unwrap(), &server_key, &policy).await;
+    let remote = SocketAddr::from(([127, 0, 0, 1], free_port().await));
+    let target = format!("127.0.0.1:{}", echo.port());
+    let client = TunnelClient::connect(ClientConfig {
+        addr: server.addr.to_string(),
+        key: client_key,
+        peer: server_key.public_key(),
+        cipher: Cipher::Aes256Gcm,
+        conns: 2,
+        local: vec![format!("127.0.0.1:0:{target}").parse().unwrap()],
+        remote: vec![format!("{remote}:{target}").parse().unwrap()],
+        verbose: true,
+    })
+    .await
+    .unwrap();
+    let local = client.local_addrs()[0];
+    let stop = Arc::new(Notify::new());
+    let run = tokio::spawn({
+        let stop = stop.clone();
+        client.run_reconnecting(QUICK, async move { stop.notified().await })
+    });
+    let data = pattern(1 << 20, 11);
+    for addr in [local, remote] {
+        let got = timeout(LIMIT, round_trip(addr, &data)).await.unwrap();
+        assert!(got.unwrap() == data, "{addr} before the restart");
+    }
+
+    let mut open = TcpStream::connect(local).await.unwrap();
+    open.write_all(b"hi").await.unwrap();
+    let mut hi = [0u8; 2];
+    timeout(LIMIT, open.read_exact(&mut hi))
+        .await
+        .unwrap()
+        .unwrap();
+    let addr = server.addr;
+    server.stop().await;
+    let err = timeout(LIMIT, open.read_to_end(&mut Vec::new()))
+        .await
+        .unwrap()
+        .expect_err("a stream cut off with its session must not end cleanly");
+    assert_eq!(err.kind(), ErrorKind::ConnectionReset);
+
+    // Holding the -R port, as a server's stale session would, fails every
+    // attempt until it lets go.
+    let squatter = TcpListener::bind(remote).await.unwrap();
+    let server = start(addr, &server_key, &policy).await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    expect_reset_at_once(local).await;
+    drop(squatter);
+    round_trip_eventually(local, &data).await;
+    round_trip_eventually(remote, &data).await;
+    stop.notify_one();
+    timeout(LIMIT, run).await.unwrap().unwrap();
+    server.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_reconnecting_client_stops_at_once_while_it_waits() {
+    let (client_key, server_key) = (PrivateKey::generate(), PrivateKey::generate());
+    let policy = Policy::new(&plain(&client_key), permits(&["127.0.0.1:*"], &[])).unwrap();
+    let server = start("127.0.0.1:0".parse().unwrap(), &server_key, &policy).await;
+    let client = TunnelClient::connect(ClientConfig {
+        addr: server.addr.to_string(),
+        key: client_key,
+        peer: server_key.public_key(),
+        cipher: Cipher::Aes256Gcm,
+        conns: 1,
+        local: vec!["127.0.0.1:0:127.0.0.1:1".parse().unwrap()],
+        remote: vec![],
+        verbose: true,
+    })
+    .await
+    .unwrap();
+    let local = client.local_addrs()[0];
+    let stop = Arc::new(Notify::new());
+    let backoff = Backoff {
+        initial: Duration::from_secs(3600),
+        ..QUICK
+    };
+    let run = tokio::spawn({
+        let stop = stop.clone();
+        client.run_reconnecting(backoff, async move { stop.notified().await })
+    });
+    server.stop().await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    expect_reset_at_once(local).await;
+    stop.notify_one();
+    timeout(Duration::from_secs(5), run)
+        .await
+        .expect("stopping must not wait out the backoff")
+        .unwrap();
+}
+
+fn mjolnir_tunnel(server: SocketAddr, key: &std::path::Path) -> std::process::Command {
+    let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_mjolnir"));
+    cmd.arg("tunnel")
+        .arg(server.to_string())
+        .arg("--key")
+        .arg(key)
+        .stdin(std::process::Stdio::null());
+    cmd
+}
+
+/// Retrying is for sessions that once worked: a first connect that fails
+/// exits with its error.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_reconnecting_client_still_fails_fast_on_its_first_connect() {
+    let setup = server(permits(&["*"], &[]), |_| {
+        vec![AuthorizedKey {
+            key: PrivateKey::generate().public_key(),
+            options: vec![],
+        }]
+    })
+    .await;
+    let dir = tempfile::tempdir().unwrap();
+    let key_path = dir.path().join("client.key");
+    setup.client_key.save(&key_path).unwrap();
+    let mut cmd = mjolnir_tunnel(setup.server, &key_path);
+    cmd.arg("--peer").arg(setup.server_key.to_string()).args([
+        "--reconnect",
+        "-L",
+        "0:127.0.0.1:1",
+    ]);
+    let out = timeout(LIMIT, tokio::task::spawn_blocking(move || cmd.output()))
+        .await
+        .expect("a rejected first connect must not be retried")
+        .unwrap()
+        .unwrap();
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("rejected the handshake"), "{stderr}");
+}
+
+#[test]
+fn reconnect_and_stdio_do_not_go_together() {
+    let out = mjolnir_tunnel("127.0.0.1:1".parse().unwrap(), "client.key".as_ref())
+        .arg("--peer")
+        .arg(PrivateKey::generate().public_key().to_string())
+        .args(["--reconnect", "-W", "127.0.0.1:22"])
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("cannot be used with"), "{stderr}");
 }

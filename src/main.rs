@@ -11,7 +11,7 @@ use clap::{Parser, Subcommand};
 use mjolnir::filemap::{ApplyPolicy, Preserve};
 use mjolnir::keys::AuthorizedKey;
 use mjolnir::printable::escape;
-use mjolnir::tunnel::{self, ForwardSpec, HostPort, Pattern, Permits, Policy};
+use mjolnir::tunnel::{self, Backoff, ForwardSpec, HostPort, Pattern, Permits, Policy};
 use mjolnir::{
     Cipher, Phase, PhaseTimes, PrivateKey, Progress, PublicKey, Receiver, RecvConfig, RecvReport,
     SendConfig, load_authorized_entries, parse_size, transfer_keys, web,
@@ -134,6 +134,10 @@ enum Cmd {
         connections: u32,
         #[arg(long, value_enum, default_value_t = Cipher::Aes256Gcm)]
         cipher: Cipher,
+        /// When a session ends, set up a new one, waiting 1 s, doubling to
+        /// 60 s, between attempts. The first session must still succeed.
+        #[arg(long, conflicts_with = "stdio")]
+        reconnect: bool,
         /// Log every stream.
         #[arg(short = 'v', long)]
         verbose: bool,
@@ -320,6 +324,7 @@ fn run(cmd: Cmd) -> Result<()> {
             stdio,
             connections,
             cipher,
+            reconnect,
             verbose,
         } => {
             if stdio.is_none() && local.is_empty() && remote.is_empty() {
@@ -341,7 +346,14 @@ fn run(cmd: Cmd) -> Result<()> {
                     Some(target) => client.stdio(target).await.map(drop),
                     None => {
                         eprintln!("mjolnir: tunnel up");
-                        client.run_until(interrupted()).await
+                        if reconnect {
+                            client
+                                .run_reconnecting(Backoff::default(), interrupted())
+                                .await;
+                            Ok(())
+                        } else {
+                            client.run_until(interrupted()).await
+                        }
                     }
                 }
             })?;

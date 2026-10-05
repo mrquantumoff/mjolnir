@@ -20,7 +20,7 @@ mod spec;
 #[cfg(test)]
 mod tests;
 
-pub use client::{ClientConfig, TunnelClient};
+pub use client::{Backoff, ClientConfig, TunnelClient};
 pub use pump::Traffic;
 pub use server::{ServerConfig, TunnelServer};
 pub use spec::{DEFAULT_BIND, ForwardSpec, HostPort, Pattern, Permits, Policy};

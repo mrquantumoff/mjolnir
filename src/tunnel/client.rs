@@ -7,6 +7,7 @@ use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context as TaskContext, Poll};
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
@@ -62,6 +63,58 @@ const CTRL_QUEUE: usize = 64;
 pub struct TunnelClient {
     session: Session,
     local: LocalForwards,
+    cfg: ClientConfig,
+}
+
+/// How long [`TunnelClient::run_reconnecting`] waits before each attempt.
+#[derive(Clone, Copy, Debug)]
+pub struct Backoff {
+    /// The first wait. Each failed attempt doubles it.
+    pub initial: Duration,
+    /// The longest wait.
+    pub max: Duration,
+    /// A session that stays up this long starts the waits over.
+    pub stable: Duration,
+}
+
+impl Default for Backoff {
+    fn default() -> Self {
+        Backoff {
+            initial: Duration::from_secs(1),
+            max: Duration::from_secs(60),
+            stable: Duration::from_secs(60),
+        }
+    }
+}
+
+/// The waits of one reconnecting client, in order.
+struct Waits {
+    backoff: Backoff,
+    next: Duration,
+}
+
+impl Waits {
+    fn new(backoff: Backoff) -> Self {
+        Waits {
+            backoff,
+            next: backoff.initial,
+        }
+    }
+
+    /// The wait after a session that was up for `lasted`.
+    fn after_session(&mut self, lasted: Duration) -> Duration {
+        if lasted >= self.backoff.stable {
+            self.next = self.backoff.initial;
+        }
+        self.take()
+    }
+
+    /// The wait after a failed attempt.
+    fn take(&mut self) -> Duration {
+        let wait = self.next;
+        self.next = wait.saturating_mul(2).min(self.backoff.max);
+        wait
+    }
 }
 
 /// One authenticated session, with every `-R` listener set up on the
@@ -114,7 +167,11 @@ impl TunnelClient {
         );
         let session = Session::establish(&cfg).await?;
         let local = LocalForwards::bind(&cfg.local, cfg.verbose).await?;
-        Ok(TunnelClient { session, local })
+        Ok(TunnelClient {
+            session,
+            local,
+            cfg,
+        })
     }
 
     /// Where each `-L` forward listens, in the order given.
@@ -141,6 +198,49 @@ impl TunnelClient {
             Ok(())
         })
         .await
+    }
+
+    /// Like [`TunnelClient::run_until`], but when the session ends, waits
+    /// as `backoff` says and sets up a new one, until `stop` completes.
+    /// Every `-R` listener is asked for again on each new session. The `-L`
+    /// listeners stay bound throughout, and reset what they accept while
+    /// no session is up.
+    pub async fn run_reconnecting(self, backoff: Backoff, stop: impl Future<Output = ()>) {
+        let TunnelClient {
+            mut session,
+            mut local,
+            cfg,
+        } = self;
+        tokio::pin!(stop);
+        let mut waits = Waits::new(backoff);
+        'serving: loop {
+            let up = Instant::now();
+            let ended = session
+                .run_with(&mut local.accepted, async {
+                    stop.as_mut().await;
+                    Ok(())
+                })
+                .await;
+            let Err(e) = ended else { break };
+            let mut wait = waits.after_session(up.elapsed());
+            eprintln!("mjolnir: session ended: {e:#}; reconnecting in {wait:?}");
+            session = loop {
+                let attempt = async {
+                    tokio::time::sleep(wait).await;
+                    Session::establish(&cfg).await
+                };
+                match local.refusing_while(attempt, stop.as_mut()).await {
+                    None => break 'serving,
+                    Some(Ok(session)) => break session,
+                    Some(Err(e)) => {
+                        wait = waits.take();
+                        eprintln!("mjolnir: reconnecting failed: {e:#}; retrying in {wait:?}");
+                    }
+                }
+            };
+            eprintln!("mjolnir: tunnel up again");
+        }
+        local.acceptors.shutdown().await;
     }
 
     /// Carries one stream to `target` over stdin and stdout, as `ssh -W`
@@ -172,7 +272,9 @@ impl TunnelClient {
 
     /// Runs the session alongside `work`, returning when either ends.
     async fn run_with<T>(self, work: impl Future<Output = Result<T>>) -> Result<T> {
-        let TunnelClient { session, mut local } = self;
+        let TunnelClient {
+            session, mut local, ..
+        } = self;
         let result = session.run_with(&mut local.accepted, work).await;
         local.acceptors.shutdown().await;
         result
@@ -206,6 +308,23 @@ impl LocalForwards {
             accepted,
             acceptors,
         })
+    }
+
+    /// Runs `work`, resetting every connection accepted meanwhile, as a
+    /// broken stream would. `None` if `stop` completes first.
+    async fn refusing_while<T>(
+        &mut self,
+        work: impl Future<Output = T>,
+        stop: impl Future<Output = ()>,
+    ) -> Option<T> {
+        tokio::pin!(work, stop);
+        loop {
+            tokio::select! {
+                () = &mut stop => return None,
+                done = &mut work => return Some(done),
+                Some((socket, ..)) = self.accepted.recv() => drop(ResetGuard::new(&socket)),
+            }
+        }
     }
 }
 
@@ -656,7 +775,18 @@ async fn serve_incoming(shared: Arc<Shared>, stream: u32, from: String, target: 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::Duration;
+
+    #[test]
+    fn waits_double_up_to_the_max_and_start_over_after_a_stable_session() {
+        let s = Duration::from_secs;
+        let mut waits = Waits::new(Backoff::default());
+        assert_eq!(waits.after_session(s(5)), s(1));
+        let failed: Vec<_> = (0..7).map(|_| waits.take()).collect();
+        assert_eq!(failed, [2, 4, 8, 16, 32, 60, 60].map(s));
+        assert_eq!(waits.after_session(s(59)), s(60), "a short session");
+        assert_eq!(waits.after_session(s(60)), s(1), "a stable session");
+        assert_eq!(waits.take(), s(2));
+    }
 
     #[test]
     fn server_stream_ids_must_have_the_top_bit_and_grow() {
