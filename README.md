@@ -219,9 +219,9 @@ receiver, a tunnel server, or a tunnel client. The command goes after
 would stop after one transfer and a client after one session.
 
 The service runs as SYSTEM, so mjolnir must live where only
-administrators can change it, and so must its key and authorized-keys
-files. In an elevated terminal (Run as administrator), install mjolnir
-under Program Files:
+administrators can change it, and so must its key, its authorized-keys
+file, and the folder a receiver writes into. In an elevated terminal
+(Run as administrator), install mjolnir under Program Files:
 
 ```powershell
 $env:MJOLNIR_INSTALL_DIR = "$env:ProgramFiles\mjolnir"
@@ -236,7 +236,7 @@ mjolnir keygen --system --out $env:ProgramData\mjolnir\recv.key
 Set-Content $env:ProgramData\mjolnir\senders.txt "<SENDER_PUBLIC_KEY>"
 cd $env:ProgramData\mjolnir
 mjolnir service install inbox -- recv --keep-listening --key recv.key `
-    --authorized senders.txt --out D:\incoming
+    --authorized senders.txt --out incoming
 mjolnir service start inbox
 ```
 
@@ -270,9 +270,14 @@ The service runs as LocalSystem, so it reads keys and writes files as
 SYSTEM. Received files take the access list of their `--out` directory.
 `install` refuses, and the service refuses again each time it starts,
 when an account other than SYSTEM, Administrators, and TrustedInstaller
-can change the mjolnir binary or its folder, the key, or the
-authorized-keys file, or can replace one of them through a folder above
-it. The error names those accounts. `keygen --system` writes a key that
+can change the mjolnir binary or its folder, the key, the
+authorized-keys file, or a receiver's `--out` folder (or, if it does not
+exist yet, the nearest folder above it), or can replace one of them
+through a folder above it. A receiver writing as SYSTEM into a folder
+others can change would follow links they plant there. The error names
+those accounts. A folder made under `%ProgramData%\mjolnir` passes; one
+made elsewhere usually inherits write access for Users and needs the
+`icacls` command the error prints. `keygen --system` writes a key that
 passes, and creates its folder the same way if it is missing; read the
 key with `mjolnir pubkey` from an elevated terminal. A key `keygen`
 wrote without `--system` also grants your account, so `install` refuses

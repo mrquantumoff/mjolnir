@@ -95,19 +95,21 @@ impl ServiceName {
     }
 }
 
-/// What a service's command trusts besides this binary: its private key
-/// and, for `recv` and `tunnel-server`, its authorized-keys file.
+/// What a service's command trusts besides this binary: its private key,
+/// for `recv` and `tunnel-server` its authorized-keys file, and for `recv`
+/// the folder it writes into.
 pub struct Inputs<'a> {
     pub key: &'a Path,
     pub authorized: Option<&'a Path>,
+    pub out: Option<&'a Path>,
 }
 
 const PROTECTED: &str = "accounts other than SYSTEM, Administrators, and TrustedInstaller";
 
 /// Refuses what a service running as SYSTEM must not trust: this binary
-/// or its folder, the key, or the authorized-keys file, when an account
-/// outside SYSTEM, Administrators, and TrustedInstaller can change it, and
-/// a key LocalSystem would refuse to read.
+/// or its folder, the key, the authorized-keys file, or the output folder,
+/// when an account outside SYSTEM, Administrators, and TrustedInstaller can
+/// change it, and a key LocalSystem would refuse to read.
 pub fn check_inputs(inputs: &Inputs) -> Result<()> {
     let exe = std::env::current_exe()?;
     let folder = exe.parent().context("the binary has no folder")?;
@@ -142,7 +144,28 @@ pub fn check_inputs(inputs: &Inputs) -> Result<()> {
              %ProgramData%\\mjolnir, and write it from an elevated terminal",
         )?;
     }
+    if let Some(out) = inputs.out {
+        check_out(out)?;
+    }
     Ok(())
+}
+
+fn check_out(out: &Path) -> Result<()> {
+    // recv creates a missing folder, so the nearest one that exists decides
+    // who could plant links in it first.
+    let out = std::path::absolute(out)?;
+    let existing = out
+        .ancestors()
+        .find(|p| fs::symlink_metadata(p).is_ok())
+        .unwrap_or(&out);
+    require_protected(
+        "output folder",
+        existing,
+        "files written there as SYSTEM would follow links other accounts plant; receive into \
+         a folder only administrators can change, such as one restricted with `icacls DIR \
+         /inheritance:r /grant:r *S-1-5-18:(OI)(CI)F *S-1-5-32-544:(OI)(CI)F \
+         *S-1-5-32-545:(OI)(CI)RX`",
+    )
 }
 
 fn require_protected(what: &str, path: &Path, fix: &str) -> Result<()> {
@@ -785,10 +808,22 @@ mod tests {
     }
 
     #[test]
+    fn an_output_folder_others_can_change_is_refused() {
+        let user = tempfile::tempdir().unwrap();
+        for out in [user.path().to_path_buf(), user.path().join("missing/in")] {
+            let err = format!("{:#}", check_out(&out).unwrap_err());
+            assert!(err.contains("output folder"), "{}: {err}", out.display());
+        }
+        let system = std::env::var_os("SystemRoot").unwrap();
+        check_out(&Path::new(&system).join("System32").join("mjolnir-missing")).unwrap();
+    }
+
+    #[test]
     fn a_binary_under_a_user_folder_is_refused() {
         let err = check_inputs(&Inputs {
             key: Path::new("unused.key"),
             authorized: None,
+            out: None,
         })
         .unwrap_err();
         let err = format!("{err:#}");

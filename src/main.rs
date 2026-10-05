@@ -633,17 +633,26 @@ fn parse_service_command(args: &[OsString]) -> Result<Cmd> {
 fn service_inputs(cmd: &Cmd) -> service::Inputs<'_> {
     match cmd {
         Cmd::Recv {
-            key, authorized, ..
-        }
-        | Cmd::TunnelServer {
+            key,
+            authorized,
+            out,
+            ..
+        } => service::Inputs {
+            key,
+            authorized: authorized.as_deref(),
+            out: Some(out),
+        },
+        Cmd::TunnelServer {
             key, authorized, ..
         } => service::Inputs {
             key,
             authorized: authorized.as_deref(),
+            out: None,
         },
         Cmd::Tunnel { key, .. } => service::Inputs {
             key,
             authorized: None,
+            out: None,
         },
         _ => unreachable!("parse_service_command accepts only these"),
     }
