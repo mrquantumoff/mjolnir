@@ -88,8 +88,9 @@ connections they carried. A receiver cancels its transfer, which resumes
 from staging when the sender retries. When the command fails on its own,
 for example because its port is taken or a client's first session fails,
 the service stops with an error and the service manager starts it again
-10 seconds later. It does this up to 3 times, and the count starts over
-after a day without a failure. A stop you ask for is not a failure.
+10 seconds later. It does this up to 3 times. After a fourth failure the
+service stays stopped until you start it, and the count starts over after
+a day without a failure. A stop you ask for is not a failure.
 
 ## Linux
 

@@ -250,16 +250,12 @@ pub fn install(
     }
     let created = ScHandle(service);
     let configured = (|| -> Result<()> {
-        let restart = ServiceAction {
-            action_type: ServiceActionType::Restart,
-            delay: RESTART_DELAY,
-        };
         let service = open(name, ServiceAccess::CHANGE_CONFIG | ServiceAccess::START)?;
         service.update_failure_actions(ServiceFailureActions {
             reset_period: ServiceFailureResetPeriod::After(FAILURE_RESET),
             reboot_msg: None,
             command: None,
-            actions: Some(vec![restart; RESTARTS]),
+            actions: Some(failure_actions()),
         })?;
         // Otherwise only a crash counts as a failure, not a stop with an error.
         service.set_failure_actions_on_non_crash_failures(true)?;
@@ -269,6 +265,22 @@ pub fn install(
         unsafe { DeleteService(created.0) };
     }
     configured
+}
+
+/// `RESTARTS` restarts, then nothing: the service manager repeats the last
+/// action for every failure past the list.
+fn failure_actions() -> Vec<ServiceAction> {
+    let restart = ServiceAction {
+        action_type: ServiceActionType::Restart,
+        delay: RESTART_DELAY,
+    };
+    let give_up = ServiceAction {
+        action_type: ServiceActionType::None,
+        delay: Duration::ZERO,
+    };
+    let mut actions = vec![restart; RESTARTS];
+    actions.push(give_up);
+    actions
 }
 
 /// Starts the service and waits until it runs. Returns its PID.
@@ -805,6 +817,18 @@ mod tests {
             let err = format!("{:#}", open_log(&dir.path().join(log)).unwrap_err());
             assert!(err.contains("reparse point"), "{log}: {err}");
         }
+    }
+
+    #[test]
+    fn failures_past_the_restarts_leave_the_service_stopped() {
+        let actions = failure_actions();
+        assert_eq!(actions.len(), RESTARTS + 1);
+        assert!(
+            actions[..RESTARTS]
+                .iter()
+                .all(|a| a.action_type == ServiceActionType::Restart)
+        );
+        assert_eq!(actions[RESTARTS].action_type, ServiceActionType::None);
     }
 
     #[test]
