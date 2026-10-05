@@ -36,4 +36,6 @@ service checks who can change its `--out` folder, or the nearest folder
 above it that exists, but not the folders under it. Do not grant other
 accounts write access anywhere under a service's `--out`. A subfolder
 they can change could be swapped for a junction that redirects the
-receiver's writes as SYSTEM.
+receiver's writes as SYSTEM. A service's binary, key, authorized-keys
+file, log, and output folder may not pass through a junction, symlink,
+or mounted-folder link; give their real paths.

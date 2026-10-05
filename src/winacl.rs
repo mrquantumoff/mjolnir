@@ -26,9 +26,10 @@ use windows_sys::Win32::Security::{
 };
 use windows_sys::Win32::Storage::FileSystem::{
     CreateDirectoryW, CreateFileW, DELETE, FILE_APPEND_DATA, FILE_ATTRIBUTE_REPARSE_POINT,
-    FILE_DELETE_CHILD, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_DELETE,
-    FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_WRITE_DATA, GetFinalPathNameByHandleW, OPEN_EXISTING,
-    READ_CONTROL, VOLUME_NAME_DOS, VOLUME_NAME_GUID, WRITE_DAC, WRITE_OWNER,
+    FILE_DELETE_CHILD, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
+    FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_WRITE_DATA,
+    GetFinalPathNameByHandleW, OPEN_EXISTING, READ_CONTROL, VOLUME_NAME_DOS, VOLUME_NAME_GUID,
+    WRITE_DAC, WRITE_OWNER,
 };
 use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 
@@ -213,13 +214,13 @@ fn is_admin(sid: PSID) -> io::Result<bool> {
 }
 
 /// Opens `path` itself, not what a link there points to, to read its
-/// security.
+/// security and attributes.
 fn open_for_security(path: &Path) -> io::Result<fs::File> {
     use std::os::windows::io::FromRawHandle;
     let handle = unsafe {
         CreateFileW(
             wide(path.as_os_str()).as_ptr(),
-            READ_CONTROL,
+            READ_CONTROL | FILE_READ_ATTRIBUTES,
             FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
             null_mut(),
             OPEN_EXISTING,
@@ -275,7 +276,7 @@ fn final_path(file: &fs::File) -> io::Result<PathBuf> {
 /// The accounts other than SYSTEM, Administrators, and TrustedInstaller
 /// that can change `path`, add files to it if it is a folder, or replace
 /// it through a folder above it, each with where it can. Empty when there
-/// are none. Refuses a path that is itself a link.
+/// are none. Refuses a path that is a link or passes through one.
 pub(crate) fn outside_writers(path: &Path) -> Result<Vec<String>> {
     use std::os::windows::io::AsRawHandle;
     let path = std::path::absolute(path)?;
@@ -289,11 +290,10 @@ pub(crate) fn outside_writers(path: &Path) -> Result<Vec<String>> {
         .with_context(|| format!("resolving {}", path.display()))?;
     let resolved = (!resolved.as_os_str().eq_ignore_ascii_case(&path)).then_some(resolved);
     let mut found = Vec::new();
-    // A folder above `path` is opened as the link it may be, so the chain
-    // of `path` says who can replace a junction, symlink, or mount point
-    // there, but not who can change the folders it leads to. The chain
-    // `path` resolves to says that. Links themselves stay allowed, since
-    // mounted volumes and relocated folders are legitimate.
+    // Whoever can write to a link above `path` can retarget it, and a link
+    // can lead through further links, so none is allowed. The chain `path`
+    // resolves to still matters for paths that differ without a link, such
+    // as a `subst` drive.
     let levels = std::iter::once((path.as_path(), CHANGE))
         .chain(path.ancestors().skip(1).map(|dir| (dir, REPLACE)))
         .chain(
@@ -304,6 +304,23 @@ pub(crate) fn outside_writers(path: &Path) -> Result<Vec<String>> {
     for (at, rights) in levels {
         let file = open_for_security(at)
             .with_context(|| format!("reading the permissions of {}", at.display()))?;
+        let attributes = file
+            .metadata()
+            .with_context(|| format!("reading {}", at.display()))?
+            .file_attributes();
+        if attributes & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            let fix = match &resolved {
+                Some(real) if !real.starts_with(at) => {
+                    format!("; use its real path {}", real.display())
+                }
+                _ => String::new(),
+            };
+            bail!(
+                "{} passes through {}, a link (a reparse point){fix}",
+                path.display(),
+                at.display()
+            );
+        }
         let security = Security::of(file.as_raw_handle())?;
         let mut note = |who: String| {
             let entry = format!("{who} on {}", at.display());
@@ -422,18 +439,22 @@ mod tests {
     }
 
     #[test]
-    fn a_junction_others_can_replace_is_refused_though_its_target_is_protected() {
+    fn a_path_through_a_junction_is_refused_with_its_real_path() {
         let dir = tempfile::tempdir().unwrap();
         let link = dir.path().join("link");
-        let root = std::env::var_os("SystemRoot").unwrap();
-        junction(&link, &Path::new(&root).join("System32"));
-        let found = outside_writers(&link.join("cmd.exe")).unwrap();
-        let on_link = format!(" on {}", link.display());
-        assert!(found.iter().any(|w| w.ends_with(&on_link)), "{found:?}");
+        let system32 = Path::new(&std::env::var_os("SystemRoot").unwrap()).join("System32");
+        junction(&link, &system32);
+        let err = format!("{:#}", outside_writers(&link.join("cmd.exe")).unwrap_err());
+        assert!(
+            err.contains(&format!("passes through {}, a link", link.display())),
+            "{err}"
+        );
+        let real = format!("use its real path {}", system32.join("cmd.exe").display());
+        assert!(err.to_lowercase().ends_with(&real.to_lowercase()), "{err}");
     }
 
     #[test]
-    fn a_junction_into_a_folder_others_can_change_is_refused() {
+    fn a_path_through_a_junction_into_a_folder_others_can_change_is_refused() {
         let (links, targets) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
         let opened = targets.path().join("opened");
         fs::create_dir_all(opened.join("sub")).unwrap();
@@ -441,12 +462,36 @@ mod tests {
         icacls(&opened, &["/grant", "*S-1-1-0:(DC)"]);
         let link = links.path().join("link");
         junction(&link, &opened.join("sub"));
-        let found = outside_writers(&link.join("file")).unwrap();
+        let err = format!("{:#}", outside_writers(&link.join("file")).unwrap_err());
         assert!(
-            found
-                .iter()
-                .any(|w| w.contains("S-1-1-0) on ") && w.ends_with("opened")),
-            "{found:?}"
+            err.contains(&format!("passes through {}, a link", link.display())),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn a_path_through_chained_junctions_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let (a, b) = (dir.path().join("a"), dir.path().join("b"));
+        fs::create_dir(&b).unwrap();
+        let system32 = Path::new(&std::env::var_os("SystemRoot").unwrap()).join("System32");
+        junction(&b.join("hop"), &system32);
+        junction(&a, &b.join("hop"));
+        let err = format!("{:#}", outside_writers(&a.join("cmd.exe")).unwrap_err());
+        assert!(
+            err.contains(&format!("passes through {}, a link", a.display())),
+            "{err}"
+        );
+        let err = format!(
+            "{:#}",
+            outside_writers(&b.join(r"hop\cmd.exe")).unwrap_err()
+        );
+        assert!(
+            err.contains(&format!(
+                "passes through {}, a link",
+                b.join("hop").display()
+            )),
+            "{err}"
         );
     }
 }

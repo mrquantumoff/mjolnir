@@ -63,16 +63,18 @@ when an account other than SYSTEM, Administrators, and TrustedInstaller
 can change the mjolnir binary or its folder, the key, the
 authorized-keys file, or a receiver's `--out` folder (or, if it does not
 exist yet, the nearest folder above it), or can replace one of them
-through a folder above it. When a folder above one of them is a junction
-or another link, the folders it leads to are checked too. A receiver
-writing as SYSTEM into a folder others can change would follow links
+through a folder above it. A receiver writing as SYSTEM into a folder
+others can change would follow links
 they plant there. The check covers `--out` itself, not the folders under
 it, so do not grant other accounts write access anywhere under a
 service's `--out`. A subfolder they can change could be swapped for a
 junction that sends the receiver's writes elsewhere. The error names
 those accounts. A folder made under `%ProgramData%\mjolnir` passes; one
 made elsewhere usually inherits write access for Users and needs the
-`icacls` command the error prints. `keygen --system` writes a key that
+`icacls` command the error prints. These paths and the log's may not
+pass through a junction, symlink, or mounted-folder link, since whoever
+can write to a link can point it elsewhere. Use the real path, which the
+error names when it knows it. `keygen --system` writes a key that
 passes, and creates its folder the same way if it is missing; read the
 key with `mjolnir pubkey` from an elevated terminal. A key `keygen`
 wrote without `--system` also grants your account, so `install` refuses
