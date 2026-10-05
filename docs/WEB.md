@@ -259,7 +259,9 @@ once when a transfer ends.
 `connections` (1 to 64), `chunk_size` (4 KiB to 64 MiB), `cipher`
 (`Aes256Gcm` or `ChaCha20Poly1305`), `threads` (0 to 256, 0 meaning one
 per core), `hash`, `preserve`, and `follow_symlinks` are optional with the
-defaults shown. `preserve` must name all three flags when given.
+defaults shown, except that `cipher` defaults to `ChaCha20Poly1305` on a
+Windows ARM64 CPU without the Cryptography Extension. The form's
+"Default" cipher omits it. `preserve` must name all three flags when given.
 `follow_symlinks: false` is `send --no-follow-symlinks`: links, in `paths`
 or under them, are skipped instead of sent as what they point to.
 `addr` may be a host name; it is resolved when the transfer starts. Every

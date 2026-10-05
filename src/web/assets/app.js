@@ -301,7 +301,8 @@ function readSendForm() {
     paths: app.sendPaths.slice(),
     connections: Number($('send-connections').value),
     chunk_size: Number($('send-chunk').value),
-    cipher: $('send-cipher').value,
+    // Omitted, the server picks the cipher this CPU can run.
+    cipher: $('send-cipher').value || undefined,
     threads: readThreads('send-threads'),
     hash: $('send-hash').checked,
     follow_symlinks: $('send-follow-symlinks').checked,

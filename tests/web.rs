@@ -327,6 +327,19 @@ fn send_can_turn_off_following_links() {
 }
 
 #[test]
+fn send_without_a_cipher_uses_the_default() {
+    let ui = start();
+    let dir = tempfile::tempdir().unwrap();
+    let r = post(
+        &ui,
+        "/api/send",
+        json!({ "addr": "127.0.0.1:9", "peer": ui.public_key, "paths": [dir.path()] }),
+    );
+    assert_eq!(r.status, 200, "{}", r.body);
+    assert_eq!(r.body["spec"]["cipher"], json!(mjolnir::Cipher::default()));
+}
+
+#[test]
 fn malformed_preserve_is_400() {
     let ui = start();
     let dir = tempfile::tempdir().unwrap();
