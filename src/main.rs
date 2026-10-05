@@ -419,16 +419,21 @@ fn run(cmd: Cmd, progress_lines: bool) -> Result<()> {
                 verbose,
             };
             block_on(async move {
-                let client = tunnel::TunnelClient::connect(cfg).await?;
+                let stop = stopped();
+                tokio::pin!(stop);
+                let client = tokio::select! {
+                    client = tunnel::TunnelClient::connect(cfg) => client?,
+                    () = &mut stop => return Ok(()),
+                };
                 match stdio {
                     Some(target) => client.stdio(target).await.map(drop),
                     None => {
                         eprintln!("mjolnir: tunnel up");
                         if reconnect {
-                            client.run_reconnecting(Backoff::default(), stopped()).await;
+                            client.run_reconnecting(Backoff::default(), stop).await;
                             Ok(())
                         } else {
-                            client.run_until(stopped()).await
+                            client.run_until(stop).await
                         }
                     }
                 }
