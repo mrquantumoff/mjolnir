@@ -30,12 +30,13 @@ serde = { version = "1.0.229", features = ["derive", "rc"] }
 serde_bytes = "0.11.19"
 serde_json = "1.0.151"
 sha2 = "0.10"
-snow = { version = "0.10", default-features = false, features = ["std", "use-chacha20poly1305", "use-sha2", "use-curve25519", "use-getrandom"] }
+# Just the Noise state machine. src/crypto/noise.rs supplies the primitives.
+snow = { version = "0.10", default-features = false }
 socket2 = { version = "0.6", features = ["all"] }
 tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "io-std", "time", "sync", "macros", "signal"] }
 unicode-normalization = "0.1.25"
 walkdir = "2.5.0"
-zeroize = "1"
+zeroize = "1.8"
 # Named only to turn on zeroize-on-drop for the cipher states inside aes-gcm
 # and chacha20poly1305.
 aes = { version = "0.8", default-features = false, features = ["zeroize"] }
@@ -48,6 +49,8 @@ lto = "thin"
 codegen-units = 1
 
 [dev-dependencies]
+# Only the tests use snow's own resolver, to check wire compatibility.
+snow = { version = "0.10", default-features = false, features = ["use-chacha20poly1305", "use-sha2", "use-curve25519", "use-getrandom"] }
 tempfile = "3.27.0"
 
 [target."cfg(unix)".dependencies]

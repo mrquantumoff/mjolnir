@@ -244,7 +244,13 @@ holder of the receiver key it passed with `--peer`, and the receiver only
 accepts senders whose keys it was given. There are no certificates and no
 trust on first use. The handshake is `Noise_IK_25519_ChaChaPoly_SHA256` as
 implemented by the [snow](https://crates.io/crates/snow) crate; mjolnir does
-not implement Noise itself. The session secret travels under ephemeral
+not implement Noise itself. It does supply the primitives snow runs on, so
+the static and ephemeral private keys, the handshake's cipher keys, and the
+HMAC buffers are wiped from memory when the handshake ends. Some copies stay
+behind. snow keeps the final chaining key and transcript hash in its own
+state, and the Diffie-Hellman results and key-derivation temporaries pass
+through its stack. That chaining key only derives snow's transport keys,
+which mjolnir never uses. The session secret travels under ephemeral
 Diffie-Hellman keys, so recorded traffic stays private even if both static
 keys later leak. Every chunk is authenticated together with the session,
 file, and chunk index, so a chunk cannot be altered, replayed into another

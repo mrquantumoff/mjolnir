@@ -15,6 +15,8 @@ use zeroize::{Zeroize, Zeroizing};
 
 use crate::keys::{PrivateKey, PublicKey};
 
+mod noise;
+
 const NOISE_PARAMS: &str = "Noise_IK_25519_ChaChaPoly_SHA256";
 const PROLOGUE: &[u8] = b"mjolnir v2";
 const NOISE_MAX: usize = 65535;
@@ -236,7 +238,10 @@ impl SessionKeys {
 }
 
 fn builder() -> snow::Builder<'static> {
-    snow::Builder::new(NOISE_PARAMS.parse().expect("valid Noise params"))
+    snow::Builder::with_resolver(
+        NOISE_PARAMS.parse().expect("valid Noise params"),
+        Box::new(noise::Resolver),
+    )
 }
 
 fn write_noise(w: &mut impl Write, msg: &[u8]) -> Result<()> {
