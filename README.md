@@ -18,7 +18,7 @@ installing; see [docs/RELEASING.md](docs/RELEASING.md).
 # Linux and macOS, into ~/.local/bin
 curl -fsSL https://raw.githubusercontent.com/mrquantumoff/mjolnir/master/scripts/install.sh | bash
 ```
-
+On Windows, Powershell 7 must be present in order for the script to work.
 ```powershell
 # Windows, into %LOCALAPPDATA%\Programs\mjolnir, added to the user PATH
 irm https://raw.githubusercontent.com/mrquantumoff/mjolnir/master/scripts/install.ps1 | iex
