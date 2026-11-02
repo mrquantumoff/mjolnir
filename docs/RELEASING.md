@@ -81,8 +81,8 @@ a flagged dependency publishes nothing.
 Pushing a `v` tag builds and publishes a release from that tag:
 
 ```sh
-git tag v0.3.0
-git push origin v0.3.0
+git tag v0.3.1
+git push origin v0.3.1
 ```
 
 The release holds `mjolnir-<target>.tar.gz` for Linux and macOS,
